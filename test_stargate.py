@@ -40,10 +40,11 @@ def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0
     cfg = {
         "agents": {
             "noop": {"command": agent('printf "%s" "$0" > /dev/null; echo done')},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
             "reviewer": {"command": agent(reviewer)},
         },
-        "workflow": {"architect": "noop", "developer": "noop",
-                     "reviewer": "reviewer", "fixer": "noop"},
+        "workflow": {"architect": "noop", "developer": "dev",
+                     "reviewer": "reviewer", "fixer": "dev"},
         "settings": {"max_review_loops": loops, "test_command": test_command,
                      "agent_timeout_seconds": agent_timeout, "test_timeout_seconds": 30,
                      "prompts_dir": prompts_dir},
@@ -148,10 +149,11 @@ def test_project_config_overrides_one_agent_only(root: Path) -> None:
     user_cfg.write_text(yaml.safe_dump({
         "agents": {
             "noop": {"command": agent(f"echo inherited >> {inherited}; echo done")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
             "reviewer": {"command": agent('echo "VERDICT: APPROVED"')},
         },
-        "workflow": {"architect": "noop", "developer": "noop",
-                     "reviewer": "reviewer", "fixer": "noop"},
+        "workflow": {"architect": "noop", "developer": "dev",
+                     "reviewer": "reviewer", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true"},
     }))
     (repo / ".stargate.yaml").write_text(yaml.safe_dump({
@@ -450,10 +452,11 @@ def test_output_placeholder_forwards_file_not_stdout(root: Path) -> None:
         "agents": {
             "arch": {"command": noisy},
             "noop": {"command": agent("echo done")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
             "rev": {"command": agent(f'printf "%s" "$0" > {dump}; echo "VERDICT: APPROVED"')},
         },
-        "workflow": {"architect": "arch", "developer": "noop",
-                     "reviewer": "rev", "fixer": "noop"},
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true"},
     }))
     proc = run(repo, cfg)
@@ -512,10 +515,13 @@ def test_no_cap_means_no_limit(root: Path) -> None:
         "agents": {
             "greedy": {"command": agent('echo "tokens used"; echo "999,999"; echo plan'),
                        "usage_pattern": r"tokens used\s+([\d,]+)"},
+            "dev": {"command": agent(
+                'echo change >> impl.txt; echo "tokens used"; echo "999,999"; echo done'
+            ), "usage_pattern": r"tokens used\s+([\d,]+)"},
             "rev": {"command": agent('echo "VERDICT: APPROVED"')},
         },
-        "workflow": {"architect": "greedy", "developer": "greedy",
-                     "reviewer": "rev", "fixer": "greedy"},
+        "workflow": {"architect": "greedy", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true"},
     }))
     proc = run(repo, cfg)
@@ -552,7 +558,9 @@ def test_resume_reuses_plan_and_worktree(root: Path) -> None:
     assert state["completed"] == ["architect", "worktree"], state
     assert "exit code 1" in state["error"], state
 
-    fixed = cfg_for(agent("echo done"), root / "fixed.yaml")
+    fixed = cfg_for(
+        agent("echo change >> impl.txt; echo done"), root / "fixed.yaml"
+    )
     proc = subprocess.run(
         [sys.executable, "-m", "stargate", "--config", str(fixed),
          "resume", state["run_id"]],
@@ -631,10 +639,11 @@ def test_agent_env_sets_and_unsets(root: Path) -> None:
                 "env": {"STARGATE_KEY": "from-config", "STARGATE_INHERITED": None},
             },
             "noop": {"command": agent("echo done")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
             "rev": {"command": agent('echo "VERDICT: APPROVED"')},
         },
-        "workflow": {"architect": "arch", "developer": "noop",
-                     "reviewer": "rev", "fixer": "noop"},
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true"},
     }))
     proc = subprocess.run(
@@ -708,10 +717,11 @@ def test_retry_recovers_a_transient_failure(root: Path) -> None:
         "agents": {
             "arch": {"command": transient},
             "noop": {"command": agent("echo done")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
             "rev": {"command": agent('echo "VERDICT: APPROVED"')},
         },
-        "workflow": {"architect": "arch", "developer": "noop",
-                     "reviewer": "rev", "fixer": "noop"},
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true",
                      "agent_retries": 2, "agent_retry_backoff_seconds": 0},
     }))
@@ -787,10 +797,11 @@ def test_retry_counts_tokens_once_per_attempt(root: Path) -> None:
             "arch": {"command": metered,
                      "usage_pattern": r"tokens used\s+([\d,]+)"},
             "noop": {"command": agent("echo done")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
             "rev": {"command": agent('echo "VERDICT: APPROVED"')},
         },
-        "workflow": {"architect": "arch", "developer": "noop",
-                     "reviewer": "rev", "fixer": "noop"},
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true",
                      "agent_retries": 1, "agent_retry_backoff_seconds": 0},
     }))
@@ -906,6 +917,190 @@ def test_runs_survives_a_corrupt_state_file(root: Path) -> None:
     assert after_entries == before_entries, "listing modified a run directory"
 
 
+def test_doctor_probe_verifies_the_capability_a_role_uses(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "capability-probes.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "read_ok": {
+                "command": agent('cat "$0"'),
+                "probe": "{probe_file}",
+                "probe_expect": "read",
+            },
+            "read_broken": {
+                "command": agent("echo OK; echo reader"),
+                "probe": "{probe_file}",
+                "probe_expect": "read",
+            },
+            "write_ok": {
+                "command": agent('echo OK > "$0"'),
+                "probe": "{probe_file}",
+                "probe_expect": "write",
+            },
+            "write_broken": {
+                "command": agent("echo OK; echo writer"),
+                "probe": "{probe_file}",
+                "probe_expect": "write",
+            },
+        },
+        "workflow": {
+            "architect": "read_ok",
+            "developer": "write_ok",
+            "reviewer": "read_broken",
+            "fixer": "write_broken",
+        },
+        "settings": {},
+    }))
+
+    proc = doctor(repo, cfg, "--probe")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "OK   read_ok (read) [" in proc.stdout, proc.stdout
+    assert "FAIL read_broken (read) [" in proc.stdout, proc.stdout
+    assert "did not return the marker" in proc.stdout, proc.stdout
+    assert "OK   write_ok (write) [" in proc.stdout, proc.stdout
+    assert "FAIL write_broken (write) [" in proc.stdout, proc.stdout
+    assert "did not write" in proc.stdout, proc.stdout
+    assert not list(repo.glob("probe-*.txt")), "probe file reached the user's repo"
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, text=True,
+        capture_output=True, check=True,
+    )
+    assert not status.stdout, status.stdout
+
+
+def test_developer_that_changes_nothing_stops_the_run(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "noop-developer.yaml"
+    reviewed = root / "reviewed.txt"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("echo plan")},
+            "dev": {"command": agent("echo done")},
+            "rev": {"command": agent(
+                f'echo reviewed > {reviewed}; echo "VERDICT: APPROVED"'
+            )},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "changed nothing" in proc.stderr, proc.stderr
+    assert not reviewed.exists(), "reviewer ran after an empty developer stage"
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert state["status"] == "failed", state
+    assert state["stage"] == "developer", state
+    assert state["completed"] == ["architect", "worktree"], state
+
+
+def test_untracked_new_file_counts_as_work(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "untracked-developer.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("echo plan")},
+            "dev": {"command": agent("echo new > newfile.txt; echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert (Path(state["worktree"]) / "newfile.txt").read_text() == "new\n"
+
+
+def test_resume_redo_reruns_a_completed_stage(root: Path) -> None:
+    repo = make_repo(root)
+    architect_calls = root / "architect-calls.txt"
+    developer_calls = root / "developer-calls.txt"
+    import yaml
+
+    def config(path: Path, reviewer: str) -> Path:
+        path.write_text(yaml.safe_dump({
+            "agents": {
+                "arch": {"command": agent(
+                    f'echo run >> {architect_calls}; echo "THE PLAN"'
+                )},
+                "dev": {"command": agent(
+                    f"echo run >> {developer_calls}; "
+                    "echo change >> impl.txt; echo done"
+                )},
+                "rev": {"command": agent(reviewer)},
+            },
+            "workflow": {"architect": "arch", "developer": "dev",
+                         "reviewer": "rev", "fixer": "dev"},
+            "settings": {"max_review_loops": 0, "test_command": "true"},
+        }))
+        return path
+
+    broken = config(root / "redo-broken.yaml", "echo no-verdict")
+    first = run(repo, broken)
+    assert first.returncode == 1, first.stdout + first.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert "developer" in state["completed"], state
+
+    fixed = config(root / "redo-fixed.yaml", 'echo "VERDICT: APPROVED"')
+    resumed = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(fixed),
+         "resume", state["run_id"], "--redo", "developer"],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert len(developer_calls.read_text().splitlines()) == 2
+    assert len(architect_calls.read_text().splitlines()) == 1
+    assert "DEVELOPER (skipped" not in resumed.stdout, resumed.stdout
+    assert "ARCHITECT (skipped" in resumed.stdout, resumed.stdout
+
+
+def test_fixer_that_changes_nothing_stops_the_review_loop(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "noop-fixer.yaml"
+    reviewer_calls = root / "reviewer-calls.txt"
+    fixer_calls = root / "fixer-calls.txt"
+    test_calls = root / "test-calls.txt"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("echo plan")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
+            "rev": {"command": agent(
+                f'echo review >> {reviewer_calls}; '
+                'echo "VERDICT: CHANGES_REQUESTED"'
+            )},
+            "fix": {"command": agent(
+                f"echo fix >> {fixer_calls}; echo no-change-needed"
+            )},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "fix"},
+        "settings": {
+            "max_review_loops": 2,
+            "test_command": f"echo test >> {test_calls}",
+        },
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert len(reviewer_calls.read_text().splitlines()) == 1
+    assert len(fixer_calls.read_text().splitlines()) == 1
+    assert len(test_calls.read_text().splitlines()) == 1
+    assert "changed nothing" in proc.stderr, proc.stderr
+    assert "Verdict:   CHANGES_REQUESTED" in proc.stdout, proc.stdout
+
+
 if __name__ == "__main__":
     for fn in (test_settings_only_project_config_is_valid,
                test_project_config_layers_over_user_config,
@@ -940,7 +1135,12 @@ if __name__ == "__main__":
                test_no_retries_by_default,
                test_runs_lists_newest_first_and_marks_resumable,
                test_runs_without_a_stargate_directory,
-               test_runs_survives_a_corrupt_state_file):
+               test_runs_survives_a_corrupt_state_file,
+               test_doctor_probe_verifies_the_capability_a_role_uses,
+               test_developer_that_changes_nothing_stops_the_run,
+               test_untracked_new_file_counts_as_work,
+               test_resume_redo_reruns_a_completed_stage,
+               test_fixer_that_changes_nothing_stops_the_review_loop):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
         print(f"ok  {fn.__name__}")

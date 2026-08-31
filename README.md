@@ -87,8 +87,9 @@ specific first:
 
 `settings` and `workflow` merge by key, and `agents` merges by agent name. An
 agent entry is replaced as a whole, so redefining one must include its complete
-`command`, `probe`, `usage_pattern` and `env` as needed; entries for all other
-agents are inherited. Top-level scalar values use the most-specific value.
+`command`, `probe`, `probe_expect`, `usage_pattern` and `env` as needed; entries
+for all other agents are inherited. Top-level scalar values use the
+most-specific value.
 
 `--config <path>` is the exception: that file is used exactly as given, with no
 project, user or packaged config layered under it. This is also the escape hatch
@@ -118,7 +119,7 @@ Everything under `settings:` in the layered effective config. All are optional.
 | `prompts_dir` | `""` | Directory of custom `<role>.md` prompts, checked before the user and packaged ones. Relative paths resolve against the repo you run in. |
 
 Per-agent keys live on the agent entry, not here: `command`, `probe`,
-`usage_pattern`, `env`.
+`probe_expect`, `usage_pattern`, `env`.
 
 ## Exit codes
 
@@ -126,7 +127,7 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 |---|---|
 | `0` | Approved, and the test command passed or was not configured. |
 | `1` | The run failed — an agent errored, timed out, or config was invalid. `resume` is offered. |
-| `2` | The reviewer still requested changes after the last allowed fixer pass. |
+| `2` | The reviewer still requested changes after the last allowed fixer pass, or the fixer changed nothing and the loop stopped early. |
 | `3` | Approved, but the test command failed. |
 | `4` | `max_task_tokens` was reached; the run stopped between phases. |
 | `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
@@ -151,31 +152,43 @@ use. It makes no external calls, so `FOUND` means only that the executable is on
 ## Probing agents
 
 `doctor` alone never calls an agent. `doctor --probe` makes one real,
-**billable** call per distinct agent command — two for the four default roles,
-since they map onto two commands:
+**billable** call per distinct agent command. It tests the file capability that
+role depends on, so a working credential paired with a broken tool layer fails
+in seconds instead of being discovered after a paid planning stage:
 
 ```console
 $ stargate doctor --probe
 Agent probes:
-  FAIL architect, reviewer [4.3s]
-       Credit balance is too low
-  OK   developer, fixer [7.9s]
+  OK   architect, reviewer (read) [4.3s]
+  FAIL developer, fixer (write) [6.1s]
+       agent exited 0 but did not write probe-1.txt; its file-editing tools are not working
 ```
 
-The prompt lives in the config, so the orchestrator stays vendor-agnostic:
+The prompt and required capability live in the config, so the orchestrator
+stays vendor-agnostic. `{probe_file}` becomes an absolute path inside the
+throwaway repository, and `probe_expect` may be `read` or `write`:
 
 ```yaml
 architect:
   command: [claude, -p, --output-format, text, --model, opus]
-  probe: "Reply with exactly OK."
+  probe: "Read the file {probe_file} and reply with its contents, nothing else."
+  probe_expect: read
 ```
 
-Because the probe runs the agent's *real* command, it catches a wrong model
-name or an unsupported flag too, not only credentials — including an agent that
-exits 0 while writing nothing to its `{output}` file. Agents with no `probe`
-key report `SKIP` and do not fail the exit code. Probes run in a throwaway git
-repository, never in yours, and use `probe_timeout_seconds` (120) rather than
-the much longer agent timeout.
+For a read probe, stargate seeds the file with a random marker and requires the
+agent to return it. For a write probe, the file starts absent and the agent must
+create it non-empty. The packaged architect and reviewer use `read`: their
+`--disallowedTools "Edit Write NotebookEdit"` setting intentionally prevents
+writes, so demanding one would be a false alarm. The developer and fixer use
+`write` because editing is their job.
+
+Because the probe runs the agent's *real* command, it also catches a wrong
+model name or unsupported flag. The existing `{output}` contract remains in
+force: an agent that declares it and exits 0 without writing the final-message
+file fails the probe. Agents with no `probe` key report `SKIP` and do not fail
+the exit code. Probes remain opt-in, run in a throwaway Git repository rather
+than yours, and use `probe_timeout_seconds` (120) rather than the much longer
+agent timeout.
 
 ## Use it against a repository
 
@@ -364,6 +377,19 @@ the run stops rather than silently forwarding an empty plan.
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
 
+## Stages that produce nothing
+
+The architect already has to return a non-empty plan. The developer has a
+different output contract: it must change the worktree. Tracked edits,
+deletions, commits and untracked new files all count. If it exits 0 without any
+change, the run fails before tests or review and the developer is not recorded
+as complete, so a normal `resume` reruns it.
+
+A fixer can legitimately conclude that a review finding needs no code change,
+so the same situation is not treated as an agent failure. Re-reviewing an
+identical worktree would only buy the same verdict again; stargate stops the
+loop immediately with `CHANGES_REQUESTED` instead.
+
 ## Retrying a transient failure
 
 Retries are off by default. Enable them per project with a count of retries
@@ -433,7 +459,8 @@ Resume with: stargate resume 20260831-101304-add-passkey-authentication
 
 `resume` reuses the plan, branch, worktree, frozen config and frozen prompts,
 and skips the stages already marked complete. It does not produce a second
-plan, branch or worktree.
+plan, branch or worktree. A developer that exited successfully but changed
+nothing is deliberately not marked complete, so plain `resume` reruns it.
 
 By default it runs under the config frozen into the run, so resuming cannot
 silently change the agents the earlier stages ran under. Pass `--config` to
@@ -442,6 +469,18 @@ override that, which is how you resume past a broken agent definition:
 ```bash
 stargate --config ./fixed.yaml resume <run-id>
 ```
+
+To rerun a stage that was already recorded as complete, use the supported
+`--redo` option instead of editing `state.json`:
+
+```bash
+stargate resume <run-id> --redo developer
+```
+
+`--redo` accepts `architect` or `developer` and is repeatable. Redoing only the
+architect leaves the developer marked complete, which means the new plan would
+not be implemented; stargate warns in that case, and you can pass both
+`--redo architect --redo developer`.
 
 The review loop always restarts from its first attempt: re-reviewing is
 idempotent and cheap next to re-implementing.
@@ -580,16 +619,13 @@ boundary; prompts are guidance, not a security boundary.
 ## Useful next additions
 
 Shipped since this list was written: token accounting, timeouts, retries,
-persistent run state, `runs`, `resume`, and catchable-signal handling. What is
-still open, roughly in order of how much it would change the tool:
+persistent run state, `runs`, `resume`, catchable-signal handling, capability
+probes, and empty-stage detection. What is still open, roughly in order of how
+much it would change the tool:
 
 - **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
   DAG scheduling, then an integrated review across the branches. This is the
   real v2 and everything else is small next to it.
-- **Output validation.** Three separate integration bugs have been the same
-  shape: an agent's answer was not what it printed. The orchestrator still
-  trusts whatever it receives — an empty, truncated or summarised plan is
-  forwarded without complaint.
 - **Structured review output** (JSON findings instead of a prose verdict).
 - **Project detection** for `test_command`.
 - **GitHub issue / PR as task input.**

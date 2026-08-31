@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -341,6 +343,7 @@ PROBE_TIMEOUT_DEFAULT = 120
 AGENT_RETRIES_DEFAULT = 0
 AGENT_RETRY_BACKOFF_DEFAULT = 10.0
 FINGERPRINT_LINES = 20
+PROBE_CAPABILITIES = ("read", "write")
 
 # How often a running agent prints that it is still alive.
 HEARTBEAT_SECONDS = 30
@@ -359,6 +362,15 @@ def retry_settings(config: dict[str, Any]) -> tuple[int, float]:
     return retries, backoff
 
 
+@dataclass
+class Capability:
+    """A file operation that a probe must demonstrate, not merely describe."""
+
+    kind: str
+    path: Path
+    marker: str = ""
+
+
 def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dict[str, Any]]]:
     """Distinct agent invocations: the four default roles map onto two commands,
     and probing per role would bill twice for nothing.
@@ -366,6 +378,8 @@ def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dic
     Identity is command AND environment. Two roles running the same command
     under different credentials are two different things to verify -- deduping
     on the command alone would report one of them without ever calling it.
+    Keeping the entry that declared the probe also keeps its prompt and
+    capability expectation together when only a later duplicate declares one.
     """
     agents: dict[Any, tuple[list[str], Any, dict[str, Any]]] = {}
     for role in ROLES:
@@ -375,15 +389,23 @@ def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dic
             tuple(agent_command(config, role)),
             tuple(sorted((str(k), v) for k, v in declared.items())) if isinstance(declared, dict) else None,
         )
-        names, known, first = agents.get(key, ([], None, entry))
+        names, prober, first = agents.get(key, ([], None, entry))
         names.append(config["workflow"][role])
-        agents[key] = (names, known if known is not None else entry.get("probe"), first)
+        agents[key] = (
+            names,
+            prober if prober is not None else (
+                entry if entry.get("probe") is not None else None
+            ),
+            first,
+        )
     return agents
 
 
 def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
-              timeout: float | None, env: dict[str, str] | None) -> str:
+              timeout: float | None, env: dict[str, str] | None,
+              capability: Capability | None = None) -> str:
     """Empty string on success, otherwise the reason it failed."""
+    writes_final = any("{output}" in part for part in command)
     cmd = [part.replace("{output}", str(output)) for part in command]
     try:
         proc = subprocess.run(
@@ -400,10 +422,30 @@ def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
         return proc.stdout.strip() or f"agent exited with status {proc.returncode}"
     # Exit 0 while writing nothing to {output} is the false positive this flag
     # exists to remove: invoke_agent would kill the run at the first real stage.
-    if any("{output}" in part for part in command):
+    if writes_final:
         if not (output.read_text() if output.exists() else "").strip():
             return ("agent declares {output} but wrote nothing; check that its "
                     "CLI supports the configured flag")
+    if capability is None:
+        return ""
+    if capability.kind == "write":
+        if not capability.path.is_file() or not capability.path.stat().st_size:
+            return (
+                f"agent exited 0 but did not write {capability.path.name}; "
+                "its file-editing tools are not working"
+            )
+        return ""
+
+    # A prose-only answer cannot guess this marker, so returning it proves the
+    # role actually used its file-reading tools in the isolated repository.
+    answer = (
+        output.read_text() if output.exists() else ""
+    ) if writes_final else proc.stdout
+    if capability.marker not in answer:
+        return (
+            "agent exited 0 but did not return the marker seeded in "
+            f"{capability.path.name}; its file-reading tools are not working"
+        )
     return ""
 
 
@@ -431,22 +473,46 @@ def probe_agents(config: dict[str, Any]) -> bool:
             print("       " + detail.replace("\n", "\n       "))
             return False
 
-        for index, (key, (names, prompt, entry)) in enumerate(unique_agents(config).items()):
+        for index, (key, (names, prober, entry)) in enumerate(
+            unique_agents(config).items()
+        ):
             command = key[0]
             label = ", ".join(dict.fromkeys(names))
             if overrides := env_summary(entry):
                 label += f" (env: {overrides})"
-            if prompt is None:
+            if prober is None:
+                if entry.get("probe_expect") is not None:
+                    print(f"  FAIL {label} (probe_expect needs a probe prompt)")
+                    ok = False
+                    continue
                 print(f"  SKIP {label} (no probe configured)")
                 continue
+            prompt = prober.get("probe")
             if not isinstance(prompt, str) or not prompt.strip():
                 print(f"  FAIL {label} (probe must be a non-empty string)")
                 ok = False
                 continue
+            capability = None
+            expect = prober.get("probe_expect")
+            probe_path = cwd / f"probe-{index}.txt"
+            if expect is not None:
+                if expect not in PROBE_CAPABILITIES:
+                    print(
+                        f"  FAIL {label} (probe_expect must be one of "
+                        f"{', '.join(PROBE_CAPABILITIES)})"
+                    )
+                    ok = False
+                    continue
+                marker = f"stargate-{uuid.uuid4().hex[:12]}"
+                if expect == "read":
+                    probe_path.write_text(marker + "\n")
+                capability = Capability(expect, probe_path, marker)
+                label += f" ({expect})"
+                prompt = prompt.replace("{probe_file}", str(probe_path))
             started = time.monotonic()
             error = probe_one(
                 command, prompt, cwd, cwd / f"output-{index}.txt", timeout,
-                agent_env(entry),
+                agent_env(entry), capability,
             )
             print(f"  {'FAIL' if error else 'OK':4} {label} [{time.monotonic() - started:.1f}s]")
             if error:
@@ -655,9 +721,9 @@ def invoke_agent(
         log_path = attempt_log_path(output_path, attempt)
         print(f"trace: tail -f {shlex.quote(str(log_path))}", flush=True)
 
-        # A retry that exits successfully but writes nothing must not inherit a
-        # previous attempt's answer and pass the output contract by accident.
-        if writes_final and retries and output_path.exists():
+        # A retry or explicitly redone stage must not inherit an earlier
+        # answer and pass the output contract after writing nothing.
+        if writes_final and output_path.exists():
             output_path.unlink()
 
         started = time.monotonic()
@@ -784,6 +850,10 @@ def budget_spent(ctx: RunContext, next_phase: str) -> bool:
 
 
 STAGES = ("architect", "worktree", "developer", "review")
+
+# These are the completed records that skip work. The worktree is reused
+# regardless, and the review loop already restarts from its first attempt.
+REDOABLE_STAGES = ("architect", "developer")
 
 
 def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
@@ -959,6 +1029,35 @@ def create_worktree(ctx: RunContext) -> None:
     git(ctx.repo, *args, capture=True)
 
 
+def git_quiet(repo: Path, *args: str) -> str:
+    """Read Git state without burying run output under a full printed diff."""
+    proc = subprocess.run(
+        ["git", *args], cwd=str(repo), text=True, capture_output=True
+    )
+    if proc.returncode:
+        raise StargateError(
+            f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}"
+        )
+    return proc.stdout
+
+
+def worktree_fingerprint(ctx: RunContext) -> str:
+    """Digest the tracked and untracked state that an agent can change."""
+    parts = [git_quiet(ctx.worktree, "diff", ctx.base_ref)]
+    untracked = git_quiet(
+        ctx.worktree, "ls-files", "--others", "--exclude-standard", "-z"
+    )
+    for name in untracked.split("\0"):
+        if not name:
+            continue
+        # New files are implementation work too. Metadata errs toward allowing
+        # a review rather than hashing an arbitrarily large untracked artifact.
+        with contextlib.suppress(OSError):
+            info = (ctx.worktree / name).lstat()
+            parts.append(f"{name}\t{info.st_size}\t{info.st_mtime_ns}")
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
 TEST_TAIL_LINES = 200
 
 
@@ -1057,6 +1156,17 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         ctx = load_run(repo, args.run_id, config, use_frozen=args.config is None)
         prompts = [ctx.artifacts / "prompts"]
         print(f"\nResuming {ctx.run_id}: {ctx.task}")
+        if redo := set(args.redo):
+            # Completion is the only reason a stage is skipped, so forgetting
+            # that record replaces hand-editing state.json.
+            ctx.done -= redo
+            print(f"Redoing: {', '.join(sorted(redo))}")
+            if "architect" in redo and "developer" in ctx.done:
+                print(
+                    "Warning: the developer is still marked complete, so the "
+                    "new plan will not be implemented. Add --redo developer.",
+                    file=sys.stderr,
+                )
         print(f"Completed: {', '.join(sorted(ctx.done)) or '(nothing)'}")
     else:
         warn_if_dirty(repo)
@@ -1110,6 +1220,7 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
         print("\n=== DEVELOPER (skipped, already ran in this run) ===")
     else:
         enter_stage(ctx, "developer")
+        before = worktree_fingerprint(ctx)
         developer_prompt = render_prompt(
             prompts,
             "developer",
@@ -1125,6 +1236,16 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
             ctx.worktree,
             ctx.artifacts / "developer.txt",
         )
+        if worktree_fingerprint(ctx) == before:
+            # Leaving this incomplete is intentional: a reviewer can only
+            # rediscover the empty diff, while resume must rerun this stage.
+            raise StargateError(
+                f"The developer changed nothing in {ctx.worktree}; there is "
+                f"nothing to review. Check the trace in "
+                f"{ctx.artifacts / 'developer.txt.log'}, verify the agent's "
+                "tools with 'stargate doctor --probe', then resume: this stage "
+                "was not recorded as complete."
+            )
         complete_stage(ctx, "developer")
 
     test_exit, test_report = run_tests(ctx, "developer")
@@ -1187,6 +1308,7 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
         if budget_spent(ctx, f"fixer {attempt + 1}"):
             return finish(ctx, ctx.task, "BUDGET_EXCEEDED", test_exit)
 
+        before = worktree_fingerprint(ctx)
         print(f"\n=== FIXER {attempt + 1} ===")
         invoke_agent(
             ctx,
@@ -1195,6 +1317,15 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
             ctx.worktree,
             ctx.artifacts / f"fix-{attempt + 1}.txt",
         )
+        if worktree_fingerprint(ctx) == before:
+            # A fixer may reasonably reject a review finding, but another
+            # review of the identical tree would only repeat the same verdict.
+            print(
+                f"\n[fixer {attempt + 1}] changed nothing; a further review "
+                "would reach the same verdict. Stopping the review loop.",
+                file=sys.stderr,
+            )
+            break
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
     complete_stage(ctx, "review")
@@ -1249,6 +1380,12 @@ def build_parser() -> argparse.ArgumentParser:
         "config and prompts.",
     )
     resume.add_argument("run_id", help="Run ID, as printed by the original run.")
+    resume.add_argument(
+        "--redo", action="append", default=[], choices=REDOABLE_STAGES,
+        metavar="STAGE",
+        help="Run this completed stage again instead of skipping it "
+        f"({', '.join(REDOABLE_STAGES)}). Repeatable.",
+    )
 
     for parser_ in (run, resume):
         parser_.add_argument(
