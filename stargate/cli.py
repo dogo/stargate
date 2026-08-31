@@ -55,7 +55,8 @@ def run_process(
             with log_path.open("w") as handle:
                 proc = subprocess.run(
                     args, cwd=str(cwd), text=True, stdout=handle,
-                    stderr=subprocess.STDOUT, timeout=timeout,
+                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                    timeout=timeout,
                 )
         except subprocess.TimeoutExpired as exc:
             raise StargateError(
@@ -76,6 +77,7 @@ def run_process(
             text=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.STDOUT if capture else None,
+            stdin=subprocess.DEVNULL,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired as exc:
