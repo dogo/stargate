@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 # claude -p --output-format text already prints only the final message, so the
 # Claude roles need no {output} placeholder.
@@ -13,6 +13,8 @@ agents:
       - plan
       - --model
       - opus
+    # Used only by `stargate doctor --probe`; this makes a small billable call.
+    probe: "Reply with exactly OK."
 
   # "{output}" is replaced with a file path; whatever the agent writes there is
   # what gets forwarded to the next role. Without it, codex exec's entire
@@ -25,6 +27,8 @@ agents:
       - workspace-write
       - --output-last-message
       - "{output}"
+    # Used only by `stargate doctor --probe`; this makes a small billable call.
+    probe: "Reply with exactly OK."
     # codex exec ends its stdout with "tokens used\n7,967".
     usage_pattern: 'tokens used\s+([\d,]+)'
 
@@ -38,6 +42,7 @@ agents:
       - plan
       - --model
       - opus
+    probe: "Reply with exactly OK."
 
   fixer:
     command:
@@ -47,6 +52,7 @@ agents:
       - workspace-write
       - --output-last-message
       - "{output}"
+    probe: "Reply with exactly OK."
     # codex exec ends its stdout with "tokens used\n7,967".
     usage_pattern: 'tokens used\s+([\d,]+)'
 

@@ -58,6 +58,116 @@ def run(repo: Path, config: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def doctor(repo: Path, config: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(config),
+         "doctor", *args],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+
+
+def test_doctor_probe_is_opt_in_and_deduplicated(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "doctor.yaml"
+    calls = root / "calls.txt"
+    import yaml
+    first = agent(f'echo "first:$0" >> {calls}; echo OK')
+    second = ["/bin/sh", "-c",
+              f'test -d .git && echo "$1" | grep -q "output-.*\\.txt" && '
+              f'echo second >> {calls} && echo OK > "$1"', "_", "{output}"]
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "architect": {"command": first, "probe": "cheap"},
+            "reviewer": {"command": first, "probe": "cheap"},
+            "developer": {"command": second, "probe": "cheap"},
+            "fixer": {"command": second, "probe": "cheap"},
+        },
+        "workflow": {role: role for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {},
+    }))
+    proc = doctor(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not calls.exists(), "plain doctor made a billable probe"
+
+    proc = doctor(repo, cfg, "--probe")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    recorded = calls.read_text().splitlines()
+    assert len(recorded) == 2, proc.stdout
+    assert "first:cheap" in recorded, recorded
+    assert "OK   architect, reviewer [" in proc.stdout, proc.stdout
+    assert "OK   developer, fixer [" in proc.stdout, proc.stdout
+
+
+def test_doctor_probe_reports_cli_failure(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "doctor-fail.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {"bad": {
+            "command": agent('echo "Credit balance is too low" >&2; exit 7'),
+            "probe": "cheap",
+        }},
+        "workflow": {role: "bad" for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {},
+    }))
+    proc = doctor(repo, cfg, "--probe")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "FAIL bad [" in proc.stdout, proc.stdout
+    assert "Credit balance is too low" in proc.stdout, proc.stdout
+
+
+def test_doctor_probe_rejects_empty_output_and_skips_missing_probe(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "doctor-output.yaml"
+    skipped = root / "skipped.txt"
+    mixed = root / "mixed.txt"
+    import yaml
+    shared = agent(f'printf "%s" "$0" > {mixed}')
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "silent": {"command": agent("exit 0") + ["{output}"], "probe": "cheap"},
+            "unconfigured": {"command": shared},
+            "missing": {"command": agent(f"touch {skipped}")},
+            "configured": {"command": shared, "probe": "mixed cheap"},
+        },
+        "workflow": {"architect": "silent", "developer": "unconfigured",
+                     "reviewer": "missing", "fixer": "configured"},
+        "settings": {},
+    }))
+    proc = doctor(repo, cfg, "--probe")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "FAIL silent [" in proc.stdout, proc.stdout
+    assert "declares {output} but wrote nothing" in proc.stdout, proc.stdout
+    assert "OK   unconfigured, configured [" in proc.stdout, proc.stdout
+    assert mixed.read_text() == "mixed cheap"
+    assert "SKIP missing (no probe configured)" in proc.stdout, proc.stdout
+    assert not skipped.exists(), "agent without a probe was invoked"
+
+
+def test_doctor_probe_reports_missing_git_without_crashing(root: Path) -> None:
+    cfg = root / "doctor-no-git.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {"fake": {"command": ["/bin/echo"], "probe": "cheap"}},
+        "workflow": {role: "fake" for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {},
+    }))
+    proc = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg),
+         "doctor", "--probe"],
+        cwd=root, text=True, capture_output=True,
+        env={**os.environ, "PATH": "", "PYTHONPATH": str(ROOT)},
+    )
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "SKIP probes (git is required" in proc.stdout, proc.stdout
+    assert "Effective settings:" in proc.stdout, proc.stdout
+    assert "Traceback" not in proc.stderr, proc.stderr
+
+
 def test_prose_mentioning_approved_is_not_an_approval(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "a.yaml"
@@ -286,7 +396,11 @@ def test_hung_agent_times_out(root: Path) -> None:
 
 
 if __name__ == "__main__":
-    for fn in (test_prose_mentioning_approved_is_not_an_approval,
+    for fn in (test_doctor_probe_is_opt_in_and_deduplicated,
+               test_doctor_probe_reports_cli_failure,
+               test_doctor_probe_rejects_empty_output_and_skips_missing_probe,
+               test_doctor_probe_reports_missing_git_without_crashing,
+               test_prose_mentioning_approved_is_not_an_approval,
                test_reviewer_receives_test_output,
                test_missing_verdict_is_an_error,
                test_custom_prompts_dir_overrides_one_file,

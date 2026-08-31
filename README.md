@@ -95,7 +95,26 @@ read an unrelated repo's `agents.yaml`.
 stargate doctor
 ```
 
-Expected result is `OK` for `git`, `claude`, and `codex`.
+This only checks that `git`, `claude`, and `codex` are on `PATH`; it makes no
+external calls. To also verify authentication, credits, quota, and model
+availability, explicitly run the potentially billable probes:
+
+```bash
+stargate doctor --probe
+```
+
+Each unique agent command is called once, even when several roles use it.
+Results include `OK` or `FAIL`, elapsed time, and the CLI's error output on
+failure. Any failed probe makes `doctor` exit non-zero. The vendor-specific
+cheap prompt stays in config:
+
+```yaml
+architect:
+  command: [claude, -p, --output-format, text]
+  probe: "Reply with exactly OK."
+```
+
+Agents without `probe` are skipped, so existing user configs remain usable.
 
 ## Use it against a repository
 
