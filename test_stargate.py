@@ -151,6 +151,50 @@ def test_output_placeholder_empty_file_is_an_error(root: Path) -> None:
     assert "wrote nothing" in proc.stderr, proc.stderr
 
 
+def test_token_cap_stops_the_run(root: Path) -> None:
+    """Architect burns the budget; the run must stop before the developer."""
+    repo = make_repo(root)
+    cfg = root / "h.yaml"
+    marker = root / "developer-ran.txt"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "greedy": {"command": agent('echo "tokens used"; echo "118,089"; echo plan'),
+                       "usage_pattern": r"tokens used\s+([\d,]+)"},
+            "dev": {"command": agent(f'echo ran > {marker}')},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "greedy", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"max_review_loops": 0, "test_command": "true",
+                     "max_task_tokens": 16000},
+    }))
+    proc = run(repo, cfg)
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert not marker.exists(), "developer ran despite the budget being spent"
+    assert "Token budget reached: 118,089 of 16,000" in proc.stderr, proc.stderr
+    assert "BUDGET_EXCEEDED" in proc.stdout, proc.stdout
+
+
+def test_no_cap_means_no_limit(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "i.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "greedy": {"command": agent('echo "tokens used"; echo "999,999"; echo plan'),
+                       "usage_pattern": r"tokens used\s+([\d,]+)"},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "greedy", "developer": "greedy",
+                     "reviewer": "rev", "fixer": "greedy"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Tokens:    1,999,998 (no cap)" in proc.stdout, proc.stdout
+
+
 def test_hung_agent_times_out(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "d.yaml"
@@ -167,6 +211,8 @@ if __name__ == "__main__":
                test_custom_prompts_dir_overrides_one_file,
                test_output_placeholder_forwards_file_not_stdout,
                test_output_placeholder_empty_file_is_an_error,
+               test_token_cap_stops_the_run,
+               test_no_cap_means_no_limit,
                test_hung_agent_times_out):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))

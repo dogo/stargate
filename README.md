@@ -264,6 +264,42 @@ the run stops rather than silently forwarding an empty plan.
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
 
+## Token budget
+
+```yaml
+settings:
+  max_task_tokens: 120000     # 0 or unset = no limit
+```
+
+Be clear about what this can and cannot do. Most of a run's tokens are the
+model reading the repository — that never crosses this process, so the
+orchestrator cannot meter it and cannot interrupt an agent mid-flight. The
+number it tracks is whatever the agent's CLI *prints*, extracted by a regex the
+config supplies:
+
+```yaml
+developer:
+  command: [codex, exec, --sandbox, workspace-write, --output-last-message, "{output}"]
+  usage_pattern: 'tokens used\s+([\d,]+)'
+```
+
+The totals are summed across phases and checked at each phase boundary. So a
+budget stops the *next* agent from starting, never the one already running — a
+single runaway invocation still overshoots. Hitting the cap ends the run with
+verdict `BUDGET_EXCEEDED` and exit code 4, leaving the branch and worktree
+intact.
+
+For a genuine in-flight cap, use a vendor flag in the command itself. Claude
+has one; Codex has no equivalent today:
+
+```yaml
+architect:
+  command: [claude, -p, --output-format, text, --max-budget-usd, "0.50"]
+```
+
+An agent with no `usage_pattern` contributes zero to the total, which makes the
+budget blind to it. `stargate doctor` flags that per role whenever a cap is set.
+
 ## Change who does what
 
 The roles are aliases:

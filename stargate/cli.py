@@ -30,6 +30,7 @@ class RunContext:
     base_ref: str
     worktree: Path
     artifacts: Path
+    tokens_used: int = 0
 
 
 def run_process(
@@ -161,14 +162,40 @@ def warn_if_dirty(repo: Path) -> None:
         )
 
 
-def agent_command(config: dict[str, Any], role: str) -> list[str]:
-    agent_name = config["workflow"][role]
+def agent_entry(config: dict[str, Any], role: str) -> dict[str, Any]:
     try:
-        command = config["agents"][agent_name]["command"]
+        return config["agents"][config["workflow"][role]]
     except KeyError as exc:
         raise StargateError(f"Invalid agent configuration for role '{role}'.") from exc
+
+
+def parse_usage(transcript: str, pattern: str | None) -> int:
+    """Tokens an agent reported spending, via a regex the CONFIG supplies.
+
+    The orchestrator cannot see inside an agent — most of a run's tokens are the
+    model reading the repo, never crossing this process. So the only usable
+    number is whatever the CLI prints, and the shape of that is the vendor's
+    business, not this file's.
+    """
+    if not pattern:
+        return 0
+    match = re.search(pattern, transcript)
+    if not match or not match.groups():
+        return 0
+    try:
+        return int(match.group(1).replace(",", "").replace(".", "").replace("_", ""))
+    except ValueError:
+        return 0
+
+
+def token_cap(config: dict[str, Any]) -> int:
+    return int(config.get("settings", {}).get("max_task_tokens", 0) or 0)
+
+
+def agent_command(config: dict[str, Any], role: str) -> list[str]:
+    command = agent_entry(config, role).get("command")
     if not isinstance(command, list) or not command:
-        raise StargateError(f"Agent '{agent_name}' command must be a non-empty YAML list.")
+        raise StargateError(f"Agent for role '{role}' needs a non-empty command list.")
     return [str(x) for x in command]
 
 
@@ -187,9 +214,15 @@ def doctor(config: dict[str, Any], config_path: Path, script_dir: Path) -> int:
         print(f"{state:8} {binary:12} {path or ''}")
         ok = ok and bool(path)
 
+    cap = token_cap(config)
+    print(f"\nToken cap: {cap:,}" if cap else "\nToken cap: none")
+
     print("\nAgents:")
     for role in ROLES:
+        meters = "reports usage" if agent_entry(config, role).get("usage_pattern") else "no usage_pattern"
         print(f"  {role:10} {shlex.join(agent_command(config, role))}")
+        if cap:
+            print(f"  {'':10} └─ {meters}")
 
     print("\nPrompts:")
     dirs = prompt_dirs(config, script_dir)
@@ -225,7 +258,7 @@ def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
 
 
 def invoke_agent(
-    config: dict[str, Any],
+    ctx: RunContext,
     role: str,
     prompt: str,
     cwd: Path,
@@ -239,13 +272,20 @@ def invoke_agent(
     command contains "{output}" is handed a file path to write its last message
     to, and that file is what gets forwarded; its stdout is kept as a .log.
     """
-    cmd = agent_command(config, role)
+    cmd = agent_command(ctx.config, role)
     writes_final = any("{output}" in part for part in cmd)
     cmd = [part.replace("{output}", str(output_path)) for part in cmd]
 
-    timeout = float(config.get("settings", {}).get("agent_timeout_seconds", 1800))
+    timeout = float(ctx.config.get("settings", {}).get("agent_timeout_seconds", 1800))
     proc = run_process([*cmd, prompt], cwd, capture=True, timeout=timeout or None)
     transcript = proc.stdout or ""
+
+    used = parse_usage(transcript, agent_entry(ctx.config, role).get("usage_pattern"))
+    ctx.tokens_used += used
+    if used:
+        cap = token_cap(ctx.config)
+        budget = f" of {cap:,}" if cap else ""
+        print(f"\n[{role}] reported {used:,} tokens; {ctx.tokens_used:,}{budget} used so far.")
 
     if not writes_final:
         output_path.write_text(transcript)
@@ -297,6 +337,20 @@ def make_context(
         worktree=worktree,
         artifacts=artifacts,
     )
+
+
+def budget_spent(ctx: RunContext, next_phase: str) -> bool:
+    """Whether the cap is reached. Checked BETWEEN phases: nothing here can stop
+    an agent already running, so a single runaway invocation still overshoots."""
+    cap = token_cap(ctx.config)
+    if not cap or ctx.tokens_used < cap:
+        return False
+    print(
+        f"\nToken budget reached: {ctx.tokens_used:,} of {cap:,} used. "
+        f"Stopping before {next_phase}.",
+        file=sys.stderr,
+    )
+    return True
 
 
 def create_worktree(ctx: RunContext) -> None:
@@ -353,6 +407,29 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
     return code, f"$ {command}\n{verdict}\n\n{tail}"
 
 
+def finish(ctx: RunContext, task: str, verdict: str, test_exit: int | None) -> int:
+    write_summary(ctx, task, verdict, test_exit)
+
+    print("\n=== RESULT ===")
+    print(f"Verdict:   {verdict}")
+    print(f"Branch:    {ctx.branch}")
+    print(f"Worktree:  {ctx.worktree}")
+    print(f"Artifacts: {ctx.artifacts}")
+    if ctx.tokens_used:
+        cap = token_cap(ctx.config)
+        print(f"Tokens:    {ctx.tokens_used:,}" + (f" of {cap:,}" if cap else " (no cap)"))
+    print("\nNothing was committed, merged, pushed, or deleted automatically.")
+    print(f"Inspect with: cd {shlex.quote(str(ctx.worktree))} && git status && git diff {shlex.quote(ctx.base_ref)}")
+
+    if verdict == "BUDGET_EXCEEDED":
+        return 4
+    if verdict != "APPROVED":
+        return 2
+    if test_exit not in (None, 0):
+        return 3
+    return 0
+
+
 def write_summary(ctx: RunContext, task: str, verdict: str, test_exit: int | None) -> None:
     status = git(ctx.worktree, "status", "--short").stdout
     diff_stat = git(ctx.worktree, "diff", "--stat", ctx.base_ref).stdout
@@ -365,6 +442,7 @@ Branch: {ctx.branch}
 Worktree: {ctx.worktree}
 Verdict: {verdict}
 Test exit: {test_exit}
+Tokens reported: {ctx.tokens_used:,}{" of " + format(token_cap(ctx.config), ",") if token_cap(ctx.config) else ""}
 
 ## git status
 
@@ -396,7 +474,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     )
     print("\n=== ARCHITECT ===")
     plan = invoke_agent(
-        config, "architect", architect_prompt, repo, ctx.artifacts / "plan.md"
+        ctx, "architect", architect_prompt, repo, ctx.artifacts / "plan.md"
     ).strip()
     if not plan:
         raise StargateError("Architect returned an empty plan.")
@@ -404,6 +482,9 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     # 2. Create isolated implementation branch/worktree.
     print("\n=== WORKTREE ===")
     create_worktree(ctx)
+
+    if budget_spent(ctx, "the developer"):
+        return finish(ctx, args.task, "BUDGET_EXCEEDED", None)
 
     # 3. Developer implements.
     developer_prompt = render_prompt(
@@ -415,7 +496,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     )
     print("\n=== DEVELOPER ===")
     invoke_agent(
-        config,
+        ctx,
         "developer",
         developer_prompt,
         ctx.worktree,
@@ -430,6 +511,8 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     verdict = "CHANGES_REQUESTED"
 
     for attempt in range(max_loops + 1):
+        if budget_spent(ctx, f"review {attempt + 1}"):
+            return finish(ctx, args.task, "BUDGET_EXCEEDED", test_exit)
         review_prompt = render_prompt(
             prompts,
             "reviewer",
@@ -440,7 +523,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         )
         print(f"\n=== REVIEW {attempt + 1} ===")
         review = invoke_agent(
-            config,
+            ctx,
             "reviewer",
             review_prompt,
             ctx.worktree,
@@ -473,9 +556,12 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
             review=review,
             tests=test_report,
         )
+        if budget_spent(ctx, f"fixer {attempt + 1}"):
+            return finish(ctx, args.task, "BUDGET_EXCEEDED", test_exit)
+
         print(f"\n=== FIXER {attempt + 1} ===")
         invoke_agent(
-            config,
+            ctx,
             "fixer",
             fixer_prompt,
             ctx.worktree,
@@ -483,21 +569,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         )
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
-    write_summary(ctx, args.task, verdict, test_exit)
-
-    print("\n=== RESULT ===")
-    print(f"Verdict:   {verdict}")
-    print(f"Branch:    {ctx.branch}")
-    print(f"Worktree:  {ctx.worktree}")
-    print(f"Artifacts: {ctx.artifacts}")
-    print("\nNothing was committed, merged, pushed, or deleted automatically.")
-    print(f"Inspect with: cd {shlex.quote(str(ctx.worktree))} && git status && git diff {shlex.quote(ctx.base_ref)}")
-
-    if verdict != "APPROVED":
-        return 2
-    if test_exit not in (None, 0):
-        return 3
-    return 0
+    return finish(ctx, args.task, verdict, test_exit)
 
 
 def build_parser() -> argparse.ArgumentParser:

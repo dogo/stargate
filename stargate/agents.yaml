@@ -25,6 +25,8 @@ agents:
       - workspace-write
       - --output-last-message
       - "{output}"
+    # codex exec ends its stdout with "tokens used\n7,967".
+    usage_pattern: 'tokens used\s+([\d,]+)'
 
   reviewer:
     command:
@@ -45,6 +47,8 @@ agents:
       - workspace-write
       - --output-last-message
       - "{output}"
+    # codex exec ends its stdout with "tokens used\n7,967".
+    usage_pattern: 'tokens used\s+([\d,]+)'
 
 workflow:
   architect: architect
@@ -72,6 +76,13 @@ settings:
   # prompts. A relative path resolves against the repo you run in.
   # See `stargate init-prompts` and `stargate doctor`.
   prompts_dir: ""
+
+  # Stop the run once the agents have reported this many tokens in total.
+  # 0 or unset = no limit. Only counts what an agent's usage_pattern extracts,
+  # and is only checked BETWEEN phases -- a single runaway invocation still
+  # overshoots. For a real in-flight cap, put a vendor flag in the command:
+  # claude has --max-budget-usd, codex has no equivalent today.
+  max_task_tokens: 0
 
   # Hard limits so a stuck agent or test suite cannot hang the run forever.
   agent_timeout_seconds: 1800
