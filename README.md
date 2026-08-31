@@ -53,8 +53,12 @@ worktree.
 pipx install .                # or: uv tool install .
 ```
 
-Not on PyPI, so install from a copy of this directory (or
-`pipx install git+<repo-url>` once it is pushed). Both prompts and the default
+```bash
+pipx install git+https://github.com/dogo/stargate.git
+```
+
+Not on PyPI (the name is taken by DataStax), so install from the repo or a copy
+of this directory. Both prompts and the default
 config ship inside the package, so once installed the source directory can be
 deleted or moved. `make install` / `make install-uv` are the same commands;
 `make uninstall` removes it.
@@ -324,3 +328,7 @@ A v2 can add:
 - persistent run state and resume;
 - a final human approval gate before commit/merge;
 - MCP-shared project context.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
