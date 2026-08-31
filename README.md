@@ -78,20 +78,31 @@ Seed a user-level config:
 stargate init-config         # writes ~/.config/stargate/agents.yaml
 ```
 
-Config lookup, first hit wins:
+Without `--config`, every existing file in this lookup chain is layered, most
+specific first:
 
-1. `--config <path>`
-2. `./.stargate.yaml` in the repo you are standing in
-3. `~/.config/stargate/agents.yaml` (or `$XDG_CONFIG_HOME`)
-4. the `agents.yaml` packaged with the install
+1. `./.stargate.yaml` in the repo you are standing in
+2. `~/.config/stargate/agents.yaml` (or `$XDG_CONFIG_HOME`)
+3. the `agents.yaml` packaged with the install
 
-`stargate doctor` prints which one it picked. Per-project overrides use
-`.stargate.yaml`, not `agents.yaml`, so a global install can't accidentally
-read an unrelated repo's `agents.yaml`.
+`settings` and `workflow` merge by key, and `agents` merges by agent name. An
+agent entry is replaced as a whole, so redefining one must include its complete
+`command`, `probe`, `usage_pattern` and `env` as needed; entries for all other
+agents are inherited. Top-level scalar values use the most-specific value.
+
+`--config <path>` is the exception: that file is used exactly as given, with no
+project, user or packaged config layered under it. This is also the escape hatch
+for resuming with a repaired agent definition.
+
+`stargate doctor` numbers every source and marks the source of each effective
+setting, agent entry and workflow remap. Per-project overrides use
+`.stargate.yaml`, not `agents.yaml`, and lookup never walks to a parent directory
+or follows paths named by a config, so a global install cannot accidentally read
+configuration from an unrelated repository.
 
 ## Settings reference
 
-Everything under `settings:` in the active config. All are optional.
+Everything under `settings:` in the layered effective config. All are optional.
 
 | key | default | meaning |
 |---|---|---|
@@ -118,6 +129,9 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 | `2` | The reviewer still requested changes after the last allowed fixer pass. |
 | `3` | Approved, but the test command failed. |
 | `4` | `max_task_tokens` was reached; the run stopped between phases. |
+| `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
+| `130` | The run was interrupted with Ctrl-C/SIGINT. Its state is recorded as failed and `resume` is offered. |
+| `143` | The run received SIGTERM. Its state is recorded as failed and `resume` is offered. |
 
 `doctor` exits `1` when a binary is missing, a prompt cannot be resolved, or a
 `--probe` call fails.
@@ -128,9 +142,10 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 stargate doctor
 ```
 
-It prints the config it loaded, the effective settings, each role's resolved
-command and the prompt file each role would use. It makes no external calls, so
-`FOUND` means only that the executable is on `PATH` — see
+It prints the numbered config layers and provenance of the effective settings
+and agents, each role's resolved command, and the prompt file each role would
+use. It makes no external calls, so `FOUND` means only that the executable is on
+`PATH` — see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
 
 ## Probing agents
@@ -220,7 +235,7 @@ Run artifacts are stored under the target repo:
 ```text
 my-project/.stargate/runs/<run-id>/
 ├── state.json         # stage, status, error, tokens -- what `resume` reads
-├── config.yaml        # the effective config, frozen at run start
+├── config.yaml        # the fully merged effective config, frozen at run start
 ├── prompts/           # the four prompts, frozen at run start
 ├── plan.md
 ├── plan.md.log        # the agent's full trace, written live
@@ -398,11 +413,13 @@ Runs in /home/me/project (newest first):
 * resumable. Resume the newest with: stargate resume 20260831-101304-add-passkey-authentication
 ```
 
-Failed and interrupted (`running`) runs are marked with `*`. Missing or corrupt
-`state.json` files are shown as unknown rather than crashing or hiding the run.
-If `.stargate/runs/` does not exist or is empty, the command reports that there
-are no runs. Listing is read-only: it never creates, repairs or deletes run
-artifacts.
+Failed runs and rows still reading `running` are marked with `*`. A `running`
+row normally means the run is still in flight, but it can also mean the process
+was stopped by an uncatchable hard kill such as SIGKILL or power loss. Missing
+or corrupt `state.json` files are shown as unknown rather than crashing or
+hiding the run. If `.stargate/runs/` does not exist or is empty, the command
+reports that there are no runs. Listing is read-only: it never creates, repairs
+or deletes run artifacts.
 
 ## Resuming a failed run
 
@@ -423,11 +440,29 @@ silently change the agents the earlier stages ran under. Pass `--config` to
 override that, which is how you resume past a broken agent definition:
 
 ```bash
-stargate resume <run-id> --config ./fixed.yaml
+stargate --config ./fixed.yaml resume <run-id>
 ```
 
 The review loop always restarts from its first attempt: re-reviewing is
 idempotent and cheap next to re-implementing.
+
+## Terminating a run
+
+Ctrl-C already follows the normal failure path. SIGTERM and SIGHUP do too: the
+direct agent process stargate started is killed, `state.json` is changed from
+`running` to `failed` with the signal recorded, and the same `Resume with:` hint
+is printed. The orchestrator exits with the conventional `128 + signal` code:
+130 for SIGINT, 143 for SIGTERM and 129 for SIGHUP. Cleanup is bounded, and a
+second termination signal uses the operating system's default action so it
+cannot leave the orchestrator stuck.
+
+SIGKILL and sudden power loss cannot be handled by any process. A run stopped
+that way can still show as `running`; inspect it before resuming. Only the direct
+agent process is killed during catchable-signal cleanup. Subprocesses it spawned,
+such as test runs or tool calls, may be orphaned and continue running, so check
+the worktree before resuming. Signal handling also starts only after the CLI has
+enough information to enter the run path, so a termination during very early
+setup may leave no state file rather than a false `running` state.
 
 ## Token budget
 
@@ -545,8 +580,8 @@ boundary; prompts are guidance, not a security boundary.
 ## Useful next additions
 
 Shipped since this list was written: token accounting, timeouts, retries,
-persistent run state, `runs` and `resume`. What is still open, roughly in order
-of how much it would change the tool:
+persistent run state, `runs`, `resume`, and catchable-signal handling. What is
+still open, roughly in order of how much it would change the tool:
 
 - **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
   DAG scheduling, then an integrated review across the branches. This is the
@@ -555,8 +590,6 @@ of how much it would change the tool:
   shape: an agent's answer was not what it printed. The orchestrator still
   trusts whatever it receives — an empty, truncated or summarised plan is
   forwarded without complaint.
-- **Interrupt handling.** A killed run leaves `state.json` reading `running`
-  forever, because nothing catches SIGTERM/SIGINT.
 - **Structured review output** (JSON findings instead of a prose verdict).
 - **Project detection** for `test_command`.
 - **GitHub issue / PR as task input.**
