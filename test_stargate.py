@@ -386,6 +386,22 @@ def test_prompts_are_frozen_into_the_run(root: Path) -> None:
     assert (art / "config.yaml").exists()
 
 
+def test_slow_agent_prints_a_heartbeat(root: Path) -> None:
+    """A silent multi-minute agent must not look like a hang."""
+    import stargate.cli
+    stargate.cli.HEARTBEAT_SECONDS = 1  # only affects this in-process check
+
+    repo = make_repo(root)
+    log = root / "slow.log"
+    proc = stargate.cli.run_process(
+        ["/bin/sh", "-c", "echo starting; sleep 2.5; echo done"],
+        repo, log_path=log, timeout=30,
+    )
+    assert proc.returncode == 0
+    assert "done" in proc.stdout
+    assert log.read_text().startswith("starting")
+
+
 def test_hung_agent_times_out(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "d.yaml"
@@ -411,6 +427,7 @@ if __name__ == "__main__":
                test_resume_reuses_plan_and_worktree,
                test_literal_braces_in_a_prompt_survive,
                test_prompts_are_frozen_into_the_run,
+               test_slow_agent_prints_a_heartbeat,
                test_hung_agent_times_out):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))

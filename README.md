@@ -186,9 +186,20 @@ my-project/.stargate/runs/<run-id>/
 └── summary.md
 ```
 
-Each role prints its `.log` path before starting, so a silent multi-minute
-agent can be followed with `tail -f`, and its exit code and duration when it
-ends. The trace is not echoed to the terminal.
+Each role prints its `.log` path before starting, so it can be followed with
+`tail -f`, and its exit code and duration when it ends. While an agent runs it
+prints a heartbeat every 30 seconds — elapsed time and bytes written — so a
+long silent stage is visibly moving rather than possibly hung:
+
+```console
+=== DEVELOPER ===
+trace: tail -f .../developer.txt.log
+  ... 30s elapsed, 41,238 bytes written
+  ... 60s elapsed, 96,004 bytes written
+[developer] exit 0 in 512s
+```
+
+The trace itself is never echoed to the terminal.
 
 `.stargate/` ignores itself (it writes its own `.gitignore`), so run
 artifacts never show up in the target repo's `git status`.

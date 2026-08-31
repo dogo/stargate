@@ -52,18 +52,31 @@ def run_process(
     if log_path is not None:
         # Straight to disk, so a silent multi-minute agent can be tailed live
         # instead of surfacing only once the process exits.
-        try:
-            with log_path.open("w") as handle:
-                proc = subprocess.run(
-                    args, cwd=str(cwd), text=True, stdout=handle,
-                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                    timeout=timeout,
-                )
-        except subprocess.TimeoutExpired as exc:
-            raise StargateError(
-                f"Command timed out after {timeout}s (partial trace in {log_path}): "
-                f"{shlex.join(args)}"
-            ) from exc
+        with log_path.open("w") as handle:
+            proc = subprocess.Popen(
+                args, cwd=str(cwd), text=True, stdout=handle,
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            )
+            started = time.monotonic()
+            deadline = None if timeout is None else started + timeout
+            while True:
+                try:
+                    proc.wait(timeout=HEARTBEAT_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if deadline is not None and time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait()
+                    raise StargateError(
+                        f"Command timed out after {timeout}s "
+                        f"(partial trace in {log_path}): {shlex.join(args)}"
+                    )
+                # Growing byte count is the "still moving, not hung" signal;
+                # the trace itself stays out of the terminal.
+                size = log_path.stat().st_size if log_path.exists() else 0
+                elapsed = time.monotonic() - started
+                print(f"  ... {elapsed:.0f}s elapsed, {size:,} bytes written", flush=True)
         output = log_path.read_text() if log_path.exists() else ""
         if check and proc.returncode != 0:
             raise StargateError(
@@ -230,6 +243,9 @@ def agent_command(config: dict[str, Any], role: str) -> list[str]:
 
 
 PROBE_TIMEOUT_DEFAULT = 120
+
+# How often a running agent prints that it is still alive.
+HEARTBEAT_SECONDS = 30
 
 
 def unique_agents(config: dict[str, Any]) -> dict[tuple[str, ...], tuple[list[str], Any]]:
