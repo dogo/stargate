@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stargate"
+version = "0.1.0"
+description = "Tiny local orchestrator that lets Claude Code and Codex CLI collaborate on one task."
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6,<7"]
+
+[project.scripts]
+stargate = "stargate.cli:main"
+
+[tool.setuptools]
+packages = ["stargate"]
+
+# Prompts and the default config live next to the module so the existing
+# __file__-relative lookups keep working once installed.
+[tool.setuptools.package-data]
+stargate = ["agents.yaml", "prompts/*.md"]
