@@ -109,3 +109,9 @@ settings:
   # Hard limits so a stuck agent or test suite cannot hang the run forever.
   agent_timeout_seconds: 1800
   test_timeout_seconds: 900
+
+  # Retries apply to non-zero agent exits and timeouts. Each wait doubles, and
+  # every attempt keeps its own trace and contributes any reported token usage.
+  # 0 retries preserves the historical single-attempt behavior.
+  agent_retries: 0
+  agent_retry_backoff_seconds: 10

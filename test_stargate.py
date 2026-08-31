@@ -50,9 +50,11 @@ def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0
     path.write_text(yaml.safe_dump(cfg))
 
 
-def run(repo: Path, config: Path) -> subprocess.CompletedProcess[str]:
+def run(
+    repo: Path, config: Path, task: str = "demo task"
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "stargate", "--config", str(config), "run", "demo task"],
+        [sys.executable, "-m", "stargate", "--config", str(config), "run", task],
         cwd=repo, text=True, capture_output=True,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
@@ -62,6 +64,14 @@ def doctor(repo: Path, config: Path, *args: str) -> subprocess.CompletedProcess[
     return subprocess.run(
         [sys.executable, "-m", "stargate", "--config", str(config),
          "doctor", *args],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+
+
+def runs(repo: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "stargate", "runs"],
         cwd=repo, text=True, capture_output=True,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
@@ -478,6 +488,217 @@ def test_hung_agent_times_out(root: Path) -> None:
     assert "timed out" in proc.stderr, proc.stderr
 
 
+def test_retry_recovers_a_transient_failure(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "retry.yaml"
+    calls = root / "architect-calls.txt"
+    import yaml
+    transient = agent(
+        f'if test ! -e {calls}; then echo first > {calls}; '
+        'echo boom >&2; exit 1; fi; echo "THE PLAN"'
+    )
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": transient},
+            "noop": {"command": agent("echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "noop",
+                     "reviewer": "rev", "fixer": "noop"},
+        "settings": {"max_review_loops": 0, "test_command": "true",
+                     "agent_retries": 2, "agent_retry_backoff_seconds": 0},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "attempt 1 of 3 failed" in proc.stdout, proc.stdout
+    assert "retrying in 0s (attempt 2 of 3)" in proc.stdout, proc.stdout
+    artifacts = next((repo / ".stargate" / "runs").glob("*"))
+    assert (artifacts / "plan.md.log").read_text().strip() == "boom"
+    assert (artifacts / "plan.md.attempt-2.log").exists()
+
+
+def test_retries_exhausted_fails_exactly_like_today(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "retry-exhausted.yaml"
+    state_counter = root / "state-counter.txt"
+    calls = root / "calls.txt"
+    import yaml
+    always_different = agent(
+        f'echo call >> {calls}; value=$(cat {state_counter} 2>/dev/null || true); '
+        'case "$value" in "") next=a;; a) next=b;; *) next=c;; esac; '
+        f'echo "$next" > {state_counter}; echo "boom $next" >&2; exit 1'
+    )
+    cfg.write_text(yaml.safe_dump({
+        "agents": {"bad": {"command": always_different}},
+        "workflow": {role: "bad" for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {"agent_retries": 2, "agent_retry_backoff_seconds": 0},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert len(calls.read_text().splitlines()) == 3, calls.read_text()
+    assert "Command failed with exit code 1" in proc.stderr, proc.stderr
+    assert "Resume with: stargate resume" in proc.stderr, proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    assert json.loads(state_path.read_text())["status"] == "failed"
+
+
+def test_identical_failure_stops_retrying_early(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "retry-identical.yaml"
+    calls = root / "calls.txt"
+    import yaml
+    permanent = agent(f'echo call >> {calls}; echo permanent >&2; exit 1')
+    cfg.write_text(yaml.safe_dump({
+        "agents": {"bad": {"command": permanent}},
+        "workflow": {role: "bad" for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {"agent_retries": 5, "agent_retry_backoff_seconds": 0},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert len(calls.read_text().splitlines()) == 2, calls.read_text()
+    assert "failed identically twice; not retrying 4 more time(s)" in proc.stdout
+    assert "Command failed with exit code 1" in proc.stderr, proc.stderr
+
+
+def test_retry_counts_tokens_once_per_attempt(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "retry-tokens.yaml"
+    calls = root / "architect-calls.txt"
+    import yaml
+    metered = agent(
+        'echo "tokens used"; echo "1,000"; '
+        f'if test ! -e {calls}; then echo first > {calls}; exit 1; fi; '
+        'echo plan'
+    )
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": metered,
+                     "usage_pattern": r"tokens used\s+([\d,]+)"},
+            "noop": {"command": agent("echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "noop",
+                     "reviewer": "rev", "fixer": "noop"},
+        "settings": {"max_review_loops": 0, "test_command": "true",
+                     "agent_retries": 1, "agent_retry_backoff_seconds": 0},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Tokens:    2,000 (no cap)" in proc.stdout, proc.stdout
+
+
+def test_no_retries_by_default(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "no-retry.yaml"
+    calls = root / "developer-calls.txt"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("echo plan")},
+            "bad": {"command": agent(
+                f'echo call >> {calls}; echo boom >&2; exit 1'
+            )},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "bad",
+                     "reviewer": "rev", "fixer": "bad"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert len(calls.read_text().splitlines()) == 1, calls.read_text()
+    assert "attempt 1 of" not in proc.stdout, proc.stdout
+
+
+def test_runs_lists_newest_first_and_marks_resumable(root: Path) -> None:
+    repo = make_repo(root)
+    approved = root / "approved.yaml"
+    failed = root / "failed.yaml"
+    write_config(
+        approved, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+    first = run(repo, approved, "older approved task")
+    assert first.returncode == 0, first.stdout + first.stderr
+
+    import yaml
+    failed.write_text(yaml.safe_dump({
+        "agents": {"bad": {"command": agent("echo boom >&2; exit 1")}},
+        "workflow": {role: "bad" for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {},
+    }))
+    second = run(repo, failed, "newer failed task")
+    assert second.returncode == 1, second.stdout + second.stderr
+
+    states = [json.loads(path.read_text()) for path in
+              (repo / ".stargate" / "runs").glob("*/state.json")]
+    approved_id = next(state["run_id"] for state in states
+                       if state["status"] == "approved")
+    failed_id = next(state["run_id"] for state in states
+                     if state["status"] == "failed")
+    proc = runs(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    failed_line = next(line for line in proc.stdout.splitlines()
+                       if failed_id in line)
+    approved_line = next(line for line in proc.stdout.splitlines()
+                         if approved_id in line)
+    assert failed_line.startswith("* "), failed_line
+    assert approved_line.startswith("  "), approved_line
+    assert f"Resume the newest with: stargate resume {failed_id}" in proc.stdout
+    assert proc.stdout.index(failed_id) < proc.stdout.index(approved_id), proc.stdout
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_runs_without_a_stargate_directory(root: Path) -> None:
+    repo = make_repo(root)
+    proc = runs(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "No runs recorded in" in proc.stdout, proc.stdout
+    assert "Traceback" not in proc.stdout + proc.stderr
+    assert not (repo / ".stargate").exists(), "listing created .stargate"
+
+    (repo / ".stargate" / "runs").mkdir(parents=True)
+    empty = runs(repo)
+    assert empty.returncode == 0, empty.stdout + empty.stderr
+    assert "No runs recorded in" in empty.stdout, empty.stdout
+
+
+def test_runs_survives_a_corrupt_state_file(root: Path) -> None:
+    repo = make_repo(root)
+    run_root = repo / ".stargate" / "runs"
+    corrupt = run_root / "20260831-120000-corrupt"
+    missing = run_root / "20260831-110000-missing"
+    corrupt.mkdir(parents=True)
+    missing.mkdir()
+    state_path = corrupt / "state.json"
+    state_path.write_bytes(b"not json {{{\n")
+    before_bytes = state_path.read_bytes()
+    before_entries = {
+        path.name: sorted(child.name for child in path.iterdir())
+        for path in (corrupt, missing)
+    }
+
+    proc = runs(repo)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
+    assert corrupt.name in proc.stdout, proc.stdout
+    assert missing.name in proc.stdout, proc.stdout
+    assert "state.json missing or unreadable" in proc.stdout, proc.stdout
+    assert state_path.read_bytes() == before_bytes
+    after_entries = {
+        path.name: sorted(child.name for child in path.iterdir())
+        for path in (corrupt, missing)
+    }
+    assert after_entries == before_entries, "listing modified a run directory"
+
+
 if __name__ == "__main__":
     for fn in (test_doctor_probe_is_opt_in_and_deduplicated,
                test_doctor_probe_reports_cli_failure,
@@ -498,7 +719,15 @@ if __name__ == "__main__":
                test_agent_env_sets_and_unsets,
                test_probe_dedup_separates_agents_by_env,
                test_env_values_are_never_printed,
-               test_hung_agent_times_out):
+               test_hung_agent_times_out,
+               test_retry_recovers_a_transient_failure,
+               test_retries_exhausted_fails_exactly_like_today,
+               test_identical_failure_stops_retrying_early,
+               test_retry_counts_tokens_once_per_attempt,
+               test_no_retries_by_default,
+               test_runs_lists_newest_first_and_marks_resumable,
+               test_runs_without_a_stargate_directory,
+               test_runs_survives_a_corrupt_state_file):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
         print(f"ok  {fn.__name__}")
