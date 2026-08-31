@@ -89,32 +89,76 @@ Config lookup, first hit wins:
 `.stargate.yaml`, not `agents.yaml`, so a global install can't accidentally
 read an unrelated repo's `agents.yaml`.
 
+## Settings reference
+
+Everything under `settings:` in the active config. All are optional.
+
+| key | default | meaning |
+|---|---|---|
+| `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. Empty means no tests. |
+| `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
+| `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
+| `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
+| `test_timeout_seconds` | `900` | Kills the test command; a timeout counts as exit 124. |
+| `probe_timeout_seconds` | `120` | Kills a `doctor --probe` call. Deliberately far shorter than the agent timeout. |
+| `worktree_root` | `""` | Where worktrees are created. Empty means `<repo-parent>/.stargate-worktrees/<repo-name>/`. |
+| `prompts_dir` | `""` | Directory of custom `<role>.md` prompts, checked before the user and packaged ones. Relative paths resolve against the repo you run in. |
+
+Per-agent keys live on the agent entry, not here: `command`, `probe`,
+`usage_pattern`.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| `0` | Approved, and the test command passed or was not configured. |
+| `1` | The run failed — an agent errored, timed out, or config was invalid. `resume` is offered. |
+| `2` | The reviewer still requested changes after the last allowed fixer pass. |
+| `3` | Approved, but the test command failed. |
+| `4` | `max_task_tokens` was reached; the run stopped between phases. |
+
+`doctor` exits `1` when a binary is missing, a prompt cannot be resolved, or a
+`--probe` call fails.
+
 ## Check setup
 
 ```bash
 stargate doctor
 ```
 
-This only checks that `git`, `claude`, and `codex` are on `PATH`; it makes no
-external calls. To also verify authentication, credits, quota, and model
-availability, explicitly run the potentially billable probes:
+It prints the config it loaded, the effective settings, each role's resolved
+command and the prompt file each role would use. It makes no external calls, so
+`FOUND` means only that the executable is on `PATH` — see
+[Probing agents](#probing-agents) to actually verify that an agent can run.
 
-```bash
-stargate doctor --probe
+## Probing agents
+
+`doctor` alone never calls an agent. `doctor --probe` makes one real,
+**billable** call per distinct agent command — two for the four default roles,
+since they map onto two commands:
+
+```console
+$ stargate doctor --probe
+Agent probes:
+  FAIL architect, reviewer [4.3s]
+       Credit balance is too low
+  OK   developer, fixer [7.9s]
 ```
 
-Each unique agent command is called once, even when several roles use it.
-Results include `OK` or `FAIL`, elapsed time, and the CLI's error output on
-failure. Any failed probe makes `doctor` exit non-zero. The vendor-specific
-cheap prompt stays in config:
+The prompt lives in the config, so the orchestrator stays vendor-agnostic:
 
 ```yaml
 architect:
-  command: [claude, -p, --output-format, text]
+  command: [claude, -p, --output-format, text, --model, opus]
   probe: "Reply with exactly OK."
 ```
 
-Agents without `probe` are skipped, so existing user configs remain usable.
+Because the probe runs the agent's *real* command, it catches a wrong model
+name or an unsupported flag too, not only credentials — including an agent that
+exits 0 while writing nothing to its `{output}` file. Agents with no `probe`
+key report `SKIP` and do not fail the exit code. Probes run in a throwaway git
+repository, never in yours, and use `probe_timeout_seconds` (120) rather than
+the much longer agent timeout.
 
 ## Use it against a repository
 
@@ -302,35 +346,6 @@ the run stops rather than silently forwarding an empty plan.
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
 
-### Probing
-
-`doctor` alone never calls an agent. `doctor --probe` makes one real,
-**billable** call per distinct agent command — two for the four default roles,
-since they map onto two commands:
-
-```console
-$ stargate doctor --probe
-Agent probes:
-  FAIL architect, reviewer [4.3s]
-       Credit balance is too low
-  OK   developer, fixer [7.9s]
-```
-
-The prompt lives in the config, so the orchestrator stays vendor-agnostic:
-
-```yaml
-architect:
-  command: [claude, -p, --output-format, text, --model, opus]
-  probe: "Reply with exactly OK."
-```
-
-Because the probe runs the agent's *real* command, it catches a wrong model
-name or an unsupported flag too, not only credentials — including an agent that
-exits 0 while writing nothing to its `{output}` file. Agents with no `probe`
-key report `SKIP` and do not fail the exit code. Probes run in a throwaway git
-repository, never in yours, and use `probe_timeout_seconds` (120) rather than
-the much longer agent timeout.
-
 ## Resuming a failed run
 
 Every stage is recorded in the run's `state.json` before and after it runs. If
@@ -432,7 +447,9 @@ next step.
 
 The important separation is:
 
-- Claude architect/reviewer uses plan/read-oriented mode in the default config.
+- Claude architect/reviewer runs with `--disallowedTools "Edit Write
+  NotebookEdit"` in the default config. This matters: the architect runs in
+  your real repository, not in the worktree.
 - Codex developer/fixer gets workspace write access in the isolated worktree.
 - Git destructive/publishing actions are forbidden by prompt.
 - The orchestrator does not auto-merge or auto-push.
@@ -443,19 +460,27 @@ boundary; prompts are guidance, not a security boundary.
 
 ## Useful next additions
 
-A v2 can add:
+Shipped since this list was written: token accounting, timeouts, persistent
+run state and `resume`. What is still open, roughly in order of how much it
+would change the tool:
 
-- parallel agents per module via one worktree per task;
-- a `tasks.json` produced by the architect;
-- dependency graph / DAG scheduling;
-- structured JSON review output;
-- automatic language/project detection for test commands;
-- GitHub issue / PR input;
-- cost/token accounting;
-- retry/timeouts;
-- persistent run state and resume;
-- a final human approval gate before commit/merge;
-- MCP-shared project context.
+- **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
+  DAG scheduling, then an integrated review across the branches. This is the
+  real v2 and everything else is small next to it.
+- **Per-agent `env`.** Today an agent inherits the orchestrator's environment
+  whole. A single `ANTHROPIC_API_KEY` pointing at the wrong account takes down
+  every Claude role with no way to scope it per agent.
+- **Output validation.** Three separate integration bugs have been the same
+  shape: an agent's answer was not what it printed. The orchestrator still
+  trusts whatever it receives — an empty, truncated or summarised plan is
+  forwarded without complaint.
+- **Retry.** A rate-limited or transiently failing agent ends the run; `resume`
+  recovers it, but by hand.
+- **Interrupt handling.** A killed run leaves `state.json` reading `running`
+  forever, because nothing catches SIGTERM/SIGINT.
+- **Structured review output** (JSON findings instead of a prose verdict).
+- **Project detection** for `test_command`.
+- **GitHub issue / PR as task input.**
 
 ## License
 
