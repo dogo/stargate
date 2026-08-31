@@ -1,4 +1,4 @@
-version: 3
+version: 4
 
 # claude -p --output-format text already prints only the final message, so the
 # Claude roles need no {output} placeholder.
@@ -56,6 +56,12 @@ agents:
       - text
       - --disallowedTools
       - Edit Write NotebookEdit
+      # Print mode otherwise denies arbitrary execution, leaving the reviewer
+      # able only to trust the pasted test report. This grant follows the exact
+      # command stargate runs and is dropped when none was approved. It is not
+      # on the architect because that role runs in the real repository.
+      - --allowedTools
+      - Bash({test_command})
       - --model
       - opus
     probe: "Read the file {probe_file} and reply with its contents, nothing else."
@@ -83,7 +89,8 @@ workflow:
 settings:
   max_review_loops: 2
 
-  # Empty means: don't run a test command automatically.
+  # Empty means: don't run a test command automatically or grant it to an
+  # agent command that declares {test_command}.
   # Examples:
   # test_command: "pytest -q"
   # test_command: "swift test"

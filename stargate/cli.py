@@ -389,6 +389,52 @@ def agent_command(config: dict[str, Any], role: str) -> list[str]:
     return [str(x) for x in command]
 
 
+TEST_COMMAND_PLACEHOLDER = "{test_command}"
+# The packaged allowlist syntax uses parentheses and commas as structure and
+# `*` as a wildcard. Interpolating any of them would grant a PATTERN broader
+# than the one project command stargate runs, even though config is trusted.
+TEST_COMMAND_PATTERN_UNSAFE = re.compile(r"[(),*\x00-\x1f\x7f]")
+
+
+def test_command_grant(test_command: str) -> str | None:
+    """The exact command safe to place in a permission pattern, if any."""
+    command = (test_command or "").strip()
+    if not command or TEST_COMMAND_PATTERN_UNSAFE.search(command):
+        return None
+    return command
+
+
+def expand_test_command(command: list[str], test_command: str) -> list[str]:
+    """Expand {test_command}, dropping its whole option when no grant is safe.
+
+    An empty value is not safe here: it can become Bash(), an empty argv item,
+    or leave an option to consume the agent prompt as its value. The command
+    placeholder therefore belongs in an option value, never in argv[0].
+    """
+    grant = test_command_grant(test_command)
+    expanded: list[str] = []
+    for index, part in enumerate(command):
+        if TEST_COMMAND_PLACEHOLDER not in part:
+            expanded.append(part)
+            continue
+        if index == 0:
+            raise StargateError(
+                "{test_command} cannot be used as an agent executable; put it "
+                "in an option value."
+            )
+        if grant is not None:
+            expanded.append(part.replace(TEST_COMMAND_PLACEHOLDER, grant))
+            continue
+        # An option containing the placeholder is self-contained, regardless
+        # of its spelling. A separate value may itself contain `=`, so only
+        # its position -- not that character -- identifies the option to drop.
+        if not part.startswith("-") and expanded and expanded[-1].startswith("-"):
+            expanded.pop()
+    if not expanded:
+        raise StargateError("Expanding {test_command} left an empty agent command.")
+    return expanded
+
+
 PROBE_TIMEOUT_DEFAULT = 120
 AGENT_RETRIES_DEFAULT = 0
 AGENT_RETRY_BACKOFF_DEFAULT = 10.0
@@ -453,10 +499,12 @@ def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dic
 
 def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
               timeout: float | None, env: dict[str, str] | None,
+              test_command: str,
               capability: Capability | None = None) -> str:
     """Empty string on success, otherwise the reason it failed."""
     writes_final = any("{output}" in part for part in command)
     cmd = [part.replace("{output}", str(output)) for part in command]
+    cmd = expand_test_command(cmd, test_command)
     try:
         proc = subprocess.run(
             [*cmd, prompt], cwd=cwd, text=True, stdout=subprocess.PIPE,
@@ -499,7 +547,7 @@ def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
     return ""
 
 
-def probe_agents(config: dict[str, Any]) -> bool:
+def probe_agents(config: dict[str, Any], test_command: str) -> bool:
     """Make one real, billable call per distinct agent. Opt-in only."""
     print("\nAgent probes:")
     git_bin = shutil.which("git")
@@ -562,7 +610,7 @@ def probe_agents(config: dict[str, Any]) -> bool:
             started = time.monotonic()
             error = probe_one(
                 command, prompt, cwd, cwd / f"output-{index}.txt", timeout,
-                agent_env(entry), capability,
+                agent_env(entry), test_command, capability,
             )
             print(f"  {'FAIL' if error else 'OK':4} {label} [{time.monotonic() - started:.1f}s]")
             if error:
@@ -688,6 +736,28 @@ def detect_test_commands(root: Path) -> list[Detected]:
     return detected
 
 
+def selected_test_command(
+    config: dict[str, Any], root: Path
+) -> tuple[str, list[Detected]]:
+    """The command stargate would run, plus every detected candidate.
+
+    Report-only detection intentionally grants nothing: its candidate is input
+    the user has not approved, so letting an agent execute it would defeat the
+    mode even if the orchestrator itself abstained.
+    """
+    settings = config.get("settings", {})
+    configured = str(settings.get("test_command", "") or "").strip()
+    if configured:
+        return configured, []
+    mode = detection_mode(config)
+    if mode == "off":
+        return "", []
+    detected = detect_test_commands(root)
+    if mode == "auto" and detected:
+        return detected[0].command, detected
+    return "", detected
+
+
 def doctor(
     config: dict[str, Any],
     layers: list[tuple[Path, dict[str, Any]]],
@@ -707,11 +777,20 @@ def doctor(
         suffix = " (packaged defaults)" if path == packaged_path else ""
         print(f"  [{index}] {path}{suffix}")
     print()
+    settings = config.get("settings", {})
+    mode = detection_mode(config)
+    configured_test_command = str(
+        settings.get("test_command", "") or ""
+    ).strip()
+    test_command, candidates = selected_test_command(config, Path.cwd())
+    commands = {
+        role: expand_test_command(agent_command(config, role), test_command)
+        for role in ROLES
+    }
     ok = True
     binaries = {"git"}
     for role in ROLES:
-        cmd = agent_command(config, role)
-        binaries.add(cmd[0])
+        binaries.add(commands[role][0])
 
     for binary in sorted(binaries):
         path = shutil.which(binary)
@@ -725,7 +804,7 @@ def doctor(
     )
 
     if probe:
-        ok = probe_agents(config) and ok
+        ok = probe_agents(config, test_command) and ok
 
     packaged = yaml.safe_load((script_dir / "agents.yaml").read_text()) or {}
     mine, theirs = config.get("version"), packaged.get("version")
@@ -736,7 +815,6 @@ def doctor(
             f"{script_dir / 'agents.yaml'}."
         )
 
-    settings = config.get("settings", {})
     print("\nEffective settings:")
     for key, default in (
         ("max_review_loops", 2),
@@ -753,16 +831,13 @@ def doctor(
         value = settings.get(key, default)
         print(f"  {key:22} {value!r}   {value_source(layers, 'settings', key)}")
 
-    mode = detection_mode(config)
-    command = str(settings.get("test_command", "") or "").strip()
     print("\nTest command:")
-    if command:
+    if configured_test_command:
         source = value_source(layers, "settings", "test_command")
-        print(f"  configured  {command!r}   {source}")
+        print(f"  configured  {configured_test_command!r}   {source}")
     elif mode == "off":
         print("  (not configured; detection is off)")
     else:
-        candidates = detect_test_commands(Path.cwd())
         print("  (not configured)")
         for candidate in candidates:
             print(f"  detected    {candidate.command:16} {candidate.source}")
@@ -780,22 +855,53 @@ def doctor(
 
     cap = token_cap(config)
     print("\nAgents:")
+    architect_declares_test_command = False
     for role in ROLES:
         agent_name = config["workflow"][role]
         agent_source = value_source(layers, "agents", agent_name)
         workflow_source = value_source(layers, "workflow", role)
         entry = agent_entry(config, role)
+        raw_command = agent_command(config, role)
+        declares_test_command = any(
+            TEST_COMMAND_PLACEHOLDER in part for part in raw_command
+        )
         print(
             f"  {role:10} {agent_source:9} "
-            f"{shlex.join(agent_command(config, role))}"
+            f"{shlex.join(commands[role])}"
         )
         if workflow_source != agent_source:
             print(f"  {'':10} {'':9} └─ role mapped by {workflow_source}")
         if overrides := env_summary(entry):
             print(f"  {'':10} {'':9} └─ env: {overrides}")
+        if declares_test_command:
+            architect_declares_test_command = (
+                architect_declares_test_command or role == "architect"
+            )
+            if grant := test_command_grant(test_command):
+                print(
+                    f"  {'':10} {'':9} └─ may run the test command: {grant}"
+                )
+            elif test_command:
+                print(
+                    f"  {'':10} {'':9} └─ {{test_command}}: {test_command!r} "
+                    "contains a permission-pattern metacharacter or control "
+                    "character; it was not interpolated and the grant is dropped"
+                )
+            else:
+                print(
+                    f"  {'':10} {'':9} └─ {{test_command}}: no test command "
+                    "will run; the grant and its flag are dropped"
+                )
         if cap:
             meters = "reports usage" if entry.get("usage_pattern") else "no usage_pattern"
             print(f"  {'':10} {'':9} └─ {meters}")
+
+    if architect_declares_test_command:
+        print(
+            "\nWARN     the architect declares {test_command}. It runs in your real "
+            "repository,\n         not the worktree, so this can grant command "
+            "execution there."
+        )
 
     print("\nPrompts:")
     dirs = prompt_dirs(config, script_dir)
@@ -892,7 +998,10 @@ def invoke_agent(
     """
     cmd = agent_command(ctx.config, role)
     writes_final = any("{output}" in part for part in cmd)
+    # Expand {output} first so those literal characters inside a configured
+    # test command cannot unexpectedly become a path.
     cmd = [part.replace("{output}", str(output_path)) for part in cmd]
+    cmd = expand_test_command(cmd, ctx.test_command)
     timeout = float(ctx.config.get("settings", {}).get("agent_timeout_seconds", 1800))
     env = agent_env(agent_entry(ctx.config, role))
     retries, backoff = retry_settings(ctx.config)
@@ -1305,11 +1414,9 @@ def plan_tests(ctx: RunContext) -> None:
     settings = ctx.config.get("settings", {})
     mode = detection_mode(ctx.config)
     configured = str(settings.get("test_command", "") or "").strip()
-    ctx.test_command = ""
+    ctx.test_command, ctx.detected = selected_test_command(ctx.config, ctx.repo)
     ctx.test_source = ""
-    ctx.detected = []
     if configured:
-        ctx.test_command = configured
         ctx.test_source = "settings.test_command"
         print(f"Tests:    {configured}   (settings.test_command)")
         return
@@ -1318,7 +1425,6 @@ def plan_tests(ctx: RunContext) -> None:
         print("Tests:    none configured (test command detection is off)")
         return
 
-    ctx.detected = detect_test_commands(ctx.repo)
     if not ctx.detected:
         ctx.test_source = "not configured; none detected"
         print("Tests:    none configured, none detected")
@@ -1326,7 +1432,6 @@ def plan_tests(ctx: RunContext) -> None:
 
     selected = ctx.detected[0]
     if mode == "auto":
-        ctx.test_command = selected.command
         ctx.test_source = f"detected: {selected.source}"
         print(
             f"Tests:    {selected.command}   (detected: {selected.source}; "
