@@ -10,6 +10,7 @@ import shutil
 import json
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -228,7 +229,9 @@ def agent_command(config: dict[str, Any], role: str) -> list[str]:
     return [str(x) for x in command]
 
 
-def doctor(config: dict[str, Any], config_path: Path, script_dir: Path) -> int:
+def doctor(
+    config: dict[str, Any], config_path: Path, script_dir: Path, *, probe: bool = False
+) -> int:
     print("stargate doctor\n")
     print(f"Config:  {config_path}\n")
     ok = True
@@ -247,6 +250,88 @@ def doctor(config: dict[str, Any], config_path: Path, script_dir: Path) -> int:
         "and model availability are NOT checked -- an agent can still fail on its\n"
         "first call (e.g. \"Credit balance is too low\")."
     )
+
+    if probe:
+        print("\nAgent probes:")
+        unique: dict[tuple[str, ...], tuple[list[str], Any]] = {}
+        for role in ROLES:
+            name = config["workflow"][role]
+            command = tuple(agent_command(config, role))
+            if command in unique:
+                names, prompt = unique[command]
+                names.append(name)
+                if prompt is None:
+                    unique[command] = (names, agent_entry(config, role).get("probe"))
+            else:
+                unique[command] = ([name], agent_entry(config, role).get("probe"))
+
+        git = shutil.which("git")
+        if not git:
+            print("  SKIP probes (git is required for the isolated probe directory)")
+            unique = {}
+        with tempfile.TemporaryDirectory(prefix="stargate-doctor-") as tmp:
+            cwd = Path(tmp)
+            try:
+                if unique:
+                    subprocess.run(
+                        [git, "init", "-q"], cwd=cwd, check=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                    )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                detail = getattr(exc, "stdout", None) or str(exc)
+                print("  FAIL probe setup [0.0s]")
+                print("       " + detail.strip().replace("\n", "\n       "))
+                ok = False
+                unique = {}
+            for index, (command, (names, prompt)) in enumerate(unique.items()):
+                label = ", ".join(dict.fromkeys(names))
+                if prompt is None:
+                    print(f"  SKIP {label} (no probe configured)")
+                    continue
+                if not isinstance(prompt, str) or not prompt.strip():
+                    print(f"  FAIL {label} (probe must be a non-empty string) [0.0s]")
+                    ok = False
+                    continue
+                output = cwd / f"output-{index}.txt"
+                writes_final = any("{output}" in part for part in command)
+                cmd = [part.replace("{output}", str(output)) for part in command]
+                started = time.monotonic()
+                try:
+                    proc = subprocess.run(
+                        [*cmd, prompt], cwd=cwd, text=True,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        stdin=subprocess.DEVNULL,
+                        timeout=float(config.get("settings", {}).get(
+                            "agent_timeout_seconds", 1800
+                        )) or None,
+                    )
+                    elapsed = time.monotonic() - started
+                    error = (
+                        proc.stdout.strip() or f"agent exited with status {proc.returncode}"
+                        if proc.returncode else ""
+                    )
+                    if not error and writes_final:
+                        final = output.read_text() if output.exists() else ""
+                        if not final.strip():
+                            error = (
+                                "agent declares {output} but wrote nothing; check that "
+                                "its CLI supports the configured flag"
+                            )
+                    state = "FAIL" if error else "OK"
+                    print(f"  {state:4} {label} [{elapsed:.1f}s]")
+                    if error:
+                        print("       " + error.replace("\n", "\n       "))
+                    ok = ok and not error
+                except subprocess.TimeoutExpired:
+                    elapsed = time.monotonic() - started
+                    print(f"  FAIL {label} [{elapsed:.1f}s]")
+                    print("       probe timed out")
+                    ok = False
+                except OSError as exc:
+                    elapsed = time.monotonic() - started
+                    print(f"  FAIL {label} [{elapsed:.1f}s]")
+                    print(f"       {exc}")
+                    ok = False
 
     packaged = yaml.safe_load((script_dir / "agents.yaml").read_text()) or {}
     mine, theirs = config.get("version"), packaged.get("version")
@@ -768,7 +853,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("doctor", help="Check local CLI dependencies and configuration.")
+    doctor_parser = sub.add_parser(
+        "doctor", help="Check local CLI dependencies and configuration."
+    )
+    doctor_parser.add_argument(
+        "--probe", action="store_true",
+        help="Make one real, potentially billable call to each unique agent.",
+    )
     sub.add_parser(
         "init-config",
         help="Copy the packaged agents.yaml to ~/.config/stargate/agents.yaml.",
@@ -819,7 +910,7 @@ def main() -> int:
     try:
         config = load_config(config_path)
         if args.command == "doctor":
-            return doctor(config, config_path, script_dir)
+            return doctor(config, config_path, script_dir, probe=args.probe)
         if args.command in ("run", "resume"):
             return orchestrate(args, script_dir, config)
         parser.error("Unknown command")
