@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import json
 import os
 import re
 import shlex
 import shutil
-import json
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,14 @@ import yaml
 
 class StargateError(RuntimeError):
     pass
+
+
+class Terminated(KeyboardInterrupt):
+    """A terminating signal that follows the already-safe interrupt path."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"signal {signum} ({signal.Signals(signum).name})")
+        self.signum = signum
 
 
 @dataclass
@@ -60,24 +70,36 @@ def run_process(
             )
             started = time.monotonic()
             deadline = None if timeout is None else started + timeout
-            while True:
-                try:
-                    proc.wait(timeout=HEARTBEAT_SECONDS)
-                    break
-                except subprocess.TimeoutExpired:
-                    pass
-                if deadline is not None and time.monotonic() > deadline:
-                    proc.kill()
-                    proc.wait()
-                    raise StargateError(
-                        f"Command timed out after {timeout}s "
-                        f"(partial trace in {log_path}): {shlex.join(args)}"
+            try:
+                while True:
+                    try:
+                        proc.wait(timeout=HEARTBEAT_SECONDS)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if deadline is not None and time.monotonic() > deadline:
+                        proc.kill()
+                        proc.wait()
+                        raise StargateError(
+                            f"Command timed out after {timeout}s "
+                            f"(partial trace in {log_path}): {shlex.join(args)}"
+                        )
+                    # Growing byte count is the "still moving, not hung" signal;
+                    # the trace itself stays out of the terminal.
+                    size = log_path.stat().st_size if log_path.exists() else 0
+                    elapsed = time.monotonic() - started
+                    print(
+                        f"  ... {elapsed:.0f}s elapsed, {size:,} bytes written",
+                        flush=True,
                     )
-                # Growing byte count is the "still moving, not hung" signal;
-                # the trace itself stays out of the terminal.
-                size = log_path.stat().st_size if log_path.exists() else 0
-                elapsed = time.monotonic() - started
-                print(f"  ... {elapsed:.0f}s elapsed, {size:,} bytes written", flush=True)
+            except BaseException:
+                # A signal reaches the orchestrator, not necessarily the agent.
+                # Leaving it alive would let it keep editing during a resume.
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    proc.wait(timeout=KILL_GRACE_SECONDS)
+                raise
         output = log_path.read_text() if log_path.exists() else ""
         if check and proc.returncode != 0:
             raise StargateError(
@@ -137,13 +159,20 @@ def user_config() -> Path:
     return Path(os.path.expanduser(base)) / "stargate" / "agents.yaml"
 
 
-def resolve_config(arg: str | None, script_dir: Path) -> Path:
+def resolve_config(arg: str | None, script_dir: Path) -> list[Path]:
+    """Config sources, most specific first."""
     if arg:
-        return Path(arg).expanduser().resolve()
-    for candidate in ((Path.cwd() / PROJECT_CONFIG).resolve(), user_config()):
-        if candidate.exists():
-            return candidate
-    return script_dir / "agents.yaml"  # packaged defaults
+        # Explicit config is also the escape hatch for resuming past a broken
+        # definition, so layering anything under it would make it non-explicit.
+        return [Path(arg).expanduser().resolve()]
+
+    project = (Path.cwd() / PROJECT_CONFIG).resolve()
+    user = user_config().resolve()
+    packaged = (script_dir / "agents.yaml").resolve()
+    candidates = [path for path in (project, user) if path.exists()]
+    # Lookup never walks to a parent or follows a path from config, so a project
+    # cannot accidentally pull configuration from an unrelated repository.
+    return list(dict.fromkeys([*candidates, packaged]))
 
 
 def init_prompts(script_dir: Path) -> int:
@@ -171,13 +200,45 @@ def init_config(script_dir: Path) -> int:
     return 0
 
 
-def load_config(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise StargateError(f"Config not found: {path}")
-    data = yaml.safe_load(path.read_text()) or {}
-    if "agents" not in data or "workflow" not in data:
+def layer_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge sections by key while replacing each structured entry whole."""
+    merged = dict(base)
+    for section, value in override.items():
+        inherited = merged.get(section)
+        if isinstance(inherited, dict) and isinstance(value, dict):
+            merged[section] = {**inherited, **value}
+        else:
+            merged[section] = value
+    return merged
+
+
+def load_config(
+    paths: list[Path],
+) -> tuple[dict[str, Any], list[tuple[Path, dict[str, Any]]]]:
+    """Load the effective config and retain the layers that supplied it."""
+    layers: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        if not path.exists():
+            raise StargateError(f"Config not found: {path}")
+        data = yaml.safe_load(path.read_text()) or {}
+        if not isinstance(data, dict):
+            raise StargateError(f"Config must be a YAML mapping: {path}")
+        layers.append((path, data))
+
+    config: dict[str, Any] = {}
+    for _, data in reversed(layers):
+        config = layer_config(config, data)
+
+    agents = config.get("agents")
+    workflow = config.get("workflow")
+    if (
+        not isinstance(agents, dict) or not agents
+        or not isinstance(workflow, dict) or not workflow
+    ):
         raise StargateError("Config must contain 'agents' and 'workflow'.")
-    return data
+    if "settings" in config and not isinstance(config["settings"], dict):
+        raise StargateError("Config 'settings' must be a mapping.")
+    return config, layers
 
 
 def slugify(text: str, max_len: int = 42) -> str:
@@ -283,6 +344,8 @@ FINGERPRINT_LINES = 20
 
 # How often a running agent prints that it is still alive.
 HEARTBEAT_SECONDS = 30
+# Cleanup must not turn a terminating signal into an indefinite wait.
+KILL_GRACE_SECONDS = 10
 
 
 def retry_settings(config: dict[str, Any]) -> tuple[int, float]:
@@ -392,11 +455,36 @@ def probe_agents(config: dict[str, Any]) -> bool:
     return ok
 
 
+def value_source(
+    layers: list[tuple[Path, dict[str, Any]]], section: str, key: str
+) -> str:
+    """The numbered layer that supplied one effective value."""
+    for index, (_, data) in enumerate(layers, 1):
+        block = data.get(section)
+        if isinstance(block, dict) and key in block:
+            return f"[{index}]"
+    return "(default)"
+
+
 def doctor(
-    config: dict[str, Any], config_path: Path, script_dir: Path, *, probe: bool = False
+    config: dict[str, Any],
+    layers: list[tuple[Path, dict[str, Any]]],
+    script_dir: Path,
+    *,
+    probe: bool = False,
+    explicit_config: bool = False,
 ) -> int:
     print("stargate doctor\n")
-    print(f"Config:  {config_path}\n")
+    qualifier = (
+        "explicit --config; used exactly as given"
+        if explicit_config else "most specific first"
+    )
+    print(f"Config sources ({qualifier}):")
+    packaged_path = (script_dir / "agents.yaml").resolve()
+    for index, (path, _) in enumerate(layers, 1):
+        suffix = " (packaged defaults)" if path == packaged_path else ""
+        print(f"  [{index}] {path}{suffix}")
+    print()
     ok = True
     binaries = {"git"}
     for role in ROLES:
@@ -440,18 +528,26 @@ def doctor(
         ("prompts_dir", ""),
     ):
         value = settings.get(key, default)
-        print(f"  {key:22} {value!r}" + ("" if key in settings else "   (default)"))
+        print(f"  {key:22} {value!r}   {value_source(layers, 'settings', key)}")
 
     cap = token_cap(config)
     print("\nAgents:")
     for role in ROLES:
+        agent_name = config["workflow"][role]
+        agent_source = value_source(layers, "agents", agent_name)
+        workflow_source = value_source(layers, "workflow", role)
         entry = agent_entry(config, role)
-        print(f"  {role:10} {shlex.join(agent_command(config, role))}")
+        print(
+            f"  {role:10} {agent_source:9} "
+            f"{shlex.join(agent_command(config, role))}"
+        )
+        if workflow_source != agent_source:
+            print(f"  {'':10} {'':9} └─ role mapped by {workflow_source}")
         if overrides := env_summary(entry):
-            print(f"  {'':10} └─ env: {overrides}")
+            print(f"  {'':10} {'':9} └─ env: {overrides}")
         if cap:
             meters = "reports usage" if entry.get("usage_pattern") else "no usage_pattern"
-            print(f"  {'':10} └─ {meters}")
+            print(f"  {'':10} {'':9} └─ {meters}")
 
     print("\nPrompts:")
     dirs = prompt_dirs(config, script_dir)
@@ -1113,8 +1209,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         default=None,
-        help=f"Config file. Default: ./{PROJECT_CONFIG}, then "
-        "~/.config/stargate/agents.yaml, then the packaged defaults.",
+        help=f"Config file, used exactly as given. Without it, ./{PROJECT_CONFIG} "
+        "layers over ~/.config/stargate/agents.yaml and the packaged defaults.",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1164,6 +1260,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def install_signal_handlers() -> None:
+    """Turn catchable termination into the existing resumable failure path."""
+    handled = [
+        signum for name in ("SIGTERM", "SIGHUP")
+        if (signum := getattr(signal, name, None)) is not None
+    ]
+
+    def terminate(signum: int, _frame: Any) -> None:
+        # One shot lets a second signal terminate even if cleanup gets stuck.
+        for handled_signum in handled:
+            signal.signal(handled_signum, signal.SIG_DFL)
+        raise Terminated(signum)
+
+    for signum in handled:
+        signal.signal(signum, terminate)
+
+
 def main() -> int:
     script_dir = Path(__file__).resolve().parent
     parser = build_parser()
@@ -1175,13 +1288,24 @@ def main() -> int:
         return init_prompts(script_dir)
 
     try:
+        if args.command in ("run", "resume"):
+            # SIGINT already becomes KeyboardInterrupt; replacing it would add
+            # a second path for an interrupt that is already recorded safely.
+            install_signal_handlers()
+
         if args.command == "runs":
             return list_runs(repo_root(Path.cwd()))
 
-        config_path = resolve_config(args.config, script_dir)
-        config = load_config(config_path)
+        config_paths = resolve_config(args.config, script_dir)
+        config, layers = load_config(config_paths)
         if args.command == "doctor":
-            return doctor(config, config_path, script_dir, probe=args.probe)
+            return doctor(
+                config,
+                layers,
+                script_dir,
+                probe=args.probe,
+                explicit_config=args.config is not None,
+            )
         if args.command in ("run", "resume"):
             return orchestrate(args, script_dir, config)
         parser.error("Unknown command")
@@ -1189,6 +1313,8 @@ def main() -> int:
     except StargateError as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         return 1
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        return 130
+    except KeyboardInterrupt as exc:
+        signum = getattr(exc, "signum", signal.SIGINT)
+        message = "Interrupted" if signum == signal.SIGINT else "Terminated"
+        print(f"\n{message}.", file=sys.stderr)
+        return 128 + int(signum)

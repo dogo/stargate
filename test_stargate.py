@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -75,6 +76,212 @@ def runs(repo: Path) -> subprocess.CompletedProcess[str]:
         cwd=repo, text=True, capture_output=True,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
+
+
+def stargate(
+    repo: Path, *args: str, config_home: Path
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "stargate", *args],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT),
+             "XDG_CONFIG_HOME": str(config_home)},
+    )
+
+
+def test_settings_only_project_config_is_valid(root: Path) -> None:
+    repo = make_repo(root)
+    (repo / ".stargate.yaml").write_text(
+        'settings:\n  test_command: "npm test"\n'
+    )
+
+    proc = stargate(repo, "doctor", config_home=root / "empty-config")
+    assert "Config must contain" not in proc.stderr, proc.stderr
+    assert "ERROR" not in proc.stderr, proc.stderr
+    assert "Effective settings:" in proc.stdout, proc.stdout
+    assert "'npm test'" in proc.stdout, proc.stdout
+
+
+def test_project_config_layers_over_user_config(root: Path) -> None:
+    repo = make_repo(root)
+    config_home = root / "config"
+    user_cfg = config_home / "stargate" / "agents.yaml"
+    user_cfg.parent.mkdir(parents=True)
+    reviewer_prompt = root / "reviewer-prompt.txt"
+    write_config(
+        user_cfg,
+        f'printf "%s" "$0" > {reviewer_prompt}; echo "VERDICT: APPROVED"',
+        test_command="false",
+        agent_timeout=73,
+    )
+    (repo / ".stargate.yaml").write_text(
+        "settings:\n"
+        "  test_command: echo MARKER_PROJECT_TESTS\n"
+        "  max_review_loops: 0\n"
+    )
+
+    proc = stargate(
+        repo, "run", "demo task", config_home=config_home
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "MARKER_PROJECT_TESTS" in reviewer_prompt.read_text()
+
+    import yaml
+    artifacts = next((repo / ".stargate" / "runs").glob("*"))
+    frozen = yaml.safe_load((artifacts / "config.yaml").read_text())
+    assert frozen["settings"]["test_command"] == "echo MARKER_PROJECT_TESTS"
+    assert frozen["settings"]["agent_timeout_seconds"] == 73
+    assert frozen["workflow"]["architect"] == "noop"
+    assert "noop" in frozen["agents"]
+    assert "developer" in frozen["agents"], "packaged base was not frozen"
+
+
+def test_project_config_overrides_one_agent_only(root: Path) -> None:
+    repo = make_repo(root)
+    config_home = root / "config"
+    user_cfg = config_home / "stargate" / "agents.yaml"
+    user_cfg.parent.mkdir(parents=True)
+    inherited = root / "inherited-agent.txt"
+    project = root / "project-agent.txt"
+
+    import yaml
+    user_cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "noop": {"command": agent(f"echo inherited >> {inherited}; echo done")},
+            "reviewer": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "noop", "developer": "noop",
+                     "reviewer": "reviewer", "fixer": "noop"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+    (repo / ".stargate.yaml").write_text(yaml.safe_dump({
+        "agents": {"project_reviewer": {"command": agent(
+            f'echo project > {project}; echo "VERDICT: APPROVED"'
+        )}},
+        "workflow": {"reviewer": "project_reviewer"},
+    }))
+
+    proc = stargate(
+        repo, "run", "demo task", config_home=config_home
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert project.exists(), "project reviewer did not run"
+    assert inherited.exists(), "agents omitted by the project were not inherited"
+
+
+def test_explicit_config_is_not_layered(root: Path) -> None:
+    repo = make_repo(root)
+    leak = root / "project-setting-leaked.txt"
+    (repo / ".stargate.yaml").write_text(
+        f"settings:\n  test_command: touch {leak}\n"
+    )
+    cfg = root / "explicit.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not leak.exists(), "project config was layered over explicit --config"
+
+
+def test_doctor_reports_config_provenance(root: Path) -> None:
+    repo = make_repo(root)
+    config_home = root / "config"
+    user_cfg = config_home / "stargate" / "agents.yaml"
+    user_cfg.parent.mkdir(parents=True)
+    write_config(
+        user_cfg, 'echo "VERDICT: APPROVED"', test_command="false",
+        agent_timeout=73,
+    )
+    project_cfg = repo / ".stargate.yaml"
+    project_cfg.write_text("settings:\n  test_command: echo PROJECT\n")
+
+    proc = stargate(repo, "doctor", config_home=config_home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "Config sources (most specific first):" in proc.stdout
+    assert f"[1] {project_cfg}" in proc.stdout
+    assert f"[2] {user_cfg}" in proc.stdout
+    assert "[3]" in proc.stdout and "(packaged defaults)" in proc.stdout
+    test_line = next(line for line in proc.stdout.splitlines()
+                     if line.strip().startswith("test_command"))
+    timeout_line = next(line for line in proc.stdout.splitlines()
+                        if line.strip().startswith("agent_timeout_seconds"))
+    packaged_line = next(line for line in proc.stdout.splitlines()
+                         if line.strip().startswith("max_task_tokens"))
+    assert test_line.endswith("[1]"), test_line
+    assert timeout_line.endswith("[2]"), timeout_line
+    assert packaged_line.endswith("[3]"), packaged_line
+
+
+def test_sigterm_records_a_terminal_status(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "signal.yaml"
+    started = root / "agent-started.txt"
+    finished = root / "agent-finished.txt"
+
+    import yaml
+    # The cleanup contract covers the process Popen starts; avoiding a shell
+    # here keeps the regression test from implying recursive process cleanup.
+    slow = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(started)!r}).write_text(str(os.getpid())); "
+        "time.sleep(30); "
+        f"pathlib.Path({str(finished)!r}).write_text('done')"
+    )
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "slow": {"command": [sys.executable, "-c", slow]},
+            "noop": {"command": agent("echo done")},
+            "reviewer": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "slow", "developer": "noop",
+                     "reviewer": "reviewer", "fixer": "noop"},
+        "settings": {"max_review_loops": 0, "test_command": "true",
+                     "agent_timeout_seconds": 60},
+    }))
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "stargate", "--config", str(cfg),
+         "run", "signal test"],
+        cwd=repo, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+
+    deadline = time.monotonic() + 15
+    while not started.exists() and proc.poll() is None \
+            and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if not started.exists():
+        proc.kill()
+        out, err = proc.communicate(timeout=10)
+        raise AssertionError(f"agent did not start\nstdout:\n{out}\nstderr:\n{err}")
+
+    agent_pid = int(started.read_text())
+    proc.terminate()
+    out, err = proc.communicate(timeout=15)
+    assert proc.returncode == 143, out + err
+    assert "Resume with: stargate resume" in err, err
+
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert state["status"] == "failed", state
+    assert "signal 15" in state["error"], state
+
+    listing = runs(repo)
+    run_line = next(line for line in listing.stdout.splitlines()
+                    if state["run_id"] in line)
+    assert "failed" in run_line and "running" not in run_line, run_line
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(agent_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError(f"agent process {agent_pid} survived SIGTERM cleanup")
+    assert not finished.exists(), "agent continued after the orchestrator exited"
 
 
 def test_doctor_probe_is_opt_in_and_deduplicated(root: Path) -> None:
@@ -700,7 +907,13 @@ def test_runs_survives_a_corrupt_state_file(root: Path) -> None:
 
 
 if __name__ == "__main__":
-    for fn in (test_doctor_probe_is_opt_in_and_deduplicated,
+    for fn in (test_settings_only_project_config_is_valid,
+               test_project_config_layers_over_user_config,
+               test_project_config_overrides_one_agent_only,
+               test_explicit_config_is_not_layered,
+               test_doctor_reports_config_provenance,
+               test_sigterm_records_a_terminal_status,
+               test_doctor_probe_is_opt_in_and_deduplicated,
                test_doctor_probe_reports_cli_failure,
                test_doctor_probe_rejects_empty_output_and_skips_missing_probe,
                test_doctor_probe_reports_missing_git_without_crashing,
