@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 # claude -p --output-format text already prints only the final message, so the
 # Claude roles need no {output} placeholder.
@@ -19,8 +19,10 @@ agents:
       - Edit Write NotebookEdit
       - --model
       - opus
-    # Used only by `stargate doctor --probe`; this makes a small billable call.
-    probe: "Reply with exactly OK."
+    # A prose reply proves only that credentials work. This exercises reading,
+    # which the role is allowed to do despite its editing tools being disabled.
+    probe: "Read the file {probe_file} and reply with its contents, nothing else."
+    probe_expect: read
     # Per-agent environment, merged over the orchestrator's own. A null value
     # REMOVES the variable: an ANTHROPIC_API_KEY exported globally shadows the
     # CLI's claude.ai login, and this is how one agent opts out of it without
@@ -39,8 +41,10 @@ agents:
       - workspace-write
       - --output-last-message
       - "{output}"
-    # Used only by `stargate doctor --probe`; this makes a small billable call.
-    probe: "Reply with exactly OK."
+    # The implementer's real job depends on editing, so the billable probe
+    # creates a file in stargate's throwaway repository, never in yours.
+    probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+    probe_expect: write
     # codex exec ends its stdout with "tokens used\n7,967".
     usage_pattern: 'tokens used\s+([\d,]+)'
 
@@ -54,7 +58,8 @@ agents:
       - Edit Write NotebookEdit
       - --model
       - opus
-    probe: "Reply with exactly OK."
+    probe: "Read the file {probe_file} and reply with its contents, nothing else."
+    probe_expect: read
 
   fixer:
     command:
@@ -64,7 +69,8 @@ agents:
       - workspace-write
       - --output-last-message
       - "{output}"
-    probe: "Reply with exactly OK."
+    probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+    probe_expect: write
     # codex exec ends its stdout with "tokens used\n7,967".
     usage_pattern: 'tokens used\s+([\d,]+)'
 
