@@ -107,7 +107,8 @@ Everything under `settings:` in the layered effective config. All are optional.
 
 | key | default | meaning |
 |---|---|---|
-| `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. Empty means no tests. |
+| `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. An explicit value always wins over detection. |
+| `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
 | `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
@@ -125,10 +126,10 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 
 | code | meaning |
 |---|---|
-| `0` | Approved, and the test command passed or was not configured. |
+| `0` | Approved, and the test command passed or no command ran (`report`, `off`, or no match). |
 | `1` | The run failed — an agent errored, timed out, or config was invalid. `resume` is offered. |
 | `2` | The reviewer still requested changes after the last allowed fixer pass, or the fixer changed nothing and the loop stopped early. |
-| `3` | Approved, but the test command failed. |
+| `3` | Approved, but the explicit test command or an `auto`-detected command failed. |
 | `4` | `max_task_tokens` was reached; the run stopped between phases. |
 | `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
 | `130` | The run was interrupted with Ctrl-C/SIGINT. Its state is recorded as failed and `resume` is offered. |
@@ -144,9 +145,10 @@ stargate doctor
 ```
 
 It prints the numbered config layers and provenance of the effective settings
-and agents, each role's resolved command, and the prompt file each role would
-use. It makes no external calls, so `FOUND` means only that the executable is on
-`PATH` — see
+and agents, each role's resolved command, the prompt file each role would use,
+and the configured or detected project test commands with their evidence. It
+makes no external calls, so `FOUND` means only that the executable is on `PATH`
+— see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
 
 ## Probing agents
@@ -223,15 +225,36 @@ stargate run \
   "Refactor the image cache"
 ```
 
+Give the run and branch a short name before anything is created:
+
+```bash
+stargate run --name "passkey auth" "Add passkey authentication to account settings"
+```
+
+`--name` takes precedence over the architect's suggestion and uses at most five
+whole words (32 characters), never a word truncated in the middle.
+
 ## What gets created
 
-Suppose the task is `Add passkey authentication`.
-
-The implementation gets its own branch similar to:
+Suppose the architect names the work `passkey auth`. The implementation gets a
+short branch similar to:
 
 ```text
-stargate/add-passkey-authentication-20260830-181500
+stargate/passkey-auth-20260830-181500
 ```
+
+The packaged architect prompt asks for a `NAME:` first line. Stargate strips a
+valid line before forwarding the plan to the developer, reviewer, and fixer. A
+custom/older prompt that omits it, or a malformed name, safely falls back to the
+task slug and leaves the plan untouched.
+
+The run ID and artifacts directory must exist before the architect runs, so an
+architect suggestion renames the branch only. Use `--name "passkey auth"` when
+the run ID should also be short; that produces
+`20260830-181500-passkey-auth`. Existing run IDs are not parsed or migrated, so
+they continue to work with `runs` and `resume`. If a name is reserved twice in
+the same second, both the run ID and branch receive the same `-2`, `-3`, …
+discriminator.
 
 And its own worktree outside the target repository:
 
@@ -257,7 +280,7 @@ my-project/.stargate/runs/<run-id>/
 ├── developer.txt.log
 ├── review-1.md
 ├── fix-1.txt          # only when needed
-├── tests-*.txt        # if test_command is configured
+├── tests-*.txt        # if an explicit or auto-detected command runs
 └── summary.md
 ```
 
@@ -281,12 +304,49 @@ artifacts never show up in the target repo's `git status`.
 
 ## Configure tests
 
-The test command is per-project, so it belongs in the repo's `.stargate.yaml`:
+When `test_command` is empty, stargate inspects the repository and prints every
+likely test command and the file that supplied the evidence. `stargate doctor`
+shows the same information before a run. Detection has a fixed priority rather
+than accidental first-match-wins:
+
+1. `make test` for a `test` target in `Makefile`, `makefile`, or `GNUmakefile`
+2. `npm test`, `pnpm test`, or `yarn test` for a non-placeholder
+   `package.json` `scripts.test` (lock files choose pnpm/yarn)
+3. `cargo test` for `Cargo.toml`
+4. `go test ./...` for `go.mod`
+5. `swift test` for `Package.swift`
+6. `pytest -q` only with explicit pytest configuration/dependencies or
+   `tests/test_*.py`
+
+A root-level `test_*.py` alone is deliberately not a pytest signal: projects
+often have executable smoke tests with custom arguments that pytest cannot
+collect. Detection reads the original repository once, before agent edits, so
+a developer cannot cause a newly written command to execute later in the same
+run.
+
+The default mode is `report`. A detected command is a command the user did not
+write into stargate configuration, and the wrong guess could invoke a watcher,
+an unexpectedly broad suite, or a misleading reviewer verdict several times.
+Report-only mode fixes the previous silent failure without taking that extra
+authority: it prints the top choice and alternatives, and tells the reviewer
+what was found but not run.
+
+Confirm the project command explicitly in `.stargate.yaml`:
 
 ```yaml
 settings:
   test_command: "pytest -q"
 ```
+
+Or opt into automatically running the highest-priority match:
+
+```yaml
+settings:
+  test_command_detection: auto
+```
+
+Set the mode to `off` when the repository intentionally has no orchestrator
+test command. An explicit `test_command` always wins and suppresses detection.
 
 Examples:
 
@@ -332,6 +392,11 @@ wins:
 
 So keeping only a custom `reviewer.md` leaves the other three on the defaults.
 `stargate doctor` prints the file each role resolved to.
+
+The packaged `architect.md` also asks the architect to begin its response with
+`NAME: <two to four words>`. Stargate treats that line as optional for custom
+and frozen prompts: only a valid first non-empty `NAME:` line is removed, and
+the rest of the plan is forwarded unchanged.
 
 Prompts committed with a project:
 
@@ -627,7 +692,6 @@ much it would change the tool:
   DAG scheduling, then an integrated review across the branches. This is the
   real v2 and everything else is small next to it.
 - **Structured review output** (JSON findings instead of a prose verdict).
-- **Project detection** for `test_command`.
 - **GitHub issue / PR as task input.**
 
 ## License

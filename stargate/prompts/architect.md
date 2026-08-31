@@ -8,6 +8,13 @@ BASE REF:
 
 Inspect the repository before proposing a solution. Do not edit files.
 
+The FIRST LINE of your response must be exactly:
+
+NAME: <two to four words naming this work, e.g. "detect test command">
+
+Then add a blank line and the plan. The orchestrator uses that line to name the
+branch and strips it before forwarding the plan to the other agents.
+
 Produce an implementation plan for another coding agent. Be concrete and repository-specific.
 Include:
 1. Current architecture/components that matter.

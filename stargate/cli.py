@@ -35,6 +35,12 @@ class Terminated(KeyboardInterrupt):
         self.signum = signum
 
 
+@dataclass(frozen=True)
+class Detected:
+    command: str
+    source: str
+
+
 @dataclass
 class RunContext:
     repo: Path
@@ -49,6 +55,11 @@ class RunContext:
     stage: str = "init"
     done: set[str] = field(default_factory=set)
     tokens_used: int = 0
+    tag: str = ""
+    named_by_user: bool = False
+    test_command: str = ""
+    test_source: str = ""
+    detected: list[Detected] = field(default_factory=list)
 
 
 def run_process(
@@ -246,6 +257,45 @@ def load_config(
 def slugify(text: str, max_len: int = 42) -> str:
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return (text or "task")[:max_len].rstrip("-")
+
+
+BRANCH_NAME_WORDS = 5
+BRANCH_NAME_CHARS = 32
+
+
+def short_name(text: str) -> str:
+    """Return a short slug made only from whole words."""
+    words = [word.lower() for word in re.findall(r"[a-zA-Z0-9]+", text)]
+    kept: list[str] = []
+    for word in words[:BRANCH_NAME_WORDS]:
+        candidate = "-".join([*kept, word])
+        if len(candidate) > BRANCH_NAME_CHARS:
+            break
+        kept.append(word)
+    return "-".join(kept)
+
+
+NAME_PREFIX = "NAME:"
+
+
+def split_plan_name(plan: str) -> tuple[str, str]:
+    """Extract an optional first-line name without damaging older plans.
+
+    Only a valid name on the first non-empty line is removed. Custom and frozen
+    prompts predate this contract, and an ignored or malformed instruction must
+    keep flowing verbatim instead of turning a compatible run into a failure.
+    """
+    lines = plan.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    if first is None:
+        return "", plan
+    line = lines[first].strip()
+    if not line.startswith(NAME_PREFIX):
+        return "", plan
+    name = short_name(line[len(NAME_PREFIX):].strip())
+    if not name:
+        return "", plan
+    return name, "\n".join([*lines[:first], *lines[first + 1:]]).strip()
 
 
 def resolve_base_ref(repo: Path, requested: str | None) -> str:
@@ -532,6 +582,112 @@ def value_source(
     return "(default)"
 
 
+DETECTION_MODES = ("report", "auto", "off")
+DETECTION_READ_LIMIT = 65536
+
+
+# A detected command is input the user never wrote. It may run unattended after
+# every fixer, influence the review verdict and set the process exit code; a bad
+# guess can also be a deploy-ish Make target or a watcher that only ends at the
+# timeout. The default therefore fixes the dangerous silence by reporting the
+# guess and its evidence, without executing it. Users who accept that risk can
+# opt into `auto`; `off` records that the repository intentionally has no test.
+def detection_mode(config: dict[str, Any]) -> str:
+    settings = config.get("settings", {})
+    mode = str(settings.get("test_command_detection", "report") or "report")
+    mode = mode.strip().lower()
+    if mode not in DETECTION_MODES:
+        raise StargateError(
+            "settings.test_command_detection must be one of report, auto, off"
+        )
+    return mode
+
+
+def read_detection_file(path: Path) -> str | None:
+    """Read enough evidence for detection without trusting project file size."""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return handle.read(DETECTION_READ_LIMIT)
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def is_file(path: Path) -> bool:
+    with contextlib.suppress(OSError):
+        return path.is_file()
+    return False
+
+
+def detect_test_commands(root: Path) -> list[Detected]:
+    """Return all likely commands in a deliberate, user-visible priority."""
+    detected: list[Detected] = []
+
+    # A hand-written project entry point commonly wraps the native runner, so
+    # it outranks language metadata. All lower-ranked matches are still shown.
+    for name in ("Makefile", "makefile", "GNUmakefile"):
+        text = read_detection_file(root / name)
+        if text is not None and re.search(r"(?m)^test\s*:(?!=)", text):
+            detected.append(Detected("make test", f"{name}: test target"))
+            break
+
+    package = read_detection_file(root / "package.json")
+    if package is not None:
+        with contextlib.suppress(json.JSONDecodeError, TypeError, AttributeError):
+            script = json.loads(package).get("scripts", {}).get("test", "")
+            script = script.strip() if isinstance(script, str) else ""
+            if script and "error: no test specified" not in script.lower():
+                runner = (
+                    "pnpm" if is_file(root / "pnpm-lock.yaml")
+                    else "yarn" if is_file(root / "yarn.lock")
+                    else "npm"
+                )
+                detected.append(Detected(
+                    f"{runner} test", "package.json: scripts.test"
+                ))
+
+    for filename, command in (
+        ("Cargo.toml", "cargo test"),
+        ("go.mod", "go test ./..."),
+        ("Package.swift", "swift test"),
+    ):
+        if is_file(root / filename):
+            detected.append(Detected(command, filename))
+
+    pytest_source = ""
+    pyproject = read_detection_file(root / "pyproject.toml")
+    if pyproject is not None:
+        if re.search(r"(?im)^\s*\[tool\.pytest(?:\.|\])", pyproject):
+            pytest_source = "pyproject.toml: tool.pytest"
+        elif (
+            re.search(r"(?im)^\s*pytest(?:[-_.][\w.-]+)?\s*=", pyproject)
+            or re.search(
+                r'''(?i)["']pytest(?:[-_.][\w.-]+)?(?:[<>=~!][^"']*)?["']''',
+                pyproject,
+            )
+        ):
+            pytest_source = "pyproject.toml: pytest dependency"
+    if not pytest_source and is_file(root / "pytest.ini"):
+        pytest_source = "pytest.ini"
+    if not pytest_source:
+        for filename in ("setup.cfg", "tox.ini"):
+            text = read_detection_file(root / filename)
+            if text is not None and re.search(r"(?im)^\s*\[tool:pytest\]", text):
+                pytest_source = f"{filename}: tool:pytest"
+                break
+    if not pytest_source:
+        tests = root / "tests"
+        with contextlib.suppress(OSError):
+            if tests.is_dir() and any(path.is_file() for path in tests.rglob("test_*.py")):
+                pytest_source = "tests/: test_*.py"
+    # A root-level test_*.py is not enough evidence: this repository's smoke
+    # test takes a custom argument and pytest collection would fail. That false
+    # positive is exactly why detection reports rather than runs by default.
+    if pytest_source:
+        detected.append(Detected("pytest -q", pytest_source))
+
+    return detected
+
+
 def doctor(
     config: dict[str, Any],
     layers: list[tuple[Path, dict[str, Any]]],
@@ -585,6 +741,7 @@ def doctor(
     for key, default in (
         ("max_review_loops", 2),
         ("test_command", ""),
+        ("test_command_detection", "report"),
         ("max_task_tokens", 0),
         ("agent_timeout_seconds", 1800),
         ("agent_retries", AGENT_RETRIES_DEFAULT),
@@ -595,6 +752,31 @@ def doctor(
     ):
         value = settings.get(key, default)
         print(f"  {key:22} {value!r}   {value_source(layers, 'settings', key)}")
+
+    mode = detection_mode(config)
+    command = str(settings.get("test_command", "") or "").strip()
+    print("\nTest command:")
+    if command:
+        source = value_source(layers, "settings", "test_command")
+        print(f"  configured  {command!r}   {source}")
+    elif mode == "off":
+        print("  (not configured; detection is off)")
+    else:
+        candidates = detect_test_commands(Path.cwd())
+        print("  (not configured)")
+        for candidate in candidates:
+            print(f"  detected    {candidate.command:16} {candidate.source}")
+        if not candidates:
+            print("  No likely project test command detected.")
+        elif mode == "auto":
+            print(f"  Detection is automatic; {candidates[0].command!r} will run.")
+        else:
+            print(
+                "  Detection is report-only. To use the first candidate, "
+                "add to .stargate.yaml:"
+            )
+            print("    settings:")
+            print(f"      test_command: {candidates[0].command!r}")
 
     cap = token_cap(config)
     print("\nAgents:")
@@ -800,23 +982,70 @@ def default_worktree_root(repo: Path) -> Path:
     return repo.parent / ".stargate-worktrees" / repo.name
 
 
+def branch_exists(repo: Path, branch: str) -> bool:
+    proc = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=str(repo), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return proc.returncode == 0
+
+
+def unique_branch(repo: Path, branch: str) -> str:
+    for attempt in range(1, 100):
+        candidate = branch if attempt == 1 else f"{branch}-{attempt}"
+        if not branch_exists(repo, candidate):
+            return candidate
+    raise StargateError(f"Could not find an unused branch name based on {branch!r}.")
+
+
+def reserve_run(repo: Path, now: str, slug: str) -> tuple[str, str, Path]:
+    """Reserve one discriminator for both artifacts and the initial branch.
+
+    A second process in the same second would otherwise share the artifacts
+    directory while Git also refuses to attach its branch to another worktree.
+    Creating the directory is the atomic claim; old first-attempt names retain
+    their exact shape, so `runs` and `resume` need no format migration.
+    """
+    for attempt in range(1, 100):
+        suffix = "" if attempt == 1 else f"-{attempt}"
+        tag = f"{now}{suffix}"
+        run_id = f"{now}-{slug}{suffix}"
+        branch = f"stargate/{slug}-{tag}"
+        if branch_exists(repo, branch):
+            continue
+        artifacts = repo / ".stargate" / "runs" / run_id
+        try:
+            artifacts.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        return run_id, branch, artifacts
+    raise StargateError(
+        f"Could not reserve a unique run name for {slug!r} at {now}."
+    )
+
+
 def make_context(
     repo: Path,
     config: dict[str, Any],
     task: str,
     base_ref: str | None,
+    name: str | None = None,
 ) -> RunContext:
     now = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    slug = slugify(task)
-    run_id = f"{now}-{slug}"
+    named = short_name(name or "") if name is not None else ""
+    if name is not None and not named:
+        print(
+            "Warning: --name produced no usable slug; using the task text.",
+            file=sys.stderr,
+        )
+    slug = named or slugify(task)
     base = resolve_base_ref(repo, base_ref)
-    branch = f"stargate/{slug}-{now}"
+    run_id, branch, artifacts = reserve_run(repo, now, slug)
+    tag = branch.removeprefix(f"stargate/{slug}-")
 
     configured = str(config.get("settings", {}).get("worktree_root", "") or "").strip()
     worktree_root = Path(os.path.expanduser(configured)).resolve() if configured else default_worktree_root(repo)
     worktree = worktree_root / run_id
-    artifacts = repo / ".stargate" / "runs" / run_id
-    artifacts.mkdir(parents=True, exist_ok=False)
     # Keep run artifacts out of the target repo's git status without touching
     # the user's own .gitignore.
     (repo / ".stargate" / ".gitignore").write_text("*\n")
@@ -832,6 +1061,8 @@ def make_context(
         worktree=worktree,
         artifacts=artifacts,
         task=task,
+        tag=tag,
+        named_by_user=bool(named),
     )
 
 
@@ -873,6 +1104,7 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "error": error,
         "completed": sorted(ctx.done),
         "tokens_used": ctx.tokens_used,
+        "named_by_user": ctx.named_by_user,
         "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
         "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }, indent=2) + "\n")
@@ -913,6 +1145,13 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         stage=state.get("stage", "init"),
         done=set(state.get("completed", [])),
         tokens_used=int(state.get("tokens_used", 0)),
+        tag=(
+            match.group(1)
+            if (match := re.search(
+                r"-(\d{8}-\d{6}(?:-\d+)?)$", str(state["branch"])
+            )) else ""
+        ),
+        named_by_user=bool(state.get("named_by_user", False)),
     )
 
 
@@ -1061,18 +1300,81 @@ def worktree_fingerprint(ctx: RunContext) -> str:
 TEST_TAIL_LINES = 200
 
 
+def plan_tests(ctx: RunContext) -> None:
+    """Choose once from the original repository and explain the choice."""
+    settings = ctx.config.get("settings", {})
+    mode = detection_mode(ctx.config)
+    configured = str(settings.get("test_command", "") or "").strip()
+    ctx.test_command = ""
+    ctx.test_source = ""
+    ctx.detected = []
+    if configured:
+        ctx.test_command = configured
+        ctx.test_source = "settings.test_command"
+        print(f"Tests:    {configured}   (settings.test_command)")
+        return
+    if mode == "off":
+        ctx.test_source = "not configured; detection off"
+        print("Tests:    none configured (test command detection is off)")
+        return
+
+    ctx.detected = detect_test_commands(ctx.repo)
+    if not ctx.detected:
+        ctx.test_source = "not configured; none detected"
+        print("Tests:    none configured, none detected")
+        return
+
+    selected = ctx.detected[0]
+    if mode == "auto":
+        ctx.test_command = selected.command
+        ctx.test_source = f"detected: {selected.source}"
+        print(
+            f"Tests:    {selected.command}   (detected: {selected.source}; "
+            "automatic)"
+        )
+        for candidate in ctx.detected[1:]:
+            print(
+                f"          {candidate.command}   (detected: {candidate.source}; "
+                "lower priority, not selected)"
+            )
+        return
+
+    ctx.test_source = (
+        f"detected {selected.command} from {selected.source}; report-only"
+    )
+    print(
+        f"Tests:    {selected.command}   (detected: {selected.source}; not run -- "
+        "settings.test_command_detection: report)"
+    )
+    for candidate in ctx.detected[1:]:
+        print(
+            f"          {candidate.command}   (detected: {candidate.source}; not run)"
+        )
+    print("          To confirm the first candidate, add to .stargate.yaml:")
+    print("            settings:")
+    print(f"              test_command: {selected.command!r}")
+
+
 def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
     """Run the configured suite. Returns (exit code, report shown to agents)."""
     settings = ctx.config.get("settings", {})
-    command = str(settings.get("test_command", "") or "").strip()
+    command = ctx.test_command
     if not command:
         print("\nNo automatic test_command configured; skipping orchestrator-level tests.")
+        if ctx.detected:
+            candidate = ctx.detected[0]
+            return None, (
+                "No test command is configured in the orchestrator. It detected "
+                f"`{candidate.command}` ({candidate.source}) but did not run it. "
+                "Run the project's own tests yourself if you can."
+            )
         return None, (
             "No test command is configured in the orchestrator. "
             "Run the project's own tests yourself if you can."
         )
 
-    print(f"\nRunning configured test command: {command}")
+    kind = "detected" if ctx.test_source.startswith("detected:") else "configured"
+    print(f"\nRunning {kind} test command: {command}")
     timeout = float(settings.get("test_timeout_seconds", 900)) or None
     try:
         proc = subprocess.run(
@@ -1134,6 +1436,7 @@ Base ref: {ctx.base_ref}
 Branch: {ctx.branch}
 Worktree: {ctx.worktree}
 Verdict: {verdict}
+Test command: {ctx.test_command or "(none)"} ({ctx.test_source})
 Test exit: {test_exit}
 Tokens reported: {ctx.tokens_used:,}{" of " + format(token_cap(ctx.config), ",") if token_cap(ctx.config) else ""}
 
@@ -1170,7 +1473,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         print(f"Completed: {', '.join(sorted(ctx.done)) or '(nothing)'}")
     else:
         warn_if_dirty(repo)
-        ctx = make_context(repo, config, args.task, args.base_ref)
+        ctx = make_context(repo, config, args.task, args.base_ref, args.name)
         prompts = snapshot(ctx, prompt_dirs(config, script_dir))
 
     print(f"\nRun ID:   {ctx.run_id}")
@@ -1180,6 +1483,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     print(f"Artifacts:{ctx.artifacts}")
 
     try:
+        plan_tests(ctx)
         return run_stages(ctx, args, prompts)
     except (StargateError, KeyboardInterrupt) as exc:
         save_state(ctx, "failed", f"{type(exc).__name__}: {exc}")
@@ -1190,20 +1494,40 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
 def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -> int:
     config = ctx.config
     plan_path = ctx.artifacts / "plan.md"
+    architect_ran = False
 
     # 1. Architect reads the original repository and emits a plan.
     if "architect" in ctx.done:
-        plan = plan_path.read_text().strip()
+        raw_plan = plan_path.read_text().strip()
         print(f"\n=== ARCHITECT (skipped, reusing {plan_path}) ===")
     else:
+        architect_ran = True
         enter_stage(ctx, "architect")
         architect_prompt = render_prompt(
             prompts, "architect", task=ctx.task, base_ref=ctx.base_ref
         )
         print("\n=== ARCHITECT ===")
-        plan = invoke_agent(ctx, "architect", architect_prompt, ctx.repo, plan_path).strip()
-        if not plan:
-            raise StargateError("Architect returned an empty plan.")
+        raw_plan = invoke_agent(
+            ctx, "architect", architect_prompt, ctx.repo, plan_path
+        ).strip()
+
+    architect_name, plan = split_plan_name(raw_plan)
+    if not plan:
+        raise StargateError("Architect returned an empty plan.")
+    # The worktree is deliberately created after planning, so the branch can
+    # still adopt the architect's vocabulary. The run id was already printed
+    # and names artifacts/worktree paths; changing it here would break resume.
+    # An existing worktree is stronger evidence than a missing completion bit
+    # after a crash, and must never be orphaned by a rename.
+    if (
+        architect_name and not ctx.named_by_user and ctx.tag
+        and "worktree" not in ctx.done and not ctx.worktree.exists()
+    ):
+        proposed = f"stargate/{architect_name}-{ctx.tag}"
+        ctx.branch = unique_branch(ctx.repo, proposed)
+        save_state(ctx, "running")
+        print(f"Branch:   {ctx.branch}   (named by the architect)")
+    if architect_ran:
         complete_stage(ctx, "architect")
 
     # 2. Create isolated implementation branch/worktree.
@@ -1372,6 +1696,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--base-ref",
         default=None,
         help="Git ref to branch from. Defaults to the current branch/ref.",
+    )
+    run.add_argument(
+        "--name",
+        default=None,
+        help="Short name for the branch and run id, e.g. --name 'passkey auth'. "
+        "Overrides the name the architect suggests.",
     )
 
     resume = sub.add_parser(
