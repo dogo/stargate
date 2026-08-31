@@ -291,6 +291,35 @@ the run stops rather than silently forwarding an empty plan.
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
 
+### Probing
+
+`doctor` alone never calls an agent. `doctor --probe` makes one real,
+**billable** call per distinct agent command — two for the four default roles,
+since they map onto two commands:
+
+```console
+$ stargate doctor --probe
+Agent probes:
+  FAIL architect, reviewer [4.3s]
+       Credit balance is too low
+  OK   developer, fixer [7.9s]
+```
+
+The prompt lives in the config, so the orchestrator stays vendor-agnostic:
+
+```yaml
+architect:
+  command: [claude, -p, --output-format, text, --model, opus]
+  probe: "Reply with exactly OK."
+```
+
+Because the probe runs the agent's *real* command, it catches a wrong model
+name or an unsupported flag too, not only credentials — including an agent that
+exits 0 while writing nothing to its `{output}` file. Agents with no `probe`
+key report `SKIP` and do not fail the exit code. Probes run in a throwaway git
+repository, never in yours, and use `probe_timeout_seconds` (120) rather than
+the much longer agent timeout.
+
 ## Resuming a failed run
 
 Every stage is recorded in the run's `state.json` before and after it runs. If

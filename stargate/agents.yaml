@@ -2,6 +2,12 @@ version: 2
 
 # claude -p --output-format text already prints only the final message, so the
 # Claude roles need no {output} placeholder.
+#
+# NOT --permission-mode plan: under it Claude Code saves the plan to a file in
+# ~/.claude/plans and prints only a summary, so the orchestrator would forward
+# a fraction of the plan without noticing. --disallowedTools keeps the same
+# read-only guarantee (the architect runs in the real repo, not the worktree)
+# while leaving the answer on stdout.
 agents:
   architect:
     command:
@@ -9,8 +15,8 @@ agents:
       - -p
       - --output-format
       - text
-      - --permission-mode
-      - plan
+      - --disallowedTools
+      - Edit Write NotebookEdit
       - --model
       - opus
     # Used only by `stargate doctor --probe`; this makes a small billable call.
@@ -38,8 +44,8 @@ agents:
       - -p
       - --output-format
       - text
-      - --permission-mode
-      - plan
+      - --disallowedTools
+      - Edit Write NotebookEdit
       - --model
       - opus
     probe: "Reply with exactly OK."
@@ -89,6 +95,10 @@ settings:
   # overshoots. For a real in-flight cap, put a vendor flag in the command:
   # claude has --max-budget-usd, codex has no equivalent today.
   max_task_tokens: 0
+
+  # A probe is meant to be a quick liveness check, so it does not inherit the
+  # much longer agent timeout.
+  probe_timeout_seconds: 120
 
   # Hard limits so a stuck agent or test suite cannot hang the run forever.
   agent_timeout_seconds: 1800
