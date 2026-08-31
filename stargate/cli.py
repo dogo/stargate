@@ -7,9 +7,11 @@ import os
 import re
 import shlex
 import shutil
+import json
 import subprocess
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,9 @@ class RunContext:
     base_ref: str
     worktree: Path
     artifacts: Path
+    task: str = ""
+    stage: str = "init"
+    done: set[str] = field(default_factory=set)
     tokens_used: int = 0
 
 
@@ -40,8 +45,30 @@ def run_process(
     capture: bool = True,
     check: bool = True,
     timeout: float | None = None,
+    log_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print(f"\n$ {shlex.join(args)}", flush=True)
+    if log_path is not None:
+        # Straight to disk, so a silent multi-minute agent can be tailed live
+        # instead of surfacing only once the process exits.
+        try:
+            with log_path.open("w") as handle:
+                proc = subprocess.run(
+                    args, cwd=str(cwd), text=True, stdout=handle,
+                    stderr=subprocess.STDOUT, timeout=timeout,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise StargateError(
+                f"Command timed out after {timeout}s (partial trace in {log_path}): "
+                f"{shlex.join(args)}"
+            ) from exc
+        output = log_path.read_text() if log_path.exists() else ""
+        if check and proc.returncode != 0:
+            raise StargateError(
+                f"Command failed with exit code {proc.returncode} "
+                f"(trace in {log_path}): {shlex.join(args)}"
+            )
+        return subprocess.CompletedProcess(args, proc.returncode, output, None)
     try:
         proc = subprocess.run(
             args,
@@ -210,13 +237,39 @@ def doctor(config: dict[str, Any], config_path: Path, script_dir: Path) -> int:
 
     for binary in sorted(binaries):
         path = shutil.which(binary)
-        state = "OK" if path else "MISSING"
+        state = "FOUND" if path else "MISSING"
         print(f"{state:8} {binary:12} {path or ''}")
         ok = ok and bool(path)
+    print(
+        "\nFOUND means the executable is on PATH. Authentication, credits, quota\n"
+        "and model availability are NOT checked -- an agent can still fail on its\n"
+        "first call (e.g. \"Credit balance is too low\")."
+    )
+
+    packaged = yaml.safe_load((script_dir / "agents.yaml").read_text()) or {}
+    mine, theirs = config.get("version"), packaged.get("version")
+    if mine is not None and theirs is not None and mine != theirs:
+        print(
+            f"\nWARN     config version {mine} differs from the packaged version "
+            f"{theirs}.\n         Newer defaults may be missing; compare against "
+            f"{script_dir / 'agents.yaml'}."
+        )
+
+    settings = config.get("settings", {})
+    print("\nEffective settings:")
+    for key, default in (
+        ("max_review_loops", 2),
+        ("test_command", ""),
+        ("max_task_tokens", 0),
+        ("agent_timeout_seconds", 1800),
+        ("test_timeout_seconds", 900),
+        ("worktree_root", ""),
+        ("prompts_dir", ""),
+    ):
+        value = settings.get(key, default)
+        print(f"  {key:22} {value!r}" + ("" if key in settings else "   (default)"))
 
     cap = token_cap(config)
-    print(f"\nToken cap: {cap:,}" if cap else "\nToken cap: none")
-
     print("\nAgents:")
     for role in ROLES:
         meters = "reports usage" if agent_entry(config, role).get("usage_pattern") else "no usage_pattern"
@@ -254,7 +307,16 @@ def find_prompt(dirs: list[Path], name: str) -> Path:
 
 
 def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
-    return find_prompt(dirs, name).read_text().format(**values)
+    """Substitute only the placeholders we define, by literal replacement.
+
+    Not str.format: a custom prompt is free to contain JSON, CSS or an f-string
+    example, and every brace in it would otherwise have to be escaped or the
+    run dies with KeyError before a single agent starts.
+    """
+    text = find_prompt(dirs, name).read_text()
+    for key, value in values.items():
+        text = text.replace("{" + key + "}", value)
+    return text
 
 
 def invoke_agent(
@@ -275,10 +337,14 @@ def invoke_agent(
     cmd = agent_command(ctx.config, role)
     writes_final = any("{output}" in part for part in cmd)
     cmd = [part.replace("{output}", str(output_path)) for part in cmd]
+    log_path = output_path.with_name(output_path.name + ".log")
 
+    print(f"trace: tail -f {shlex.quote(str(log_path))}", flush=True)
+    started = time.monotonic()
     timeout = float(ctx.config.get("settings", {}).get("agent_timeout_seconds", 1800))
-    proc = run_process([*cmd, prompt], cwd, capture=True, timeout=timeout or None)
+    proc = run_process([*cmd, prompt], cwd, timeout=timeout or None, log_path=log_path)
     transcript = proc.stdout or ""
+    print(f"\n[{role}] exit {proc.returncode} in {time.monotonic() - started:.0f}s", flush=True)
 
     used = parse_usage(transcript, agent_entry(ctx.config, role).get("usage_pattern"))
     ctx.tokens_used += used
@@ -291,7 +357,6 @@ def invoke_agent(
         output_path.write_text(transcript)
         return transcript
 
-    output_path.with_name(output_path.name + ".log").write_text(transcript)
     final = output_path.read_text() if output_path.exists() else ""
     if not final.strip():
         raise StargateError(
@@ -336,6 +401,7 @@ def make_context(
         base_ref=base,
         worktree=worktree,
         artifacts=artifacts,
+        task=task,
     )
 
 
@@ -353,17 +419,95 @@ def budget_spent(ctx: RunContext, next_phase: str) -> bool:
     return True
 
 
-def create_worktree(ctx: RunContext) -> None:
-    git(
-        ctx.repo,
-        "worktree",
-        "add",
-        "-b",
-        ctx.branch,
-        str(ctx.worktree),
-        ctx.base_ref,
-        capture=True,
+STAGES = ("architect", "worktree", "developer", "review")
+
+
+def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
+    """Record where the run got to, so a failed stage can be resumed instead of
+    restarting the whole flow and leaving a second plan, branch and worktree."""
+    path = ctx.artifacts / "state.json"
+    started = json.loads(path.read_text()).get("started_at") if path.exists() else None
+    path.write_text(json.dumps({
+        "run_id": ctx.run_id,
+        "task": ctx.task,
+        "repo": str(ctx.repo),
+        "base_ref": ctx.base_ref,
+        "branch": ctx.branch,
+        "worktree": str(ctx.worktree),
+        "stage": ctx.stage,
+        "status": status,
+        "error": error,
+        "completed": sorted(ctx.done),
+        "tokens_used": ctx.tokens_used,
+        "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
+        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+    }, indent=2) + "\n")
+
+
+def enter_stage(ctx: RunContext, stage: str) -> None:
+    ctx.stage = stage
+    save_state(ctx, "running")
+
+
+def complete_stage(ctx: RunContext, stage: str) -> None:
+    ctx.done.add(stage)
+    save_state(ctx, "running")
+
+
+def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) -> RunContext:
+    artifacts = repo / ".stargate" / "runs" / run_id
+    state_path = artifacts / "state.json"
+    if not state_path.exists():
+        raise StargateError(f"No run state at {state_path}")
+    state = json.loads(state_path.read_text())
+    frozen = artifacts / "config.yaml"
+    if use_frozen and frozen.exists():
+        # Default to the run's own frozen config so resuming does not silently
+        # change the agents the earlier stages ran under. An explicit --config
+        # overrides it, which is how you resume past a bad agent definition.
+        config = yaml.safe_load(frozen.read_text()) or config
+    return RunContext(
+        repo=repo,
+        config=config,
+        run_id=state["run_id"],
+        slug=slugify(state["task"]),
+        branch=state["branch"],
+        base_ref=state["base_ref"],
+        worktree=Path(state["worktree"]),
+        artifacts=artifacts,
+        task=state["task"],
+        stage=state.get("stage", "init"),
+        done=set(state.get("completed", [])),
+        tokens_used=int(state.get("tokens_used", 0)),
     )
+
+
+def snapshot(ctx: RunContext, dirs: list[Path]) -> list[Path]:
+    """Copy the effective config and all four prompts into the run's artifacts,
+    and use those copies for the rest of the run.
+
+    A run outlives its own installation: upgrading or reinstalling the package
+    mid-run otherwise deletes the prompts out from under the next role. It also
+    makes the run reproducible -- the artifacts say exactly what was used.
+    """
+    (ctx.artifacts / "config.yaml").write_text(yaml.safe_dump(ctx.config, sort_keys=False))
+    frozen = ctx.artifacts / "prompts"
+    frozen.mkdir(exist_ok=True)
+    for role in ROLES:
+        (frozen / f"{role}.md").write_text(find_prompt(dirs, role).read_text())
+    return [frozen]
+
+
+def create_worktree(ctx: RunContext) -> None:
+    if ctx.worktree.exists():
+        print(f"Reusing existing worktree: {ctx.worktree}")
+        return
+    exists = git(ctx.repo, "rev-parse", "--verify", ctx.branch, check=False).returncode == 0
+    args = ["worktree", "add"] + (
+        [str(ctx.worktree), ctx.branch] if exists
+        else ["-b", ctx.branch, str(ctx.worktree), ctx.base_ref]
+    )
+    git(ctx.repo, *args, capture=True)
 
 
 TEST_TAIL_LINES = 200
@@ -409,6 +553,7 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
 
 def finish(ctx: RunContext, task: str, verdict: str, test_exit: int | None) -> int:
     write_summary(ctx, task, verdict, test_exit)
+    save_state(ctx, verdict.lower())
 
     print("\n=== RESULT ===")
     print(f"Verdict:   {verdict}")
@@ -457,10 +602,17 @@ Tokens reported: {ctx.tokens_used:,}{" of " + format(token_cap(ctx.config), ",")
 
 def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, Any]) -> int:
     repo = repo_root(Path.cwd())
-    warn_if_dirty(repo)
-    ctx = make_context(repo, config, args.task, args.base_ref)
+    resuming = args.command == "resume"
 
-    prompts = prompt_dirs(config, script_dir)
+    if resuming:
+        ctx = load_run(repo, args.run_id, config, use_frozen=args.config is None)
+        prompts = [ctx.artifacts / "prompts"]
+        print(f"\nResuming {ctx.run_id}: {ctx.task}")
+        print(f"Completed: {', '.join(sorted(ctx.done)) or '(nothing)'}")
+    else:
+        warn_if_dirty(repo)
+        ctx = make_context(repo, config, args.task, args.base_ref)
+        prompts = snapshot(ctx, prompt_dirs(config, script_dir))
 
     print(f"\nRun ID:   {ctx.run_id}")
     print(f"Base:     {ctx.base_ref}")
@@ -468,40 +620,63 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     print(f"Worktree: {ctx.worktree}")
     print(f"Artifacts:{ctx.artifacts}")
 
+    try:
+        return run_stages(ctx, args, prompts)
+    except (StargateError, KeyboardInterrupt) as exc:
+        save_state(ctx, "failed", f"{type(exc).__name__}: {exc}")
+        print(f"\nResume with: stargate resume {ctx.run_id}", file=sys.stderr)
+        raise
+
+
+def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -> int:
+    config = ctx.config
+    plan_path = ctx.artifacts / "plan.md"
+
     # 1. Architect reads the original repository and emits a plan.
-    architect_prompt = render_prompt(
-        prompts, "architect", task=args.task, base_ref=ctx.base_ref
-    )
-    print("\n=== ARCHITECT ===")
-    plan = invoke_agent(
-        ctx, "architect", architect_prompt, repo, ctx.artifacts / "plan.md"
-    ).strip()
-    if not plan:
-        raise StargateError("Architect returned an empty plan.")
+    if "architect" in ctx.done:
+        plan = plan_path.read_text().strip()
+        print(f"\n=== ARCHITECT (skipped, reusing {plan_path}) ===")
+    else:
+        enter_stage(ctx, "architect")
+        architect_prompt = render_prompt(
+            prompts, "architect", task=ctx.task, base_ref=ctx.base_ref
+        )
+        print("\n=== ARCHITECT ===")
+        plan = invoke_agent(ctx, "architect", architect_prompt, ctx.repo, plan_path).strip()
+        if not plan:
+            raise StargateError("Architect returned an empty plan.")
+        complete_stage(ctx, "architect")
 
     # 2. Create isolated implementation branch/worktree.
+    enter_stage(ctx, "worktree")
     print("\n=== WORKTREE ===")
     create_worktree(ctx)
+    complete_stage(ctx, "worktree")
 
     if budget_spent(ctx, "the developer"):
-        return finish(ctx, args.task, "BUDGET_EXCEEDED", None)
+        return finish(ctx, ctx.task, "BUDGET_EXCEEDED", None)
 
     # 3. Developer implements.
-    developer_prompt = render_prompt(
-        prompts,
-        "developer",
-        task=args.task,
-        base_ref=ctx.base_ref,
-        plan=plan,
-    )
-    print("\n=== DEVELOPER ===")
-    invoke_agent(
-        ctx,
-        "developer",
-        developer_prompt,
-        ctx.worktree,
-        ctx.artifacts / "developer.txt",
-    )
+    if "developer" in ctx.done:
+        print("\n=== DEVELOPER (skipped, already ran in this run) ===")
+    else:
+        enter_stage(ctx, "developer")
+        developer_prompt = render_prompt(
+            prompts,
+            "developer",
+            task=ctx.task,
+            base_ref=ctx.base_ref,
+            plan=plan,
+        )
+        print("\n=== DEVELOPER ===")
+        invoke_agent(
+            ctx,
+            "developer",
+            developer_prompt,
+            ctx.worktree,
+            ctx.artifacts / "developer.txt",
+        )
+        complete_stage(ctx, "developer")
 
     test_exit, test_report = run_tests(ctx, "developer")
 
@@ -510,13 +685,17 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     max_loops = args.max_review_loops if args.max_review_loops is not None else configured_loops
     verdict = "CHANGES_REQUESTED"
 
+    # ponytail: resume always re-runs the review loop from the first attempt.
+    # Re-reviewing is idempotent and cheap next to re-implementing; per-attempt
+    # resume would need every fixer pass recorded separately.
+    enter_stage(ctx, "review")
     for attempt in range(max_loops + 1):
         if budget_spent(ctx, f"review {attempt + 1}"):
-            return finish(ctx, args.task, "BUDGET_EXCEEDED", test_exit)
+            return finish(ctx, ctx.task, "BUDGET_EXCEEDED", test_exit)
         review_prompt = render_prompt(
             prompts,
             "reviewer",
-            task=args.task,
+            task=ctx.task,
             base_ref=ctx.base_ref,
             plan=plan,
             tests=test_report,
@@ -550,14 +729,14 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         fixer_prompt = render_prompt(
             prompts,
             "fixer",
-            task=args.task,
+            task=ctx.task,
             base_ref=ctx.base_ref,
             plan=plan,
             review=review,
             tests=test_report,
         )
         if budget_spent(ctx, f"fixer {attempt + 1}"):
-            return finish(ctx, args.task, "BUDGET_EXCEEDED", test_exit)
+            return finish(ctx, ctx.task, "BUDGET_EXCEEDED", test_exit)
 
         print(f"\n=== FIXER {attempt + 1} ===")
         invoke_agent(
@@ -569,7 +748,8 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         )
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
-    return finish(ctx, args.task, verdict, test_exit)
+    complete_stage(ctx, "review")
+    return finish(ctx, ctx.task, verdict, test_exit)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -604,12 +784,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Git ref to branch from. Defaults to the current branch/ref.",
     )
-    run.add_argument(
-        "--max-review-loops",
-        type=int,
-        default=None,
-        help="Override settings.max_review_loops.",
+
+    resume = sub.add_parser(
+        "resume",
+        help="Continue a run that failed partway, reusing its plan, worktree, "
+        "config and prompts.",
     )
+    resume.add_argument("run_id", help="Run ID, as printed by the original run.")
+
+    for parser_ in (run, resume):
+        parser_.add_argument(
+            "--max-review-loops",
+            type=int,
+            default=None,
+            help="Override settings.max_review_loops.",
+        )
     return parser
 
 
@@ -629,7 +818,7 @@ def main() -> int:
         config = load_config(config_path)
         if args.command == "doctor":
             return doctor(config, config_path, script_dir)
-        if args.command == "run":
+        if args.command in ("run", "resume"):
             return orchestrate(args, script_dir, config)
         parser.error("Unknown command")
         return 2

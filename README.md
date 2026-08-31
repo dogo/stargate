@@ -154,14 +154,22 @@ Run artifacts are stored under the target repo:
 
 ```text
 my-project/.stargate/runs/<run-id>/
+├── state.json         # stage, status, error, tokens -- what `resume` reads
+├── config.yaml        # the effective config, frozen at run start
+├── prompts/           # the four prompts, frozen at run start
 ├── plan.md
+├── plan.md.log        # the agent's full trace, written live
 ├── developer.txt
+├── developer.txt.log
 ├── review-1.md
 ├── fix-1.txt          # only when needed
-├── review-2.md        # only when needed
 ├── tests-*.txt        # if test_command is configured
 └── summary.md
 ```
+
+Each role prints its `.log` path before starting, so a silent multi-minute
+agent can be followed with `tail -f`, and its exit code and duration when it
+ends. The trace is not echoed to the terminal.
 
 `.stargate/` ignores itself (it writes its own `.gitignore`), so run
 artifacts never show up in the target repo's `git status`.
@@ -230,10 +238,10 @@ settings:
 
 Two things the templates have to respect:
 
-- Placeholders are `str.format` fields: `{task}` and `{base_ref}` everywhere,
-  plus `{plan}` (developer, reviewer, fixer), `{tests}` (reviewer, fixer) and
-  `{review}` (fixer). A literal brace must be escaped as `{{` or `}}` or
-  rendering fails immediately.
+- Only known placeholders are substituted, by literal replacement: `{task}` and
+  `{base_ref}` everywhere, plus `{plan}` (developer, reviewer, fixer),
+  `{tests}` (reviewer, fixer) and `{review}` (fixer). Every other brace is left
+  alone, so a prompt may contain JSON, CSS or an f-string example verbatim.
 - `reviewer.md` is a contract with the orchestrator: the model's last line has
   to be exactly `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`. Anything
   else aborts the run.
@@ -263,6 +271,31 @@ the run stops rather than silently forwarding an empty plan.
 
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
+
+## Resuming a failed run
+
+Every stage is recorded in the run's `state.json` before and after it runs. If
+a stage fails — the CLI is out of credits, the machine sleeps, a package
+upgrade removes the install mid-run — the run stops and prints:
+
+```text
+Resume with: stargate resume 20260831-101304-add-passkey-authentication
+```
+
+`resume` reuses the plan, branch, worktree, frozen config and frozen prompts,
+and skips the stages already marked complete. It does not produce a second
+plan, branch or worktree.
+
+By default it runs under the config frozen into the run, so resuming cannot
+silently change the agents the earlier stages ran under. Pass `--config` to
+override that, which is how you resume past a broken agent definition:
+
+```bash
+stargate resume <run-id> --config ./fixed.yaml
+```
+
+The review loop always restarts from its first attempt: re-reviewing is
+idempotent and cheap next to re-implementing.
 
 ## Token budget
 

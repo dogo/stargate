@@ -5,6 +5,7 @@ Run with: .venv/bin/python test_stargate.py
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -195,6 +196,86 @@ def test_no_cap_means_no_limit(root: Path) -> None:
     assert "Tokens:    1,999,998 (no cap)" in proc.stdout, proc.stdout
 
 
+def test_resume_reuses_plan_and_worktree(root: Path) -> None:
+    repo = make_repo(root)
+    calls = root / "architect-calls.txt"
+    import yaml
+
+    def cfg_for(dev_cmd: list[str], path: Path) -> Path:
+        path.write_text(yaml.safe_dump({
+            "agents": {
+                "arch": {"command": agent(f'echo run >> {calls}; echo "THE PLAN"')},
+                "dev": {"command": dev_cmd},
+                "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+            },
+            "workflow": {"architect": "arch", "developer": "dev",
+                         "reviewer": "rev", "fixer": "dev"},
+            "settings": {"max_review_loops": 0, "test_command": "true"},
+        }))
+        return path
+
+    broken = cfg_for(agent("echo boom >&2; exit 1"), root / "broken.yaml")
+    proc = run(repo, broken)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert calls.read_text().count("run") == 1
+
+    state = json.loads(next((repo / ".stargate" / "runs").glob("*/state.json")).read_text())
+    assert state["status"] == "failed", state
+    assert state["stage"] == "developer", state
+    assert state["completed"] == ["architect", "worktree"], state
+    assert "exit code 1" in state["error"], state
+
+    fixed = cfg_for(agent("echo done"), root / "fixed.yaml")
+    proc = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(fixed),
+         "resume", state["run_id"]],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert calls.read_text().count("run") == 1, "architect re-ran on resume"
+    assert "ARCHITECT (skipped" in proc.stdout, proc.stdout
+    assert "Reusing existing worktree" in proc.stdout, proc.stdout
+
+
+def test_literal_braces_in_a_prompt_survive(root: Path) -> None:
+    repo = make_repo(root)
+    custom = root / "p"
+    custom.mkdir()
+    (custom / "architect.md").write_text(
+        'Task {task}. Return JSON like {"ok": true} and CSS .a{color:red}.\n'
+    )
+    dump = root / "arch-prompt.txt"
+    cfg = root / "j.yaml"
+    write_config(cfg, 'echo "VERDICT: APPROVED"', test_command="true",
+                 prompts_dir=str(custom))
+    import yaml
+    data = yaml.safe_load(cfg.read_text())
+    data["agents"]["arch"] = {"command": agent(f'printf "%s" "$0" > {dump}; echo plan')}
+    data["workflow"]["architect"] = "arch"
+    cfg.write_text(yaml.safe_dump(data))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rendered = dump.read_text()
+    assert '{"ok": true}' in rendered, rendered
+    assert ".a{color:red}" in rendered, rendered
+    assert "Task demo task." in rendered, rendered
+
+
+def test_prompts_are_frozen_into_the_run(root: Path) -> None:
+    """A mid-run reinstall must not take the prompts away from later roles."""
+    repo = make_repo(root)
+    cfg = root / "k.yaml"
+    write_config(cfg, 'echo "VERDICT: APPROVED"', test_command="true")
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    art = next((repo / ".stargate" / "runs").glob("*"))
+    for role in ("architect", "developer", "reviewer", "fixer"):
+        assert (art / "prompts" / f"{role}.md").exists(), role
+    assert (art / "config.yaml").exists()
+
+
 def test_hung_agent_times_out(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "d.yaml"
@@ -213,6 +294,9 @@ if __name__ == "__main__":
                test_output_placeholder_empty_file_is_an_error,
                test_token_cap_stops_the_run,
                test_no_cap_means_no_limit,
+               test_resume_reuses_plan_and_worktree,
+               test_literal_braces_in_a_prompt_survive,
+               test_prompts_are_frozen_into_the_run,
                test_hung_agent_times_out):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
