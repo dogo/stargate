@@ -402,6 +402,73 @@ def test_slow_agent_prints_a_heartbeat(root: Path) -> None:
     assert log.read_text().startswith("starting")
 
 
+def test_agent_env_sets_and_unsets(root: Path) -> None:
+    repo = make_repo(root)
+    seen = root / "seen.txt"
+    cfg = root / "env.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {
+                "command": agent(f'echo "KEY=[$STARGATE_KEY] INHERITED=[$STARGATE_INHERITED]" > {seen}; echo plan'),
+                "env": {"STARGATE_KEY": "from-config", "STARGATE_INHERITED": None},
+            },
+            "noop": {"command": agent("echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "noop",
+                     "reviewer": "rev", "fixer": "noop"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+    proc = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg), "run", "demo task"],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT),
+             "STARGATE_INHERITED": "leaked-from-orchestrator"},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert seen.read_text().strip() == "KEY=[from-config] INHERITED=[]", seen.read_text()
+
+
+def test_probe_dedup_separates_agents_by_env(root: Path) -> None:
+    """Same command, different credentials: two things to verify, not one."""
+    repo = make_repo(root)
+    calls = root / "probe-calls.txt"
+    cfg = root / "env-probe.yaml"
+    import yaml
+    same = agent(f'echo "$STARGATE_WHO" >> {calls}; echo OK')
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "a": {"command": same, "probe": "cheap", "env": {"STARGATE_WHO": "first"}},
+            "b": {"command": same, "probe": "cheap", "env": {"STARGATE_WHO": "second"}},
+        },
+        "workflow": {"architect": "a", "reviewer": "a",
+                     "developer": "b", "fixer": "b"},
+        "settings": {},
+    }))
+    proc = doctor(repo, cfg, "--probe")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert sorted(calls.read_text().split()) == ["first", "second"], calls.read_text()
+    assert "env: STARGATE_WHO" in proc.stdout, proc.stdout
+
+
+def test_env_values_are_never_printed(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "secret.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {"a": {"command": agent("echo ok"),
+                         "env": {"MY_TOKEN": "sk-super-secret-value"}}},
+        "workflow": {role: "a" for role in
+                     ("architect", "developer", "reviewer", "fixer")},
+        "settings": {},
+    }))
+    proc = doctor(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "MY_TOKEN" in proc.stdout, proc.stdout
+    assert "sk-super-secret-value" not in proc.stdout, "env value leaked into doctor"
+
+
 def test_hung_agent_times_out(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "d.yaml"
@@ -428,6 +495,9 @@ if __name__ == "__main__":
                test_literal_braces_in_a_prompt_survive,
                test_prompts_are_frozen_into_the_run,
                test_slow_agent_prints_a_heartbeat,
+               test_agent_env_sets_and_unsets,
+               test_probe_dedup_separates_agents_by_env,
+               test_env_values_are_never_printed,
                test_hung_agent_times_out):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))

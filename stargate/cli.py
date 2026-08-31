@@ -47,6 +47,7 @@ def run_process(
     check: bool = True,
     timeout: float | None = None,
     log_path: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     print(f"\n$ {shlex.join(args)}", flush=True)
     if log_path is not None:
@@ -55,7 +56,7 @@ def run_process(
         with log_path.open("w") as handle:
             proc = subprocess.Popen(
                 args, cwd=str(cwd), text=True, stdout=handle,
-                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
             )
             started = time.monotonic()
             deadline = None if timeout is None else started + timeout
@@ -93,6 +94,7 @@ def run_process(
             stderr=subprocess.STDOUT if capture else None,
             stdin=subprocess.DEVNULL,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         raise StargateError(
@@ -212,6 +214,38 @@ def agent_entry(config: dict[str, Any], role: str) -> dict[str, Any]:
         raise StargateError(f"Invalid agent configuration for role '{role}'.") from exc
 
 
+def agent_env(entry: dict[str, Any]) -> dict[str, str] | None:
+    """The environment for one agent, or None to inherit unchanged.
+
+    A null value REMOVES the variable. That is the case worth supporting: an
+    ANTHROPIC_API_KEY exported globally shadows the CLI's own login, and
+    without this the only fix is to unset it for the whole orchestrator.
+    """
+    declared = entry.get("env")
+    if not declared:
+        return None
+    if not isinstance(declared, dict):
+        raise StargateError("An agent's 'env' must be a mapping of names to values.")
+    env = dict(os.environ)
+    for key, value in declared.items():
+        if value is None:
+            env.pop(str(key), None)
+        else:
+            env[str(key)] = str(value)
+    return env
+
+
+def env_summary(entry: dict[str, Any]) -> str:
+    """Which variables an agent overrides. Names only -- values are secrets."""
+    declared = entry.get("env") or {}
+    if not isinstance(declared, dict) or not declared:
+        return ""
+    return ", ".join(
+        f"{key} (unset)" if value is None else str(key)
+        for key, value in declared.items()
+    )
+
+
 def parse_usage(transcript: str, pattern: str | None) -> int:
     """Tokens an agent reported spending, via a regex the CONFIG supplies.
 
@@ -248,27 +282,37 @@ PROBE_TIMEOUT_DEFAULT = 120
 HEARTBEAT_SECONDS = 30
 
 
-def unique_agents(config: dict[str, Any]) -> dict[tuple[str, ...], tuple[list[str], Any]]:
-    """Distinct agent invocations, keyed by command: the four default roles map
-    onto two commands, and probing per role would bill twice for nothing."""
-    agents: dict[tuple[str, ...], tuple[list[str], Any]] = {}
+def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dict[str, Any]]]:
+    """Distinct agent invocations: the four default roles map onto two commands,
+    and probing per role would bill twice for nothing.
+
+    Identity is command AND environment. Two roles running the same command
+    under different credentials are two different things to verify -- deduping
+    on the command alone would report one of them without ever calling it.
+    """
+    agents: dict[Any, tuple[list[str], Any, dict[str, Any]]] = {}
     for role in ROLES:
-        command = tuple(agent_command(config, role))
-        prompt = agent_entry(config, role).get("probe")
-        names, known = agents.get(command, ([], None))
+        entry = agent_entry(config, role)
+        declared = entry.get("env") or {}
+        key = (
+            tuple(agent_command(config, role)),
+            tuple(sorted((str(k), v) for k, v in declared.items())) if isinstance(declared, dict) else None,
+        )
+        names, known, first = agents.get(key, ([], None, entry))
         names.append(config["workflow"][role])
-        agents[command] = (names, known if known is not None else prompt)
+        agents[key] = (names, known if known is not None else entry.get("probe"), first)
     return agents
 
 
 def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
-              timeout: float | None) -> str:
+              timeout: float | None, env: dict[str, str] | None) -> str:
     """Empty string on success, otherwise the reason it failed."""
     cmd = [part.replace("{output}", str(output)) for part in command]
     try:
         proc = subprocess.run(
             [*cmd, prompt], cwd=cwd, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return f"probe timed out after {timeout}s"
@@ -310,8 +354,11 @@ def probe_agents(config: dict[str, Any]) -> bool:
             print("       " + detail.replace("\n", "\n       "))
             return False
 
-        for index, (command, (names, prompt)) in enumerate(unique_agents(config).items()):
+        for index, (key, (names, prompt, entry)) in enumerate(unique_agents(config).items()):
+            command = key[0]
             label = ", ".join(dict.fromkeys(names))
+            if overrides := env_summary(entry):
+                label += f" (env: {overrides})"
             if prompt is None:
                 print(f"  SKIP {label} (no probe configured)")
                 continue
@@ -320,7 +367,10 @@ def probe_agents(config: dict[str, Any]) -> bool:
                 ok = False
                 continue
             started = time.monotonic()
-            error = probe_one(command, prompt, cwd, cwd / f"output-{index}.txt", timeout)
+            error = probe_one(
+                command, prompt, cwd, cwd / f"output-{index}.txt", timeout,
+                agent_env(entry),
+            )
             print(f"  {'FAIL' if error else 'OK':4} {label} [{time.monotonic() - started:.1f}s]")
             if error:
                 print("       " + error.replace("\n", "\n       "))
@@ -379,9 +429,12 @@ def doctor(
     cap = token_cap(config)
     print("\nAgents:")
     for role in ROLES:
-        meters = "reports usage" if agent_entry(config, role).get("usage_pattern") else "no usage_pattern"
+        entry = agent_entry(config, role)
         print(f"  {role:10} {shlex.join(agent_command(config, role))}")
+        if overrides := env_summary(entry):
+            print(f"  {'':10} └─ env: {overrides}")
         if cap:
+            meters = "reports usage" if entry.get("usage_pattern") else "no usage_pattern"
             print(f"  {'':10} └─ {meters}")
 
     print("\nPrompts:")
@@ -449,7 +502,10 @@ def invoke_agent(
     print(f"trace: tail -f {shlex.quote(str(log_path))}", flush=True)
     started = time.monotonic()
     timeout = float(ctx.config.get("settings", {}).get("agent_timeout_seconds", 1800))
-    proc = run_process([*cmd, prompt], cwd, timeout=timeout or None, log_path=log_path)
+    proc = run_process(
+        [*cmd, prompt], cwd, timeout=timeout or None, log_path=log_path,
+        env=agent_env(agent_entry(ctx.config, role)),
+    )
     transcript = proc.stdout or ""
     print(f"\n[{role}] exit {proc.returncode} in {time.monotonic() - started:.0f}s", flush=True)
 

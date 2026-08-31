@@ -105,7 +105,7 @@ Everything under `settings:` in the active config. All are optional.
 | `prompts_dir` | `""` | Directory of custom `<role>.md` prompts, checked before the user and packaged ones. Relative paths resolve against the repo you run in. |
 
 Per-agent keys live on the agent entry, not here: `command`, `probe`,
-`usage_pattern`.
+`usage_pattern`, `env`.
 
 ## Exit codes
 
@@ -407,6 +407,32 @@ architect:
 An agent with no `usage_pattern` contributes zero to the total, which makes the
 budget blind to it. `stargate doctor` flags that per role whenever a cap is set.
 
+## Per-agent environment
+
+An agent inherits the orchestrator's environment. `env` overrides it for that
+agent only, and a `null` value **removes** a variable:
+
+```yaml
+architect:
+  command: [claude, -p, --output-format, text]
+  env:
+    ANTHROPIC_API_KEY: null       # use the CLI's own login instead
+    ANTHROPIC_BASE_URL: "https://internal.example/v1"
+```
+
+The null case is the one that earns the feature. A globally exported
+`ANTHROPIC_API_KEY` takes precedence over the Claude CLI's claude.ai login, so
+every Claude role fails with `Credit balance is too low` while the Codex roles
+are fine — and the only other fix is unsetting it for the whole orchestrator.
+
+Two consequences worth knowing:
+
+- Probe deduplication keys on command **and** environment. Two roles running
+  the same command under different credentials are two separate probes, not
+  one; deduping on the command alone would report an agent that was never
+  called.
+- `doctor` prints the variable **names** an agent overrides, never the values.
+
 ## Change who does what
 
 The roles are aliases:
@@ -467,9 +493,6 @@ would change the tool:
 - **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
   DAG scheduling, then an integrated review across the branches. This is the
   real v2 and everything else is small next to it.
-- **Per-agent `env`.** Today an agent inherits the orchestrator's environment
-  whole. A single `ANTHROPIC_API_KEY` pointing at the wrong account takes down
-  every Claude role with no way to scope it per agent.
 - **Output validation.** Three separate integration bugs have been the same
   shape: an agent's answer was not what it printed. The orchestrator still
   trusts whatever it receives — an empty, truncated or summarised plan is

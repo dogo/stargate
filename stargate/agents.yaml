@@ -21,6 +21,12 @@ agents:
       - opus
     # Used only by `stargate doctor --probe`; this makes a small billable call.
     probe: "Reply with exactly OK."
+    # Per-agent environment, merged over the orchestrator's own. A null value
+    # REMOVES the variable: an ANTHROPIC_API_KEY exported globally shadows the
+    # CLI's claude.ai login, and this is how one agent opts out of it without
+    # unsetting it for everything else. Values are never printed by doctor.
+    # env:
+    #   ANTHROPIC_API_KEY: null
 
   # "{output}" is replaced with a file path; whatever the agent writes there is
   # what gets forwarded to the next role. Without it, codex exec's entire
