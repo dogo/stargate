@@ -107,7 +107,7 @@ Everything under `settings:` in the layered effective config. All are optional.
 
 | key | default | meaning |
 |---|---|---|
-| `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. An explicit value always wins over detection. |
+| `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. The same effective command is available to agent commands through `{test_command}`, which the packaged reviewer uses so it can verify the suite. An explicit value always wins over detection. |
 | `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
@@ -190,7 +190,8 @@ force: an agent that declares it and exits 0 without writing the final-message
 file fails the probe. Agents with no `probe` key report `SKIP` and do not fail
 the exit code. Probes remain opt-in, run in a throwaway Git repository rather
 than yours, and use `probe_timeout_seconds` (120) rather than the much longer
-agent timeout.
+agent timeout. Agent-command placeholders are expanded for probes too, so
+`doctor --probe` verifies the same effective command that a real role uses.
 
 ## Use it against a repository
 
@@ -365,7 +366,15 @@ test_command: "xcodebuild test -scheme MyApp -destination 'platform=iOS Simulato
 The command is intentionally project-specific. It runs through `/bin/sh -lc`
 inside the agent worktree, after the developer and after every fixer pass. The
 tail of its output is fed into the reviewer and fixer prompts, so a red suite
-is a blocking review finding rather than a number nobody reads.
+is a blocking review finding rather than a number nobody reads. The packaged
+reviewer may also run that exact command in the worktree, letting it reproduce
+the result itself instead of trusting the pasted report alone.
+
+The reviewer grant follows only a command Stargate itself selected. An explicit
+`test_command` is granted, as is the top detection candidate in `auto` mode.
+`report`, `off`, an empty setting, or no detected command grants nothing. A
+report-only candidate remains unapproved even though `doctor` and the reviewer
+prompt show it.
 
 Timeouts (seconds) cap a stuck agent or suite:
 
@@ -406,12 +415,13 @@ settings:
   prompts_dir: .stargate-prompts   # relative to the repo you run in
 ```
 
-Two things the templates have to respect:
+Two things the prompt templates have to respect:
 
 - Only known placeholders are substituted, by literal replacement: `{task}` and
   `{base_ref}` everywhere, plus `{plan}` (developer, reviewer, fixer),
   `{tests}` (reviewer, fixer) and `{review}` (fixer). Every other brace is left
   alone, so a prompt may contain JSON, CSS or an f-string example verbatim.
+  These are separate from the agent-command placeholders described below.
 - `reviewer.md` is a contract with the orchestrator: the model's last line has
   to be exactly `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`. Anything
   else aborts the run.
@@ -441,6 +451,27 @@ the run stops rather than silently forwarding an empty plan.
 
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
+
+Agent commands have two placeholders:
+
+- `{output}` becomes the final-message path described above.
+- `{test_command}` becomes the exact explicit or `auto`-detected command that
+  Stargate will run. The packaged reviewer places it in Claude Code's
+  `Bash(...)` allow rule.
+
+When no test command will run, Stargate removes the argument containing
+`{test_command}` and, for a separate option/value pair, its introducing option.
+This avoids `Bash()`, an empty argv item, or a dangling option consuming the
+prompt. Put the placeholder in an option value, as the packaged config does;
+it cannot be the executable. Commands without the placeholder are unchanged,
+including custom configs and configs frozen by older runs.
+
+The test command is arbitrary shell text, but an allow rule is a pattern. To
+keep interpolation from silently widening the reviewer's authority, Stargate
+does not interpolate commands containing `(`, `)`, `,`, `*`, or control
+characters. Stargate can still run such a configured command itself; the
+reviewer receives only the test report. `stargate doctor` prints every expanded
+agent command and says whether the grant is effective, absent, or refused.
 
 ## Stages that produce nothing
 
@@ -671,8 +702,13 @@ next step.
 The important separation is:
 
 - Claude architect/reviewer runs with `--disallowedTools "Edit Write
-  NotebookEdit"` in the default config. This matters: the architect runs in
-  your real repository, not in the worktree.
+  NotebookEdit"` in the default config. The packaged reviewer additionally may
+  execute only the effective test command, and it runs in the isolated
+  worktree.
+- The architect runs in your real repository, not in the worktree, so the
+  packaged architect deliberately has no `{test_command}` grant. `doctor`
+  warns if a custom config adds one because that grants project-command
+  execution in the real checkout.
 - Codex developer/fixer gets workspace write access in the isolated worktree.
 - Git destructive/publishing actions are forbidden by prompt.
 - The orchestrator does not auto-merge or auto-push.

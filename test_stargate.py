@@ -41,13 +41,18 @@ def agent(script: str) -> list[str]:
 
 def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0,
                  agent_timeout: int = 60, prompts_dir: str = "",
-                 test_command_detection: str | None = None) -> None:
+                 test_command_detection: str | None = None,
+                 reviewer_args: tuple[str, ...] = ()) -> None:
     import yaml
+    reviewer_command = agent(reviewer)
+    if reviewer_args:
+        # Preserve $0 for the shell while exposing configured argv from $1 on.
+        reviewer_command = [*reviewer_command, "_", *reviewer_args]
     cfg = {
         "agents": {
             "noop": {"command": agent('printf "%s" "$0" > /dev/null; echo done')},
             "dev": {"command": agent("echo change >> impl.txt; echo done")},
-            "reviewer": {"command": agent(reviewer)},
+            "reviewer": {"command": reviewer_command},
         },
         "workflow": {"architect": "noop", "developer": "dev",
                      "reviewer": "reviewer", "fixer": "dev"},
@@ -1279,6 +1284,165 @@ def test_doctor_reports_the_detected_test_command(root: Path) -> None:
     assert "detected" not in test_section, test_section
 
 
+def test_test_command_grant_reaches_the_reviewer(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "reviewer-grant.yaml"
+    received = root / "reviewer-grant.txt"
+    write_config(
+        cfg,
+        f'printf "%s" "$1" > {received}; echo "VERDICT: APPROVED"',
+        test_command="true",
+        reviewer_args=("Bash({test_command})",),
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert received.read_text() == "Bash(true)"
+
+
+def test_no_test_command_drops_the_grant_and_its_flag(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "no-reviewer-grant.yaml"
+    received = root / "reviewer-prompt.txt"
+    write_config(
+        cfg,
+        f'printf "%s" "$1" > {received}; echo "VERDICT: APPROVED"',
+        test_command="",
+        test_command_detection="off",
+        reviewer_args=("--allowedTools", "Bash({test_command})"),
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    prompt = received.read_text()
+    assert "USER TASK:" in prompt, prompt
+    assert "allowedTools" not in prompt and "{test_command}" not in prompt
+
+
+def test_grant_matches_only_what_stargate_runs(root: Path) -> None:
+    repo = make_repo(root)
+    (repo / "Makefile").write_text("test:\n\ttrue\n")
+    sh("git add Makefile && git commit -qm makefile", repo)
+
+    report_cfg = root / "report-grant.yaml"
+    report_arg = root / "report-arg.txt"
+    write_config(
+        report_cfg,
+        f'printf "%s" "$1" > {report_arg}; echo "VERDICT: APPROVED"',
+        test_command="",
+        test_command_detection="report",
+        reviewer_args=("Bash({test_command})",),
+    )
+    reported = run(repo, report_cfg)
+    assert reported.returncode == 0, reported.stdout + reported.stderr
+    assert "Bash(" not in report_arg.read_text()
+    assert "did not run it" in report_arg.read_text()
+
+    auto_cfg = root / "auto-grant.yaml"
+    auto_arg = root / "auto-arg.txt"
+    write_config(
+        auto_cfg,
+        f'printf "%s" "$1" > {auto_arg}; echo "VERDICT: APPROVED"',
+        test_command="",
+        test_command_detection="auto",
+        reviewer_args=("Bash({test_command})",),
+    )
+    automatic = run(repo, auto_cfg)
+    assert automatic.returncode == 0, automatic.stdout + automatic.stderr
+    assert auto_arg.read_text() == "Bash(make test)"
+
+
+def test_test_command_expansion_rules(root: Path) -> None:
+    from stargate.cli import StargateError, expand_test_command
+
+    command = ["claude", "-p", "--allowedTools", "Bash({test_command})"]
+    assert expand_test_command(command, "make test") == [
+        "claude", "-p", "--allowedTools", "Bash(make test)",
+    ]
+    assert expand_test_command(command, "") == ["claude", "-p"]
+    assert expand_test_command(
+        ["claude", "-p", "--allowedTools=Bash({test_command})"], ""
+    ) == ["claude", "-p"]
+    assert expand_test_command(
+        ["claude", "--env", "TEST={test_command}"], ""
+    ) == ["claude"]
+    for unsafe in (
+        "make test); Bash(rm -rf /", "make *", "echo one,two", "echo one\ntwo",
+    ):
+        assert expand_test_command(command, unsafe) == ["claude", "-p"]
+    unchanged = ["custom-agent", "--read-only"]
+    assert expand_test_command(unchanged, "make *") == unchanged
+    try:
+        expand_test_command(["{test_command}", "--version"], "make test")
+    except StargateError as exc:
+        assert "executable" in str(exc)
+    else:
+        raise AssertionError("{test_command} was accepted as argv[0]")
+
+
+def test_doctor_shows_and_probes_the_effective_grant(root: Path) -> None:
+    import yaml
+
+    repo = make_repo(root)
+    cfg = root / "doctor-grant.yaml"
+    probed = root / "probed-grant.txt"
+    write_config(
+        cfg,
+        f'printf "%s" "$2" > {probed}; echo "VERDICT: APPROVED"',
+        test_command="make test",
+        reviewer_args=("--allowedTools", "Bash({test_command})"),
+    )
+    data = yaml.safe_load(cfg.read_text())
+    data["agents"]["reviewer"]["probe"] = "cheap"
+    cfg.write_text(yaml.safe_dump(data))
+
+    effective = doctor(repo, cfg, "--probe")
+    assert effective.returncode == 0, effective.stdout + effective.stderr
+    assert "Bash(make test)" in effective.stdout
+    assert "may run the test command: make test" in effective.stdout
+    assert probed.read_text() == "Bash(make test)"
+
+    empty = root / "doctor-empty-grant.yaml"
+    write_config(
+        empty, 'echo "VERDICT: APPROVED"', test_command="",
+        test_command_detection="off",
+        reviewer_args=("--allowedTools", "Bash({test_command})"),
+    )
+    dropped = doctor(repo, empty)
+    assert dropped.returncode == 0, dropped.stdout + dropped.stderr
+    assert "grant and its flag are dropped" in dropped.stdout
+
+    unsafe = root / "doctor-unsafe-grant.yaml"
+    write_config(
+        unsafe, 'echo "VERDICT: APPROVED"', test_command="pytest -k f(x)",
+        reviewer_args=("--allowedTools", "Bash({test_command})"),
+    )
+    refused = doctor(repo, unsafe)
+    assert refused.returncode == 0, refused.stdout + refused.stderr
+    assert "not interpolated" in refused.stdout
+    assert "grant is dropped" in refused.stdout
+
+    architect = root / "doctor-architect-grant.yaml"
+    write_config(
+        architect, 'echo "VERDICT: APPROVED"', test_command="make test",
+    )
+    data = yaml.safe_load(architect.read_text())
+    data["agents"]["noop"]["command"] = [
+        *agent("echo plan"), "_", "--allowedTools", "Bash({test_command})",
+    ]
+    architect.write_text(yaml.safe_dump(data))
+    warned = doctor(repo, architect)
+    assert warned.returncode == 0, warned.stdout + warned.stderr
+    assert "WARN" in warned.stdout and "real repository" in warned.stdout
+
+    packaged = yaml.safe_load((ROOT / "stargate" / "agents.yaml").read_text())
+    assert packaged["version"] == 4
+    reviewer_command = packaged["agents"]["reviewer"]["command"]
+    architect_command = packaged["agents"]["architect"]["command"]
+    assert "Bash({test_command})" in reviewer_command
+    assert not any("{test_command}" in part for part in architect_command)
+
+
 def test_architect_names_the_branch(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "architect-name.yaml"
@@ -1446,6 +1610,11 @@ if __name__ == "__main__":
                test_explicit_test_command_beats_detection,
                test_detection_off_and_invalid_mode,
                test_doctor_reports_the_detected_test_command,
+               test_test_command_grant_reaches_the_reviewer,
+               test_no_test_command_drops_the_grant_and_its_flag,
+               test_grant_matches_only_what_stargate_runs,
+               test_test_command_expansion_rules,
+               test_doctor_shows_and_probes_the_effective_grant,
                test_architect_names_the_branch,
                test_missing_or_malformed_name_falls_back,
                test_name_option_and_same_second_uniqueness):

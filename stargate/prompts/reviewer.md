@@ -28,6 +28,9 @@ Review for:
 - unnecessary complexity
 
 Failing tests above are a blocking finding: request changes and say which test failed and why.
+The results above are a report, not evidence. If your tools let you run the
+project's test command in this worktree, run that exact command rather than
+trusting pasted output.
 
 The LAST LINE of your response must be exactly one of these, with nothing after it:
 
