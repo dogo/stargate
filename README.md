@@ -99,6 +99,8 @@ Everything under `settings:` in the active config. All are optional.
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
 | `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
+| `agent_retries` | `0` | Retries after a failed agent invocation. `0` preserves the single-attempt behavior; `2` allows up to three attempts. |
+| `agent_retry_backoff_seconds` | `10` | Initial retry wait. It doubles after each failure: the default waits 10s, then 20s, then 40s. |
 | `test_timeout_seconds` | `900` | Kills the test command; a timeout counts as exit 124. |
 | `probe_timeout_seconds` | `120` | Kills a `doctor --probe` call. Deliberately far shorter than the agent timeout. |
 | `worktree_root` | `""` | Where worktrees are created. Empty means `<repo-parent>/.stargate-worktrees/<repo-name>/`. |
@@ -222,6 +224,7 @@ my-project/.stargate/runs/<run-id>/
 ├── prompts/           # the four prompts, frozen at run start
 ├── plan.md
 ├── plan.md.log        # the agent's full trace, written live
+├── plan.md.attempt-2.log  # later attempts keep separate traces
 ├── developer.txt
 ├── developer.txt.log
 ├── review-1.md
@@ -345,6 +348,61 @@ the run stops rather than silently forwarding an empty plan.
 
 This also protects the verdict: a reviewer's trailing session footer would
 otherwise sit after the `VERDICT:` line the orchestrator parses.
+
+## Retrying a transient failure
+
+Retries are off by default. Enable them per project with a count of retries
+*after* the first attempt and a base wait:
+
+```yaml
+settings:
+  agent_retries: 2
+  agent_retry_backoff_seconds: 10
+```
+
+This allows at most three attempts of the agent that failed, waiting 10 seconds
+and then 20 seconds. A successful attempt is never repeated, nor are agents
+from an already completed stage. Each attempt announces its number and wait in
+the terminal and writes a separate trace such as `plan.md.log`,
+`plan.md.attempt-2.log`, and `plan.md.attempt-3.log`.
+
+Non-zero agent exits and timeouts are retried because rate limits, server
+errors and dropped connections all appear that way at this boundary. A binary
+that cannot start is not retried, nor is an agent that exits successfully but
+violates its `{output}` contract. Stargate does not maintain a brittle list of
+vendor error messages. Instead, if two consecutive failures have the same
+normalized trace tail, it treats the failure as deterministic and stops early;
+this avoids repeatedly paying for a wrong model name or unsupported flag. The
+tradeoff is that an identical transient response twice also stops the retries.
+
+Every retry is a fresh, potentially billable call. Reported usage is counted
+once for every attempt actually made, including failed attempts, so retries can
+reach `max_task_tokens` sooner. The agent timeout applies independently to each
+attempt; configure the retry count and backoff with the resulting worst-case
+runtime in mind. After the last attempt, the normal error and `Resume with:`
+hint are preserved.
+
+## Listing runs
+
+`stargate runs` shows the runs recorded in the current repository, newest
+first, without requiring an active config:
+
+```console
+$ stargate runs
+Runs in /home/me/project (newest first):
+
+  RUN ID                                      STATUS            STAGE      UPDATED             TASK
+* 20260831-101304-add-passkey-authentication  failed            developer  2026-08-31T10:19:42 Add passkey authentication
+  20260830-181500-update-docs                 approved          review     2026-08-30T18:22:11 Update docs
+
+* resumable. Resume the newest with: stargate resume 20260831-101304-add-passkey-authentication
+```
+
+Failed and interrupted (`running`) runs are marked with `*`. Missing or corrupt
+`state.json` files are shown as unknown rather than crashing or hiding the run.
+If `.stargate/runs/` does not exist or is empty, the command reports that there
+are no runs. Listing is read-only: it never creates, repairs or deletes run
+artifacts.
 
 ## Resuming a failed run
 
@@ -486,9 +544,9 @@ boundary; prompts are guidance, not a security boundary.
 
 ## Useful next additions
 
-Shipped since this list was written: token accounting, timeouts, persistent
-run state and `resume`. What is still open, roughly in order of how much it
-would change the tool:
+Shipped since this list was written: token accounting, timeouts, retries,
+persistent run state, `runs` and `resume`. What is still open, roughly in order
+of how much it would change the tool:
 
 - **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
   DAG scheduling, then an integrated review across the branches. This is the
@@ -497,8 +555,6 @@ would change the tool:
   shape: an agent's answer was not what it printed. The orchestrator still
   trusts whatever it receives — an empty, truncated or summarised plan is
   forwarded without complaint.
-- **Retry.** A rate-limited or transiently failing agent ends the run; `resume`
-  recovers it, but by hand.
 - **Interrupt handling.** A killed run leaves `state.json` reading `running`
   forever, because nothing catches SIGTERM/SIGINT.
 - **Structured review output** (JSON findings instead of a prose verdict).

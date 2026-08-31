@@ -277,9 +277,23 @@ def agent_command(config: dict[str, Any], role: str) -> list[str]:
 
 
 PROBE_TIMEOUT_DEFAULT = 120
+AGENT_RETRIES_DEFAULT = 0
+AGENT_RETRY_BACKOFF_DEFAULT = 10.0
+FINGERPRINT_LINES = 20
 
 # How often a running agent prints that it is still alive.
 HEARTBEAT_SECONDS = 30
+
+
+def retry_settings(config: dict[str, Any]) -> tuple[int, float]:
+    settings = config.get("settings", {})
+    retries = max(0, int(settings.get("agent_retries", AGENT_RETRIES_DEFAULT) or 0))
+    backoff = max(0.0, float(
+        settings.get(
+            "agent_retry_backoff_seconds", AGENT_RETRY_BACKOFF_DEFAULT
+        ) or 0
+    ))
+    return retries, backoff
 
 
 def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dict[str, Any]]]:
@@ -419,6 +433,8 @@ def doctor(
         ("test_command", ""),
         ("max_task_tokens", 0),
         ("agent_timeout_seconds", 1800),
+        ("agent_retries", AGENT_RETRIES_DEFAULT),
+        ("agent_retry_backoff_seconds", AGENT_RETRY_BACKOFF_DEFAULT),
         ("test_timeout_seconds", 900),
         ("worktree_root", ""),
         ("prompts_dir", ""),
@@ -479,6 +495,38 @@ def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
     return text
 
 
+def record_usage(ctx: RunContext, role: str, transcript: str) -> None:
+    """Charge one completed attempt, including one the vendor rejected late."""
+    used = parse_usage(
+        transcript, agent_entry(ctx.config, role).get("usage_pattern")
+    )
+    ctx.tokens_used += used
+    if used:
+        cap = token_cap(ctx.config)
+        budget = f" of {cap:,}" if cap else ""
+        print(
+            f"\n[{role}] reported {used:,} tokens; "
+            f"{ctx.tokens_used:,}{budget} used so far."
+        )
+
+
+def attempt_log_path(output_path: Path, attempt: int) -> Path:
+    # Attempt one keeps the historical path, so retries-off runs retain the
+    # same artifacts while later failures cannot overwrite its evidence.
+    suffix = "" if attempt == 1 else f".attempt-{attempt}"
+    return output_path.with_name(output_path.name + suffix + ".log")
+
+
+def failure_fingerprint(error: StargateError, trace: str) -> tuple[str, str]:
+    """Normalize per-attempt noise without interpreting vendor error text."""
+    # The prefix is ours and distinguishes timeout from a non-zero exit. The
+    # rest includes attempt-specific trace paths and the full command, neither
+    # of which says whether another attempt has a chance of succeeding.
+    reason = str(error).split(" (", 1)[0]
+    tail = "\n".join(trace.strip().splitlines()[-FINGERPRINT_LINES:])
+    return re.sub(r"\d+", "#", reason), re.sub(r"\d+", "#", tail)
+
+
 def invoke_agent(
     ctx: RunContext,
     role: str,
@@ -493,28 +541,85 @@ def invoke_agent(
     or {review} makes each hop pay for the previous hop's trace. An agent whose
     command contains "{output}" is handed a file path to write its last message
     to, and that file is what gets forwarded; its stdout is kept as a .log.
+
+    Retries stay inside this single invocation so no completed role is replayed.
+    Each attempt has its own trace, both for debugging and to count any usage
+    the failed process reported exactly once.
     """
     cmd = agent_command(ctx.config, role)
     writes_final = any("{output}" in part for part in cmd)
     cmd = [part.replace("{output}", str(output_path)) for part in cmd]
-    log_path = output_path.with_name(output_path.name + ".log")
-
-    print(f"trace: tail -f {shlex.quote(str(log_path))}", flush=True)
-    started = time.monotonic()
     timeout = float(ctx.config.get("settings", {}).get("agent_timeout_seconds", 1800))
-    proc = run_process(
-        [*cmd, prompt], cwd, timeout=timeout or None, log_path=log_path,
-        env=agent_env(agent_entry(ctx.config, role)),
-    )
-    transcript = proc.stdout or ""
-    print(f"\n[{role}] exit {proc.returncode} in {time.monotonic() - started:.0f}s", flush=True)
+    env = agent_env(agent_entry(ctx.config, role))
+    retries, backoff = retry_settings(ctx.config)
+    attempts = retries + 1
+    previous_failure: tuple[str, str] | None = None
 
-    used = parse_usage(transcript, agent_entry(ctx.config, role).get("usage_pattern"))
-    ctx.tokens_used += used
-    if used:
-        cap = token_cap(ctx.config)
-        budget = f" of {cap:,}" if cap else ""
-        print(f"\n[{role}] reported {used:,} tokens; {ctx.tokens_used:,}{budget} used so far.")
+    for attempt in range(1, attempts + 1):
+        log_path = attempt_log_path(output_path, attempt)
+        print(f"trace: tail -f {shlex.quote(str(log_path))}", flush=True)
+
+        # A retry that exits successfully but writes nothing must not inherit a
+        # previous attempt's answer and pass the output contract by accident.
+        if writes_final and retries and output_path.exists():
+            output_path.unlink()
+
+        started = time.monotonic()
+        try:
+            proc = run_process(
+                [*cmd, prompt], cwd, timeout=timeout or None, log_path=log_path,
+                env=env,
+            )
+        except OSError as exc:
+            # A process that cannot be started will fail the same way after a
+            # backoff; unlike an agent exit, it never made a remote request.
+            raise StargateError(
+                f"Could not start the agent for role '{role}': {exc}"
+            ) from exc
+        except StargateError as exc:
+            if retries:
+                trace = log_path.read_text() if log_path.exists() else ""
+                record_usage(ctx, role, trace)
+                print(
+                    f"\n[{role}] attempt {attempt} of {attempts} failed: {exc}",
+                    flush=True,
+                )
+            else:
+                # Keeping retries disabled must preserve the original failure
+                # path, including terminal output and token accounting.
+                raise
+
+            if attempt == attempts:
+                raise
+
+            fingerprint = failure_fingerprint(exc, trace)
+            if fingerprint == previous_failure:
+                remaining = attempts - attempt
+                print(
+                    f"[{role}] failed identically twice; not retrying "
+                    f"{remaining} more time(s).",
+                    flush=True,
+                )
+                raise
+            previous_failure = fingerprint
+
+            wait = backoff * 2 ** (attempt - 1)
+            print(
+                f"[{role}] retrying in {wait:g}s "
+                f"(attempt {attempt + 1} of {attempts}).",
+                flush=True,
+            )
+            time.sleep(wait)
+            continue
+
+        transcript = proc.stdout or ""
+        print(
+            f"\n[{role}] exit {proc.returncode} in "
+            f"{time.monotonic() - started:.0f}s",
+            flush=True,
+        )
+        record_usage(ctx, role, transcript)
+        break
 
     if not writes_final:
         output_path.write_text(transcript)
@@ -643,6 +748,91 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         done=set(state.get("completed", [])),
         tokens_used=int(state.get("tokens_used", 0)),
     )
+
+
+RUN_TASK_WIDTH = 60
+RESUMABLE_STATUSES = ("running", "failed")
+
+
+def read_run(path: Path) -> dict[str, Any]:
+    """Build one listing row, including runs whose state cannot be read."""
+    state_path = path / "state.json"
+    row: dict[str, Any] = {
+        "run_id": path.name,
+        "status": "unknown",
+        "stage": "-",
+        "task": "(state.json missing or unreadable)",
+        "updated": "-",
+        "sort_key": 0.0,
+        "resumable": False,
+    }
+    try:
+        # Filesystem time is also available for corrupt and hand-written runs,
+        # where the timestamp inside state.json cannot be trusted or read.
+        row["sort_key"] = (
+            state_path if state_path.exists() else path
+        ).stat().st_mtime
+    except OSError:
+        pass
+
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return row
+    if not isinstance(state, dict):
+        return row
+
+    status = " ".join(str(state.get("status") or "unknown").split())
+    row.update(
+        run_id=" ".join(str(state.get("run_id") or path.name).split()),
+        status=status,
+        stage=" ".join(str(state.get("stage") or "-").split()),
+        updated=" ".join(str(state.get("updated_at") or "-").split()),
+        # Tasks are often multi-paragraph input; one row should stay one row.
+        task=(" ".join(str(state.get("task") or "").split())[:RUN_TASK_WIDTH] or "-"),
+        resumable=status.lower() in RESUMABLE_STATUSES,
+    )
+    return row
+
+
+def list_runs(repo: Path) -> int:
+    root = repo / ".stargate" / "runs"
+    # Listing a repository that has never run stargate must not create the
+    # bookkeeping directory it is meant only to inspect.
+    if not root.is_dir():
+        print(f"No runs recorded in {repo}.")
+        return 0
+
+    try:
+        rows = [read_run(path) for path in root.iterdir() if path.is_dir()]
+    except OSError as exc:
+        raise StargateError(f"Could not read runs at {root}: {exc}") from exc
+    rows.sort(
+        key=lambda row: (row["sort_key"], row["run_id"]), reverse=True
+    )
+    if not rows:
+        print(f"No runs recorded in {repo}.")
+        return 0
+
+    width = max(len(row["run_id"]) for row in rows)
+    print(f"Runs in {repo} (newest first):\n")
+    print(f"  {'RUN ID':{width}}  {'STATUS':17} {'STAGE':10} {'UPDATED':19} TASK")
+    for row in rows:
+        marker = "*" if row["resumable"] else " "
+        print(
+            f"{marker} {row['run_id']:{width}}  {row['status']:17} "
+            f"{row['stage']:10} {row['updated']:19} {row['task']}"
+        )
+
+    newest = next((row for row in rows if row["resumable"]), None)
+    if newest:
+        print(
+            "\n* resumable. Resume the newest with: "
+            f"stargate resume {newest['run_id']}"
+        )
+    else:
+        print("\nNo runs are marked resumable.")
+    return 0
 
 
 def snapshot(ctx: RunContext, dirs: list[Path]) -> list[Path]:
@@ -945,6 +1135,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Copy the packaged prompts to ~/.config/stargate/prompts/ so they "
         "can be edited without touching the install.",
     )
+    sub.add_parser(
+        "runs", help="List the runs recorded in this repository, newest first."
+    )
 
     run = sub.add_parser("run", help="Plan, implement, review and fix a task.")
     run.add_argument("task", help="Feature/bug/task description.")
@@ -981,9 +1174,11 @@ def main() -> int:
     if args.command == "init-prompts":
         return init_prompts(script_dir)
 
-    config_path = resolve_config(args.config, script_dir)
-
     try:
+        if args.command == "runs":
+            return list_runs(repo_root(Path.cwd()))
+
+        config_path = resolve_config(args.config, script_dir)
         config = load_config(config_path)
         if args.command == "doctor":
             return doctor(config, config_path, script_dir, probe=args.probe)
