@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,11 @@ def sh(cmd: str, cwd: Path) -> None:
 def make_repo(root: Path) -> Path:
     repo = root / "repo"
     repo.mkdir()
-    sh("git init -q -b main && git config user.email t@t && git config user.name t", repo)
+    sh(
+        "git init -q -b main && git config user.email t@t && "
+        "git config user.name t && git config commit.gpgsign false",
+        repo,
+    )
     (repo / "app.py").write_text("x = 1\n")
     sh("git add -A && git commit -qm init", repo)
     return repo
@@ -35,7 +40,8 @@ def agent(script: str) -> list[str]:
 
 
 def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0,
-                 agent_timeout: int = 60, prompts_dir: str = "") -> None:
+                 agent_timeout: int = 60, prompts_dir: str = "",
+                 test_command_detection: str | None = None) -> None:
     import yaml
     cfg = {
         "agents": {
@@ -49,6 +55,8 @@ def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0
                      "agent_timeout_seconds": agent_timeout, "test_timeout_seconds": 30,
                      "prompts_dir": prompts_dir},
     }
+    if test_command_detection is not None:
+        cfg["settings"]["test_command_detection"] = test_command_detection
     path.write_text(yaml.safe_dump(cfg))
 
 
@@ -1101,6 +1109,297 @@ def test_fixer_that_changes_nothing_stops_the_review_loop(root: Path) -> None:
     assert "Verdict:   CHANGES_REQUESTED" in proc.stdout, proc.stdout
 
 
+def test_detects_the_common_project_shapes(root: Path) -> None:
+    from stargate.cli import detect_test_commands
+
+    make = root / "make"
+    make.mkdir()
+    (make / "Makefile").write_text("test:\n\ttrue\n")
+
+    node = root / "node"
+    node.mkdir()
+    (node / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest run"}})
+    )
+    (node / "pnpm-lock.yaml").write_text("lockfileVersion: 9\n")
+
+    cargo = root / "cargo"
+    cargo.mkdir()
+    (cargo / "Cargo.toml").write_text("[package]\nname = 'demo'\n")
+
+    go = root / "go"
+    go.mkdir()
+    (go / "go.mod").write_text("module example.test/demo\n")
+
+    swift = root / "swift"
+    swift.mkdir()
+    (swift / "Package.swift").write_text("// swift-tools-version: 6.0\n")
+
+    python = root / "python"
+    python.mkdir()
+    (python / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+
+    expected = (
+        (make, "make test"),
+        (node, "pnpm test"),
+        (cargo, "cargo test"),
+        (go, "go test ./..."),
+        (swift, "swift test"),
+        (python, "pytest -q"),
+    )
+    for project, command in expected:
+        candidates = detect_test_commands(project)
+        assert [candidate.command for candidate in candidates] == [command]
+        assert candidates[0].source
+
+    unsupported = root / "root-level-python"
+    unsupported.mkdir()
+    (unsupported / "test_custom.py").write_text("def test_custom(root): pass\n")
+    assert detect_test_commands(unsupported) == []
+
+    ambiguous = root / "ambiguous"
+    ambiguous.mkdir()
+    (ambiguous / "Makefile").write_text("test:\n\ttrue\n")
+    (ambiguous / "package.json").write_text(
+        json.dumps({"scripts": {"test": "node test.js"}})
+    )
+    assert [candidate.command for candidate in detect_test_commands(ambiguous)] == [
+        "make test", "npm test",
+    ]
+
+
+def test_detected_test_command_is_reported_not_run(root: Path) -> None:
+    repo = make_repo(root)
+    marker = root / "make-ran.txt"
+    (repo / "Makefile").write_text(f"test:\n\ttouch {marker}\n")
+    sh("git add Makefile && git commit -qm makefile", repo)
+    cfg = root / "report.yaml"
+    reviewer_prompt = root / "reviewer-prompt.txt"
+    write_config(
+        cfg,
+        f'printf "%s" "$0" > {reviewer_prompt}; echo "VERDICT: APPROVED"',
+        test_command="",
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not marker.exists(), "report-only detection executed make test"
+    assert "make test" in proc.stdout and "Makefile: test target" in proc.stdout
+    prompt = reviewer_prompt.read_text()
+    assert "make test" in prompt and "did not run it" in prompt, prompt
+
+
+def test_detection_auto_runs_the_top_candidate(root: Path) -> None:
+    repo = make_repo(root)
+    make_marker = root / "make-ran.txt"
+    npm_marker = root / "npm-ran.txt"
+    (repo / "Makefile").write_text(f"test:\n\ttouch {make_marker}\n")
+    (repo / "package.json").write_text(json.dumps({
+        "scripts": {"test": f"touch {npm_marker}"},
+    }))
+    sh("git add Makefile package.json && git commit -qm test-runners", repo)
+    cfg = root / "auto.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="",
+        test_command_detection="auto",
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert make_marker.exists(), proc.stdout
+    assert not npm_marker.exists(), "lower-priority npm test was executed"
+    assert "npm test" in proc.stdout and "lower priority" in proc.stdout
+    assert "Running detected test command: make test" in proc.stdout
+
+
+def test_explicit_test_command_beats_detection(root: Path) -> None:
+    repo = make_repo(root)
+    make_marker = root / "make-ran.txt"
+    reviewer_prompt = root / "reviewer-prompt.txt"
+    (repo / "Makefile").write_text(f"test:\n\ttouch {make_marker}\n")
+    sh("git add Makefile && git commit -qm makefile", repo)
+    cfg = root / "explicit-tests.yaml"
+    write_config(
+        cfg,
+        f'printf "%s" "$0" > {reviewer_prompt}; echo "VERDICT: APPROVED"',
+        test_command="echo MARKER_TEST_RAN",
+        test_command_detection="auto",
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "MARKER_TEST_RAN" in reviewer_prompt.read_text()
+    assert not make_marker.exists(), "detected command beat explicit config"
+    assert "detected:" not in proc.stdout, proc.stdout
+
+
+def test_detection_off_and_invalid_mode(root: Path) -> None:
+    repo = make_repo(root)
+    (repo / "Makefile").write_text("test:\n\ttrue\n")
+    sh("git add Makefile && git commit -qm makefile", repo)
+    off = root / "off.yaml"
+    write_config(
+        off, 'echo "VERDICT: APPROVED"', test_command="",
+        test_command_detection="off",
+    )
+
+    proc = run(repo, off)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "No automatic test_command configured" in proc.stdout
+    assert "detected:" not in proc.stdout, proc.stdout
+
+    invalid = root / "invalid.yaml"
+    write_config(
+        invalid, 'echo "VERDICT: APPROVED"', test_command="",
+        test_command_detection="nonsense",
+    )
+    checked = doctor(repo, invalid)
+    assert checked.returncode == 1, checked.stdout + checked.stderr
+    assert "report, auto, off" in checked.stderr, checked.stderr
+
+
+def test_doctor_reports_the_detected_test_command(root: Path) -> None:
+    repo = make_repo(root)
+    (repo / "Cargo.toml").write_text("[package]\nname = 'demo'\n")
+    cfg = root / "doctor-detection.yaml"
+    write_config(cfg, 'echo "VERDICT: APPROVED"', test_command="")
+
+    proc = doctor(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "test_command_detection" in proc.stdout
+    assert "detected" in proc.stdout and "cargo test" in proc.stdout
+    assert "test_command: 'cargo test'" in proc.stdout, proc.stdout
+
+    configured = root / "doctor-configured.yaml"
+    write_config(configured, 'echo "VERDICT: APPROVED"', test_command="custom test")
+    explicit = doctor(repo, configured)
+    assert explicit.returncode == 0, explicit.stdout + explicit.stderr
+    test_section = explicit.stdout.split("\nTest command:\n", 1)[1].split("\nAgents:", 1)[0]
+    assert "configured" in test_section and "custom test" in test_section
+    assert "detected" not in test_section, test_section
+
+
+def test_architect_names_the_branch(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "architect-name.yaml"
+    reviewer_prompt = root / "reviewer-prompt.txt"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("printf 'NAME: passkey auth\\n\\nTHE PLAN\\n'")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
+            "rev": {"command": agent(
+                f'printf "%s" "$0" > {reviewer_prompt}; '
+                'echo "VERDICT: APPROVED"'
+            )},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert re.fullmatch(
+        r"stargate/passkey-auth-\d{8}-\d{6}(?:-\d+)?", state["branch"]
+    ), state["branch"]
+    assert "named by the architect" in proc.stdout, proc.stdout
+    prompt = reviewer_prompt.read_text()
+    assert "THE PLAN" in prompt and "NAME: passkey auth" not in prompt, prompt
+    assert "NAME: passkey auth" in (state_path.parent / "plan.md").read_text()
+
+
+def test_missing_or_malformed_name_falls_back(root: Path) -> None:
+    import yaml
+
+    cases = (
+        ("plain", "printf 'PLAIN PLAN\\n'", "PLAIN PLAN"),
+        ("malformed", "printf 'NAME: ***\\n\\nMALFORMED PLAN\\n'", "NAME: ***"),
+    )
+    for label, architect, expected_plan in cases:
+        case_root = root / label
+        case_root.mkdir()
+        repo = make_repo(case_root)
+        reviewer_prompt = case_root / "reviewer-prompt.txt"
+        cfg = case_root / "config.yaml"
+        cfg.write_text(yaml.safe_dump({
+            "agents": {
+                "arch": {"command": agent(architect)},
+                "dev": {"command": agent("echo change >> impl.txt; echo done")},
+                "rev": {"command": agent(
+                    f'printf "%s" "$0" > {reviewer_prompt}; '
+                    'echo "VERDICT: APPROVED"'
+                )},
+            },
+            "workflow": {"architect": "arch", "developer": "dev",
+                         "reviewer": "rev", "fixer": "dev"},
+            "settings": {"max_review_loops": 0, "test_command": "true"},
+        }))
+
+        proc = run(repo, cfg)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+        state = json.loads(state_path.read_text())
+        assert re.fullmatch(
+            r"stargate/demo-task-\d{8}-\d{6}(?:-\d+)?", state["branch"]
+        ), state["branch"]
+        assert expected_plan in reviewer_prompt.read_text()
+
+
+def test_name_option_and_same_second_uniqueness(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "named.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("printf 'NAME: architect choice\\n\\nPLAN\\n'")},
+            "dev": {"command": agent("echo change >> impl.txt; echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"max_review_loops": 0, "test_command": "true"},
+    }))
+    task = "This long sentence of context would otherwise produce an unreadable name"
+    proc = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg), "run",
+         "--name", "passkey auth", task],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert re.fullmatch(r"\d{8}-\d{6}-passkey-auth(?:-\d+)?", state["run_id"])
+    assert re.fullmatch(
+        r"stargate/passkey-auth-\d{8}-\d{6}(?:-\d+)?", state["branch"]
+    )
+    assert "named by the architect" not in proc.stdout, proc.stdout
+    assert state_path.parent.name == state["run_id"]
+
+    listed = runs(repo)
+    assert listed.returncode == 0 and state["run_id"] in listed.stdout
+    resumed = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg),
+         "resume", state["run_id"]],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+
+    from stargate.cli import reserve_run
+    collision_root = root / "collision"
+    collision_root.mkdir()
+    collision_repo = make_repo(collision_root)
+    first = reserve_run(collision_repo, "20260831-150219", "passkey-auth")
+    second = reserve_run(collision_repo, "20260831-150219", "passkey-auth")
+    assert first[0] != second[0]
+    assert first[1] != second[1]
+    assert first[2].is_dir() and second[2].is_dir()
+
+
 if __name__ == "__main__":
     for fn in (test_settings_only_project_config_is_valid,
                test_project_config_layers_over_user_config,
@@ -1140,7 +1439,16 @@ if __name__ == "__main__":
                test_developer_that_changes_nothing_stops_the_run,
                test_untracked_new_file_counts_as_work,
                test_resume_redo_reruns_a_completed_stage,
-               test_fixer_that_changes_nothing_stops_the_review_loop):
+               test_fixer_that_changes_nothing_stops_the_review_loop,
+               test_detects_the_common_project_shapes,
+               test_detected_test_command_is_reported_not_run,
+               test_detection_auto_runs_the_top_candidate,
+               test_explicit_test_command_beats_detection,
+               test_detection_off_and_invalid_mode,
+               test_doctor_reports_the_detected_test_command,
+               test_architect_names_the_branch,
+               test_missing_or_malformed_name_falls_back,
+               test_name_option_and_same_second_uniqueness):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
         print(f"ok  {fn.__name__}")

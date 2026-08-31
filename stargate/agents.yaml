@@ -90,6 +90,13 @@ settings:
   # test_command: "npm test"
   test_command: ""
 
+  # When test_command is empty, inspect the repository in this order: a Make
+  # test target, package.json script, Cargo, Go, Swift, then explicit pytest
+  # signals. All matches are shown. "report" is deliberately safest because a
+  # detected command is one the user never approved; "auto" runs the first
+  # match after every developer/fixer pass, and "off" skips detection.
+  test_command_detection: report
+
   # Worktrees live outside the repository by default:
   # <repo-parent>/.stargate-worktrees/<repo-name>/<run-id>
   worktree_root: ""
