@@ -24,7 +24,7 @@ tests (optional)
  ▼
 Claude / reviewer
  │
- ├── APPROVED ─────────────► done
+ ├── APPROVED ─────────────► orchestrator commit ──► done
  │
  └── CHANGES_REQUESTED
           │
@@ -37,8 +37,15 @@ Claude / reviewer
           └──────────────► review again
 ```
 
-The orchestrator itself never commits, merges, rebases, pushes, or deletes the
-worktree.
+Every terminal result with changes is committed on the run's own branch,
+including a reviewer that still requests changes, a failing test command, or a
+token-budget stop. The verdict is part of the commit message. A run that
+crashes does not commit; `resume` does so when the run eventually reaches a
+terminal result.
+
+The orchestrator never merges, rebases, pushes, deletes the worktree, or
+touches the branch checked out in the user's original repository. The agents
+themselves remain forbidden to commit.
 
 ## Requirements
 
@@ -109,6 +116,7 @@ Everything under `settings:` in the layered effective config. All are optional.
 |---|---|---|
 | `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. The same effective command is available to agent commands through `{test_command}`, which the packaged reviewer uses so it can verify the suite. An explicit value always wins over detection. |
 | `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
+| `commit` | `true` | Commit a terminal result on the run's own branch. Set to `false`, or pass `--no-commit` to `run` or `resume`, to leave the worktree dirty as older versions did. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
 | `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
@@ -131,6 +139,7 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 | `2` | The reviewer still requested changes after the last allowed fixer pass, or the fixer changed nothing and the loop stopped early. |
 | `3` | Approved, but the explicit test command or an `auto`-detected command failed. |
 | `4` | `max_task_tokens` was reached; the run stopped between phases. |
+| `5` | The run reached a verdict, but Git could not create its commit. The work remains intact and staged where possible; the error prints a manual recovery command. |
 | `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
 | `130` | The run was interrupted with Ctrl-C/SIGINT. Its state is recorded as failed and `resume` is offered. |
 | `143` | The run received SIGTERM. Its state is recorded as failed and `resume` is offered. |
@@ -244,6 +253,14 @@ short branch similar to:
 stargate/passkey-auth-20260830-181500
 ```
 
+When the run reaches a terminal result, this branch also receives a local
+commit. The user's `main` (or other checked-out branch), index and worktree do
+not move. A follow-up can branch directly from it:
+
+```bash
+stargate run --base-ref stargate/passkey-auth-20260830-181500 "Add recovery codes"
+```
+
 The packaged architect prompt asks for a `NAME:` first line. Stargate strips a
 valid line before forwarding the plan to the developer, reviewer, and fixer. A
 custom/older prompt that omits it, or a malformed name, safely falls back to the
@@ -271,7 +288,7 @@ Run artifacts are stored under the target repo:
 
 ```text
 my-project/.stargate/runs/<run-id>/
-├── state.json         # stage, status, error, tokens -- what `resume` reads
+├── state.json         # stage, status, commit, exclusions -- what `resume` reads
 ├── config.yaml        # the fully merged effective config, frozen at run start
 ├── prompts/           # the four prompts, frozen at run start
 ├── plan.md
@@ -282,6 +299,7 @@ my-project/.stargate/runs/<run-id>/
 ├── review-1.md
 ├── fix-1.txt          # only when needed
 ├── tests-*.txt        # if an explicit or auto-detected command runs
+├── commit-message.txt # exact traceable message passed to Git, if attempted
 └── summary.md
 ```
 
@@ -486,6 +504,54 @@ so the same situation is not treated as an agent failure. Re-reviewing an
 identical worktree would only buy the same verdict again; stargate stops the
 loop immediately with `CHANGES_REQUESTED` instead.
 
+## Committing the result
+
+Committing is on by default. This changes older behavior deliberately: a
+default-off feature would leave every user who did not discover the setting
+with the same manual branching and committing step, while completed work would
+still exist only in a removable worktree. The scope of the mutation stays
+narrow: Git advances only the run branch inside the run worktree. Use
+`settings.commit: false` or `--no-commit` when that tradeoff is not wanted.
+
+Stargate commits only after a terminal verdict, never after individual fixer
+passes. A normal run therefore produces one commit. A resume of already
+committed work finds an empty index and produces no second commit; a later
+`--redo` that genuinely adds work can produce a new terminal commit. Empty
+commits are never created.
+
+Red outcomes are durable too. `CHANGES_REQUESTED`, a failed test command and
+`BUDGET_EXCEEDED` are recorded in the subject and
+`Stargate-Verdict` trailer rather than being presented as success. Crashes,
+agent errors, invalid reviewer output and catchable signals do not reach the
+finish path, so they remain uncommitted until a successful `resume` reaches a
+verdict.
+
+The commit stages tracked edits and deletions plus new untracked implementation
+files. Gitignored files remain ignored. Stargate also snapshots untracked
+entries around every orchestrator test command and excludes entries that first
+appeared during testing, so an incomplete `.gitignore` does not silently add
+`build/`, `.venv/` or similar output. Tracked files rewritten by a test,
+such as an intentional snapshot or lockfile, remain part of the reviewed diff
+and are committed. The untracked snapshot uses Git's directory grouping: if a
+suite creates an artifact inside an untracked directory that already existed
+before the suite, Git cannot distinguish the nested artifact from the
+implementation directory; the durable fix for that mixed case is a project
+`.gitignore`.
+
+The subject begins with `stargate:`, includes the terminal verdict, and stays
+within 72 characters. The body names the task, test result and base ref, while
+Git trailers carry the run ID, verdict, base ref and test exit when available.
+That run ID maps the commit back to `.stargate/runs/<run-id>/`. Git still uses
+the repository's configured user, signing policy and hooks: Stargate supplies
+neither `--author`, `--no-gpg-sign` nor `--no-verify`.
+
+A failed hook, signing problem or missing Git identity returns exit code 5.
+The result remains staged where possible, `state.json` keeps the terminal
+verdict plus `commit_error`, and the terminal names the intact worktree and a
+manual `git commit` recovery command. A hook that succeeds but rewrites files
+after staging leaves those rewrites uncommitted with a warning; Stargate never
+makes an automatic second commit to conceal that state.
+
 ## Retrying a transient failure
 
 Retries are off by default. Enable them per project with a count of retries
@@ -557,6 +623,10 @@ Resume with: stargate resume 20260831-101304-add-passkey-authentication
 and skips the stages already marked complete. It does not produce a second
 plan, branch or worktree. A developer that exited successfully but changed
 nothing is deliberately not marked complete, so plain `resume` reruns it.
+Untracked test-artifact exclusions are stored in `state.json`, so output
+created before a crash remains excluded when a later process resumes. If a
+previous invocation already committed and no new work was added, the resumed
+finish detects the empty index and does not make a duplicate commit.
 
 By default it runs under the config frozen into the run, so resuming cannot
 silently change the agents the earlier stages ran under. Pass `--config` to
@@ -622,7 +692,8 @@ The totals are summed across phases and checked at each phase boundary. So a
 budget stops the *next* agent from starting, never the one already running — a
 single runaway invocation still overshoots. Hitting the cap ends the run with
 verdict `BUDGET_EXCEEDED` and exit code 4, leaving the branch and worktree
-intact.
+intact and committing any work produced so far. No empty commit is made when
+the budget is reached before implementation changes exist.
 
 For a genuine in-flight cap, use a vendor flag in the command itself. Claude
 has one; Codex has no equivalent today:
@@ -710,9 +781,14 @@ The important separation is:
   warns if a custom config adds one because that grants project-command
   execution in the real checkout.
 - Codex developer/fixer gets workspace write access in the isolated worktree.
-- Git destructive/publishing actions are forbidden by prompt.
-- The orchestrator does not auto-merge or auto-push.
-- The final branch/worktree is left for human inspection.
+- Git commit, destructive and publishing actions remain forbidden to agents by
+  prompt.
+- At a terminal result, the orchestrator creates a local commit on the run's
+  own branch using the repository's identity, signing configuration and hooks.
+- The orchestrator does not merge, rebase, push, delete the worktree, modify
+  remotes, or touch the branch/index/worktree in the user's original checkout.
+- The final branch/worktree and its traceable commit are left for human
+  inspection.
 
 The agents' own CLI sandbox and permission settings remain the real enforcement
 boundary; prompts are guidance, not a security boundary.
@@ -721,8 +797,8 @@ boundary; prompts are guidance, not a security boundary.
 
 Shipped since this list was written: token accounting, timeouts, retries,
 persistent run state, `runs`, `resume`, catchable-signal handling, capability
-probes, and empty-stage detection. What is still open, roughly in order of how
-much it would change the tool:
+probes, empty-stage detection, and terminal commits on run branches. What is
+still open, roughly in order of how much it would change the tool:
 
 - **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
   DAG scheduling, then an integrated review across the branches. This is the

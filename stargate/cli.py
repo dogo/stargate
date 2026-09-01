@@ -60,6 +60,9 @@ class RunContext:
     test_command: str = ""
     test_source: str = ""
     detected: list[Detected] = field(default_factory=list)
+    test_artifacts: set[str] = field(default_factory=set)
+    commit: str = ""
+    commit_error: str = ""
 
 
 def run_process(
@@ -651,6 +654,23 @@ def detection_mode(config: dict[str, Any]) -> str:
     return mode
 
 
+# Committing is ON by default. The friction this removes is a default-level
+# problem: a run whose work exists only as a dirty worktree cannot be built on
+# without a hand-made branch and commit, and a `git worktree remove --force`
+# destroys it, because the artifacts hold traces and prose, not code. A flag
+# nobody knows exists does not fix that. Unlike a detected test command, this
+# executes nothing the user has not already sanctioned: the commit lands on a
+# branch stargate created, in a worktree stargate created, and is never pushed
+# or merged. The documented behaviour it changes is narrow -- `git status` in
+# the worktree goes clean, while `git diff <base>` still shows every change.
+# `commit: false` restores the old behaviour exactly.
+def commit_enabled(config: dict[str, Any]) -> bool:
+    value = config.get("settings", {}).get("commit", True)
+    if not isinstance(value, bool):
+        raise StargateError("settings.commit must be true or false.")
+    return value
+
+
 def read_detection_file(path: Path) -> str | None:
     """Read enough evidence for detection without trusting project file size."""
     try:
@@ -779,6 +799,7 @@ def doctor(
     print()
     settings = config.get("settings", {})
     mode = detection_mode(config)
+    commit_enabled(config)
     configured_test_command = str(
         settings.get("test_command", "") or ""
     ).strip()
@@ -820,6 +841,7 @@ def doctor(
         ("max_review_loops", 2),
         ("test_command", ""),
         ("test_command_detection", "report"),
+        ("commit", True),
         ("max_task_tokens", 0),
         ("agent_timeout_seconds", 1800),
         ("agent_retries", AGENT_RETRIES_DEFAULT),
@@ -1214,6 +1236,9 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "completed": sorted(ctx.done),
         "tokens_used": ctx.tokens_used,
         "named_by_user": ctx.named_by_user,
+        "test_artifacts": sorted(ctx.test_artifacts),
+        "commit": ctx.commit or None,
+        "commit_error": ctx.commit_error or None,
         "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
         "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }, indent=2) + "\n")
@@ -1254,6 +1279,9 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         stage=state.get("stage", "init"),
         done=set(state.get("completed", [])),
         tokens_used=int(state.get("tokens_used", 0)),
+        test_artifacts=set(state.get("test_artifacts", [])),
+        commit=str(state.get("commit") or ""),
+        commit_error=str(state.get("commit_error") or ""),
         tag=(
             match.group(1)
             if (match := re.search(
@@ -1406,6 +1434,20 @@ def worktree_fingerprint(ctx: RunContext) -> str:
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()
 
 
+def untracked_entries(worktree: Path) -> set[str]:
+    """Return untracked paths at Git's directory-grouped granularity."""
+    out = git_quiet(
+        worktree,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "--directory",
+        "--no-empty-directory",
+        "-z",
+    )
+    return {name for name in out.split("\0") if name}
+
+
 TEST_TAIL_LINES = 200
 
 
@@ -1481,19 +1523,29 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
     kind = "detected" if ctx.test_source.startswith("detected:") else "configured"
     print(f"\nRunning {kind} test command: {command}")
     timeout = float(settings.get("test_timeout_seconds", 900)) or None
+    before = untracked_entries(ctx.worktree)
     try:
-        proc = subprocess.run(
-            ["/bin/sh", "-lc", command],
-            cwd=str(ctx.worktree),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-        output, code = proc.stdout or "", proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        output = (exc.output or "") + f"\n\n[timed out after {timeout}s]"
-        code = 124
+        try:
+            proc = subprocess.run(
+                ["/bin/sh", "-lc", command],
+                cwd=str(ctx.worktree),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+            )
+            output, code = proc.stdout or "", proc.returncode
+        except subprocess.TimeoutExpired as exc:
+            output = (exc.output or "") + f"\n\n[timed out after {timeout}s]"
+            code = 124
+    finally:
+        # Test suites commonly leave .venv/, *.egg-info/, target/ or
+        # node_modules/. A tidy project ignores them, but an incomplete
+        # .gitignore must not turn build output into history. Tracked rewrites
+        # remain eligible because they are part of the diff the reviewer saw.
+        # Persisting these names matters when a crash and resume span processes.
+        ctx.test_artifacts |= untracked_entries(ctx.worktree) - before
+        save_state(ctx, "running")
 
     print(output, end="" if output.endswith("\n") else "\n")
     (ctx.artifacts / f"tests-{label}.txt").write_text(
@@ -1506,21 +1558,204 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
     return code, f"$ {command}\n{verdict}\n\n{tail}"
 
 
-def finish(ctx: RunContext, task: str, verdict: str, test_exit: int | None) -> int:
-    write_summary(ctx, task, verdict, test_exit)
+COMMIT_SUBJECT_CHARS = 72
+COMMIT_TIMEOUT_SECONDS = 600
+COMMIT_OUTPUT_LINES = 20
+
+
+def commit_message(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
+    task = " ".join(ctx.task.split()) or "run"
+    suffix = f" ({verdict})"
+    available = max(0, COMMIT_SUBJECT_CHARS - len("stargate: ") - len(suffix))
+    subject_task = task[:available].rstrip()
+    subject = f"stargate: {subject_task}{suffix}"
+
+    if ctx.test_command:
+        tests = (
+            f"{ctx.test_command} (exit {test_exit})"
+            if test_exit is not None else f"{ctx.test_command} (not run)"
+        )
+    elif "report-only" in ctx.test_source:
+        tests = "not run (report-only detection)"
+    else:
+        tests = "not configured"
+
+    trailers = [
+        f"Stargate-Run-Id: {ctx.run_id}",
+        f"Stargate-Verdict: {verdict}",
+        f"Stargate-Base-Ref: {ctx.base_ref}",
+    ]
+    if test_exit is not None:
+        trailers.append(f"Stargate-Tests-Exit: {test_exit}")
+    return f"""\
+{subject}
+
+Task: {task}
+Verdict: {verdict}
+Tests: {tests}
+Base: {ctx.base_ref}
+
+Produced by stargate agents, committed by the orchestrator; the agents
+themselves never run git. Plan, review and traces:
+.stargate/runs/{ctx.run_id}/
+
+{chr(10).join(trailers)}
+"""
+
+
+def stage_run_changes(ctx: RunContext) -> bool:
+    """Stage agent work while excluding untracked test-created entries."""
+    excludes = [f":(exclude,literal){name}" for name in sorted(ctx.test_artifacts)]
+    git(ctx.worktree, "add", "-A", "--", ".", *excludes, capture=True)
+    proc = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
+        cwd=str(ctx.worktree),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode not in (0, 1):
+        raise StargateError(
+            f"git diff --cached --quiet failed in {ctx.worktree}: "
+            f"{proc.stderr.strip()}"
+        )
+    return proc.returncode == 1
+
+
+def commit_failure(ctx: RunContext, reason: str, output: str = "") -> None:
+    tail = "\n".join(output.strip().splitlines()[-COMMIT_OUTPUT_LINES:])
+    message = (
+        f"Could not commit the run's work ({reason}). The changes are intact "
+        f"in {ctx.worktree}; any successfully staged changes remain staged, "
+        "and nothing was lost. A pre-commit hook or a commit signing "
+        "configuration in this repository is the usual cause -- a hook that "
+        "rewrote files may leave those rewrites unstaged. Finish by hand with:\n"
+        f"  cd {shlex.quote(str(ctx.worktree))} && git commit"
+    )
+    if tail:
+        message += "\nLast output:\n" + "\n".join(
+            f"  {line}" for line in tail.splitlines()
+        )
+    ctx.commit_error = message
+    print(f"\n{message}", file=sys.stderr)
+
+
+def commit_run(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
+    """Make at most one commit after the run reaches a terminal verdict.
+
+    Red results are committed too: they are the results most in need of a
+    durable recovery point, and the private, unpushed branch plus verdict in
+    the message keeps the history honest. Fixer passes are one editing session,
+    so committing before the final review would create misleading checkpoints.
+    """
+    ctx.commit_error = ""
+    if not ctx.worktree.exists():
+        return "empty"
+
+    branch = git_quiet(ctx.worktree, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    if branch != ctx.branch:
+        commit_failure(
+            ctx,
+            f"worktree is on {branch!r}, not the run branch {ctx.branch!r}",
+        )
+        return "failed"
+
+    try:
+        changed = stage_run_changes(ctx)
+    except StargateError as exc:
+        commit_failure(ctx, f"staging failed: {exc}")
+        return "failed"
+    if not changed:
+        return "empty"
+
+    message_path = ctx.artifacts / "commit-message.txt"
+    message_path.write_text(commit_message(ctx, verdict, test_exit))
+    try:
+        proc = run_process(
+            ["git", "commit", "-F", str(message_path)],
+            ctx.worktree,
+            check=False,
+            timeout=COMMIT_TIMEOUT_SECONDS,
+        )
+    except StargateError as exc:
+        commit_failure(ctx, str(exc))
+        return "failed"
+    if proc.returncode:
+        commit_failure(ctx, f"git exit {proc.returncode}", proc.stdout or "")
+        return "failed"
+
+    ctx.commit = git_quiet(ctx.worktree, "rev-parse", "HEAD").strip()
+    # Known test output is deliberately left untracked, so it must not be
+    # blamed on a hook. The same exclusions reveal only unexpected rewrites.
+    excludes = [f":(exclude,literal){name}" for name in sorted(ctx.test_artifacts)]
+    status = git_quiet(
+        ctx.worktree, "status", "--porcelain", "--", ".", *excludes
+    )
+    if status:
+        print(
+            "\nWarning: the commit succeeded, but a repository hook modified "
+            f"files afterward. Those changes remain uncommitted in {ctx.worktree}; "
+            "stargate will not create a second commit.",
+            file=sys.stderr,
+        )
+    return "committed"
+
+
+def commit_summary(ctx: RunContext, enabled: bool) -> str:
+    if not enabled:
+        return "disabled"
+    if ctx.commit_error:
+        return "FAILED"
+    if ctx.commit:
+        return ctx.commit
+    return "none (nothing to commit)"
+
+
+def finish(
+    ctx: RunContext,
+    task: str,
+    verdict: str,
+    test_exit: int | None,
+    *,
+    commit: bool,
+) -> int:
+    if commit:
+        commit_outcome = commit_run(ctx, verdict, test_exit)
+    else:
+        # A failed commit belongs to the invocation that attempted it. If the
+        # user deliberately resumes without committing, preserving that error
+        # would make a successful terminal result keep returning exit 5.
+        ctx.commit_error = ""
+        commit_outcome = "disabled"
+    write_summary(ctx, task, verdict, test_exit, commit)
     save_state(ctx, verdict.lower())
 
     print("\n=== RESULT ===")
     print(f"Verdict:   {verdict}")
     print(f"Branch:    {ctx.branch}")
+    print(f"Commit:    {commit_summary(ctx, commit)}")
     print(f"Worktree:  {ctx.worktree}")
     print(f"Artifacts: {ctx.artifacts}")
     if ctx.tokens_used:
         cap = token_cap(ctx.config)
         print(f"Tokens:    {ctx.tokens_used:,}" + (f" of {cap:,}" if cap else " (no cap)"))
-    print("\nNothing was committed, merged, pushed, or deleted automatically.")
+    if ctx.commit:
+        print("\nNothing was merged, pushed, or deleted automatically.")
+    else:
+        print("\nNothing was committed, merged, pushed, or deleted automatically.")
     print(f"Inspect with: cd {shlex.quote(str(ctx.worktree))} && git status && git diff {shlex.quote(ctx.base_ref)}")
+    if ctx.commit:
+        print(
+            "History: git log --oneline "
+            f"{shlex.quote(ctx.base_ref + '..' + ctx.branch)}"
+        )
+        print(
+            "Build on it with: stargate run --base-ref "
+            f"{shlex.quote(ctx.branch)} \"<next task>\""
+        )
 
+    if commit_outcome == "failed":
+        return 5
     if verdict == "BUDGET_EXCEEDED":
         return 4
     if verdict != "APPROVED":
@@ -1530,7 +1765,13 @@ def finish(ctx: RunContext, task: str, verdict: str, test_exit: int | None) -> i
     return 0
 
 
-def write_summary(ctx: RunContext, task: str, verdict: str, test_exit: int | None) -> None:
+def write_summary(
+    ctx: RunContext,
+    task: str,
+    verdict: str,
+    test_exit: int | None,
+    commit: bool,
+) -> None:
     status = git(ctx.worktree, "status", "--short").stdout
     diff_stat = git(ctx.worktree, "diff", "--stat", ctx.base_ref).stdout
     summary = f"""# stargate run
@@ -1539,6 +1780,7 @@ Task: {task}
 Run: {ctx.run_id}
 Base ref: {ctx.base_ref}
 Branch: {ctx.branch}
+Commit: {commit_summary(ctx, commit)}
 Worktree: {ctx.worktree}
 Verdict: {verdict}
 Test command: {ctx.test_command or "(none)"} ({ctx.test_source})
@@ -1581,6 +1823,8 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
         ctx = make_context(repo, config, args.task, args.base_ref, args.name)
         prompts = snapshot(ctx, prompt_dirs(config, script_dir))
 
+    commit = commit_enabled(ctx.config) and not args.no_commit
+
     print(f"\nRun ID:   {ctx.run_id}")
     print(f"Base:     {ctx.base_ref}")
     print(f"Branch:   {ctx.branch}")
@@ -1589,14 +1833,20 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
 
     try:
         plan_tests(ctx)
-        return run_stages(ctx, args, prompts)
+        return run_stages(ctx, args, prompts, commit=commit)
     except (StargateError, KeyboardInterrupt) as exc:
         save_state(ctx, "failed", f"{type(exc).__name__}: {exc}")
         print(f"\nResume with: stargate resume {ctx.run_id}", file=sys.stderr)
         raise
 
 
-def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -> int:
+def run_stages(
+    ctx: RunContext,
+    args: argparse.Namespace,
+    prompts: list[Path],
+    *,
+    commit: bool,
+) -> int:
     config = ctx.config
     plan_path = ctx.artifacts / "plan.md"
     architect_ran = False
@@ -1642,7 +1892,7 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
     complete_stage(ctx, "worktree")
 
     if budget_spent(ctx, "the developer"):
-        return finish(ctx, ctx.task, "BUDGET_EXCEEDED", None)
+        return finish(ctx, ctx.task, "BUDGET_EXCEEDED", None, commit=commit)
 
     # 3. Developer implements.
     if "developer" in ctx.done:
@@ -1690,7 +1940,9 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
     enter_stage(ctx, "review")
     for attempt in range(max_loops + 1):
         if budget_spent(ctx, f"review {attempt + 1}"):
-            return finish(ctx, ctx.task, "BUDGET_EXCEEDED", test_exit)
+            return finish(
+                ctx, ctx.task, "BUDGET_EXCEEDED", test_exit, commit=commit
+            )
         review_prompt = render_prompt(
             prompts,
             "reviewer",
@@ -1735,7 +1987,9 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
             tests=test_report,
         )
         if budget_spent(ctx, f"fixer {attempt + 1}"):
-            return finish(ctx, ctx.task, "BUDGET_EXCEEDED", test_exit)
+            return finish(
+                ctx, ctx.task, "BUDGET_EXCEEDED", test_exit, commit=commit
+            )
 
         before = worktree_fingerprint(ctx)
         print(f"\n=== FIXER {attempt + 1} ===")
@@ -1758,7 +2012,7 @@ def run_stages(ctx: RunContext, args: argparse.Namespace, prompts: list[Path]) -
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
     complete_stage(ctx, "review")
-    return finish(ctx, ctx.task, verdict, test_exit)
+    return finish(ctx, ctx.task, verdict, test_exit, commit=commit)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1823,6 +2077,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     for parser_ in (run, resume):
+        parser_.add_argument(
+            "--no-commit",
+            action="store_true",
+            help="Leave the run's work uncommitted in the worktree "
+            "(overrides settings.commit).",
+        )
         parser_.add_argument(
             "--max-review-loops",
             type=int,
