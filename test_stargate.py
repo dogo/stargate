@@ -21,6 +21,12 @@ def sh(cmd: str, cwd: Path) -> None:
     subprocess.run(cmd, cwd=cwd, shell=True, check=True, capture_output=True)
 
 
+def git_output(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, text=True, capture_output=True, check=True
+    ).stdout.strip()
+
+
 def make_repo(root: Path) -> Path:
     repo = root / "repo"
     repo.mkdir()
@@ -42,6 +48,7 @@ def agent(script: str) -> list[str]:
 def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0,
                  agent_timeout: int = 60, prompts_dir: str = "",
                  test_command_detection: str | None = None,
+                 commit: bool | str | None = None,
                  reviewer_args: tuple[str, ...] = ()) -> None:
     import yaml
     reviewer_command = agent(reviewer)
@@ -62,14 +69,17 @@ def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0
     }
     if test_command_detection is not None:
         cfg["settings"]["test_command_detection"] = test_command_detection
+    if commit is not None:
+        cfg["settings"]["commit"] = commit
     path.write_text(yaml.safe_dump(cfg))
 
 
 def run(
-    repo: Path, config: Path, task: str = "demo task"
+    repo: Path, config: Path, task: str = "demo task", *run_args: str
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "stargate", "--config", str(config), "run", task],
+        [sys.executable, "-m", "stargate", "--config", str(config), "run",
+         *run_args, task],
         cwd=repo, text=True, capture_output=True,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
@@ -1564,6 +1574,276 @@ def test_name_option_and_same_second_uniqueness(root: Path) -> None:
     assert first[2].is_dir() and second[2].is_dir()
 
 
+def test_run_commits_on_its_own_branch(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "commit.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+    main_before = git_output(repo, "rev-parse", "main")
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    branch = state["branch"]
+    worktree = Path(state["worktree"])
+    commit = git_output(worktree, "rev-parse", "HEAD")
+
+    assert git_output(repo, "rev-list", "--count", f"main..{branch}") == "1"
+    assert git_output(worktree, "status", "--porcelain") == ""
+    assert git_output(worktree, "show", f"{branch}:impl.txt") == "change"
+    assert git_output(repo, "rev-parse", "main") == main_before
+    assert git_output(repo, "status", "--porcelain") == ""
+    assert git_output(repo, "remote") == ""
+    assert state["commit"] == commit
+    assert f"Commit: {commit}" in (state_path.parent / "summary.md").read_text()
+    assert f"Commit:    {commit}" in proc.stdout, proc.stdout
+    assert "Build on it with: stargate run --base-ref" in proc.stdout
+    assert "Nothing was merged, pushed, or deleted automatically." in proc.stdout
+
+    follow_up = run(repo, cfg, "follow-up task", "--base-ref", branch)
+    assert follow_up.returncode == 0, follow_up.stdout + follow_up.stderr
+    states = [
+        json.loads(path.read_text())
+        for path in (repo / ".stargate" / "runs").glob("*/state.json")
+    ]
+    next_state = next(item for item in states if item["run_id"] != state["run_id"])
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", branch, next_state["branch"]],
+        cwd=repo, capture_output=True,
+    ).returncode == 0
+    assert git_output(repo, "rev-list", "--count",
+                      f"{branch}..{next_state['branch']}") == "1"
+    assert git_output(
+        Path(next_state["worktree"]), "show", f"{next_state['branch']}:impl.txt"
+    ) == "change\nchange"
+    assert git_output(repo, "rev-parse", "main") == main_before
+
+
+def test_commit_message_names_the_run_and_the_verdict(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "message.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+    task = "Add passkey authentication to account settings"
+
+    proc = run(repo, cfg, task)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    message = git_output(Path(state["worktree"]), "log", "-1", "--format=%B")
+    subject = message.splitlines()[0]
+
+    assert subject.startswith("stargate: "), subject
+    assert subject.endswith("(APPROVED)"), subject
+    assert len(subject) <= 72, subject
+    assert f"Stargate-Run-Id: {state['run_id']}" in message, message
+    assert "Stargate-Verdict: APPROVED" in message, message
+    message_path = state_path.parent / "commit-message.txt"
+    assert message_path.exists()
+    assert message_path.read_text().strip() == message
+
+
+def test_unapproved_result_is_committed_and_labelled(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "red.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: CHANGES_REQUESTED"', test_command="false"
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    worktree = Path(state["worktree"])
+    message = git_output(worktree, "log", "-1", "--format=%B")
+
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "1"
+    assert message.splitlines()[0].endswith("(CHANGES_REQUESTED)"), message
+    assert "Stargate-Verdict: CHANGES_REQUESTED" in message, message
+    assert "Stargate-Tests-Exit: 1" in message, message
+    assert state["status"] == "changes_requested", state
+
+
+def test_commit_can_be_disabled(root: Path) -> None:
+    configured = root / "configured"
+    configured.mkdir()
+    repo = make_repo(configured)
+    cfg = configured / "disabled.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true", commit=False
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    worktree = Path(state["worktree"])
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "0"
+    assert "?? impl.txt" in git_output(worktree, "status", "--porcelain")
+    assert state["commit"] is None
+    assert "Commit:    disabled" in proc.stdout, proc.stdout
+    assert "Nothing was committed, merged, pushed, or deleted automatically." in proc.stdout
+
+    overridden = root / "overridden"
+    overridden.mkdir()
+    repo = make_repo(overridden)
+    cfg = overridden / "default.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+    proc = run(repo, cfg, "demo task", "--no-commit")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "0"
+    assert "?? impl.txt" in git_output(
+        Path(state["worktree"]), "status", "--porcelain"
+    )
+    assert "Commit:    disabled" in proc.stdout, proc.stdout
+
+
+def test_test_artifacts_are_not_committed(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "artifacts.yaml"
+    write_config(
+        cfg,
+        'echo "VERDICT: APPROVED"',
+        test_command=(
+            "mkdir -p build-junk && echo junk > build-junk/out.bin "
+            "&& echo test >> app.py"
+        ),
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    worktree = Path(state["worktree"])
+    names = set(git_output(
+        worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+    ).splitlines())
+
+    assert names == {"app.py", "impl.txt"}, names
+    assert (worktree / "build-junk" / "out.bin").read_text() == "junk\n"
+    assert "?? build-junk/" in git_output(worktree, "status", "--porcelain")
+    assert "build-junk/" in state["test_artifacts"], state
+    assert "repository hook modified" not in proc.stderr, proc.stderr
+
+    # A later process sees the artifact before its test command starts. The
+    # persisted exclusion, rather than only the before/after snapshot, keeps it
+    # from becoming a second commit on resume.
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+    resumed = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg),
+         "resume", state["run_id"]],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "1"
+    assert "?? build-junk/" in git_output(worktree, "status", "--porcelain")
+
+
+def test_resume_does_not_commit_twice(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "resume.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+    first = run(repo, cfg)
+    assert first.returncode == 0, first.stdout + first.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    original_commit = state["commit"]
+
+    resumed = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg),
+         "resume", state["run_id"]],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    state = json.loads(state_path.read_text())
+    assert state["commit"] == original_commit
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "1"
+    assert f"Commit:    {original_commit}" in resumed.stdout, resumed.stdout
+    assert "Nothing was merged, pushed, or deleted automatically." in resumed.stdout
+    assert "Nothing was committed," not in resumed.stdout
+
+
+def test_commit_failure_is_explained_and_work_survives(root: Path) -> None:
+    repo = make_repo(root)
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\necho blocked by test hook\nexit 1\n")
+    hook.chmod(0o755)
+    cfg = root / "hook.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 5, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    worktree = Path(state["worktree"])
+
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "0"
+    assert (worktree / "impl.txt").read_text() == "change\n"
+    assert "A  impl.txt" in git_output(worktree, "status", "--porcelain")
+    assert "pre-commit hook" in proc.stderr, proc.stderr
+    assert "blocked by test hook" in proc.stderr, proc.stderr
+    assert f"cd {worktree} && git commit" in proc.stderr, proc.stderr
+    assert state["commit_error"], state
+    assert state["commit"] is None
+    assert state["status"] == "approved", state
+    assert state["error"] is None, state
+    assert "Commit: FAILED" in (state_path.parent / "summary.md").read_text()
+
+    resumed = subprocess.run(
+        [sys.executable, "-m", "stargate", "--config", str(cfg),
+         "resume", "--no-commit", state["run_id"]],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    state = json.loads(state_path.read_text())
+    assert "Commit:    disabled" in resumed.stdout, resumed.stdout
+    assert "Could not commit" not in resumed.stderr, resumed.stderr
+    assert state["commit_error"] is None, state
+    assert git_output(repo, "rev-list", "--count",
+                      f"main..{state['branch']}") == "0"
+
+
+def test_doctor_reports_the_commit_setting(root: Path) -> None:
+    repo = make_repo(root)
+    cfg = root / "doctor.yaml"
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true"
+    )
+
+    proc = doctor(repo, cfg)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert re.search(r"(?m)^  commit\s+True\s+\(default\)$", proc.stdout), proc.stdout
+
+    write_config(
+        cfg, 'echo "VERDICT: APPROVED"', test_command="true", commit="yes"
+    )
+    proc = doctor(repo, cfg)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "settings.commit must be true or false" in proc.stderr, proc.stderr
+
+
 if __name__ == "__main__":
     for fn in (test_settings_only_project_config_is_valid,
                test_project_config_layers_over_user_config,
@@ -1617,7 +1897,15 @@ if __name__ == "__main__":
                test_doctor_shows_and_probes_the_effective_grant,
                test_architect_names_the_branch,
                test_missing_or_malformed_name_falls_back,
-               test_name_option_and_same_second_uniqueness):
+               test_name_option_and_same_second_uniqueness,
+               test_run_commits_on_its_own_branch,
+               test_commit_message_names_the_run_and_the_verdict,
+               test_unapproved_result_is_committed_and_labelled,
+               test_commit_can_be_disabled,
+               test_test_artifacts_are_not_committed,
+               test_resume_does_not_commit_twice,
+               test_commit_failure_is_explained_and_work_survives,
+               test_doctor_reports_the_commit_setting):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
         print(f"ok  {fn.__name__}")
