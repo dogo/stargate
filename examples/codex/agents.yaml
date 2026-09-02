@@ -1,0 +1,44 @@
+# Every role on the Codex CLI. The packaged default mixes Claude and Codex;
+# this is the single-vendor version.
+#
+# Verified against codex-cli 0.152.0.
+version: 4
+
+agents:
+  # codex exec streams the whole session to stdout, so every role needs
+  # {output} -- without it the next role's prompt would be the previous
+  # role's trace. -o is codex's own flag for exactly this.
+  codex_reader:
+    command:
+      - codex
+      - exec
+      - --sandbox
+      - read-only
+      - --output-last-message
+      - "{output}"
+    probe: "Read the file {probe_file} and reply with its contents, nothing else."
+    probe_expect: read
+    usage_pattern: 'tokens used\s+([\d,]+)'
+
+  codex_writer:
+    command:
+      - codex
+      - exec
+      - --sandbox
+      - workspace-write
+      - --output-last-message
+      - "{output}"
+    probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+    probe_expect: write
+    usage_pattern: 'tokens used\s+([\d,]+)'
+
+workflow:
+  architect: codex_reader
+  developer: codex_writer
+  reviewer: codex_reader
+  fixer: codex_writer
+
+settings:
+  max_review_loops: 2
+  test_command: ""
+  test_command_detection: report

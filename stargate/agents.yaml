@@ -8,6 +8,10 @@ version: 4
 # a fraction of the plan without noticing. --disallowedTools keeps the same
 # read-only guarantee (the architect runs in the real repo, not the worktree)
 # while leaving the answer on stdout.
+#
+# --disallowedTools takes <tools...>, so it would swallow the prompt stargate
+# appends last. Ending these commands with --model is what stops it; keep a
+# non-variadic option last in any Claude command you write here.
 agents:
   architect:
     command:

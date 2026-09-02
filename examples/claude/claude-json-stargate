@@ -1,0 +1,16 @@
+#!/bin/sh
+# Optional claude adapter that makes token usage countable.
+#
+# `claude -p --output-format text` prints the final message and nothing else,
+# which is why the packaged config needs no wrapper -- but it also means no
+# usage number reaches stargate, so max_task_tokens never counts the Claude
+# half of a run. --output-format json carries both, at the cost of stdout no
+# longer being the answer.
+#
+# So: the JSON stays on stdout for usage_pattern to read, and .result goes to
+# the {output} file stargate forwards to the next role.
+set -e
+out=$1; shift
+# The flag goes before "$@": stargate appends the prompt as the last
+# argument, and claude --print rejects an option after it.
+claude --output-format json "$@" | tee /dev/stderr | jq -r '.result' > "$out"

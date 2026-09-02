@@ -808,9 +808,10 @@ catches the first of the four things that go wrong:
 Points 2 through 4 only surface in a real run, so finish with one against a
 throwaway repository before trusting a new agent with your own.
 
-[`examples/kiro/`](examples/kiro/) is a worked example: every role on
-`kiro-cli`, including the wrapper it needs and each of the three problems above
-that it actually hit.
+[`examples/`](examples/) has a folder per CLI — [claude](examples/claude/),
+[codex](examples/codex/), [kiro](examples/kiro/) — each running every role on
+that one vendor, with a table comparing how they map onto the knobs above and
+notes on which of the four problems each one actually hit.
 
 ## Why command prefixes instead of SDKs?
 

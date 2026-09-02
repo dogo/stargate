@@ -1,0 +1,48 @@
+# Every role on Claude Code. The packaged default mixes Claude and Codex; this
+# is the single-vendor version, useful when you only have one subscription.
+#
+# Verified against Claude Code 2.1.236.
+version: 4
+
+agents:
+  # `claude -p --output-format text` prints only the final message, so these
+  # roles need no {output} wrapper -- stdout IS the answer.
+  claude_reader:
+    command:
+      - claude
+      - -p
+      - --output-format
+      - text
+      - --disallowedTools
+      - Edit Write NotebookEdit
+      - --model
+      - opus
+    probe: "Read the file {probe_file} and reply with its contents, nothing else."
+    probe_expect: read
+
+  # Print mode denies edits unless a permission mode allows them. acceptEdits
+  # is the narrow one: file edits without prompting, everything else still
+  # asks (and in print mode, an ask is a denial).
+  claude_writer:
+    command:
+      - claude
+      - -p
+      - --output-format
+      - text
+      - --permission-mode
+      - acceptEdits
+      - --model
+      - sonnet
+    probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+    probe_expect: write
+
+workflow:
+  architect: claude_reader
+  developer: claude_writer
+  reviewer: claude_reader
+  fixer: claude_writer
+
+settings:
+  max_review_loops: 2
+  test_command: ""
+  test_command_detection: report
