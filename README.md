@@ -216,6 +216,13 @@ cd ~/dev/my-project
 stargate run "Add pagination to the users endpoint"
 ```
 
+Before creating run artifacts or calling an agent, Stargate resolves the base
+ref to a commit and checks a local branch against its configured upstream. It
+stops if the branch is behind or diverged, then uses the frozen commit for the
+whole run so a concurrently moving branch cannot change the developer's base.
+For a remote upstream it queries the remote directly without fetching; if the
+remote cannot be checked, the run does not start.
+
 Per-project settings (usually just the test command) go in a `.stargate.yaml`
 at the repo root:
 
@@ -618,8 +625,16 @@ was stopped by an uncatchable hard kill such as SIGKILL or power loss. Missing
 or corrupt `state.json` files are shown as unknown rather than crashing or
 hiding the run. If `.stargate/runs/` does not exist or is empty, the command
 reports that there are no runs. Listing only reads recorded state: it never
-creates, repairs or deletes run artifacts, and there is no destructive `clean`
-command.
+creates, repairs or deletes run artifacts.
+
+## Cleaning runs
+
+`stargate clean <run-id>` removes one run; `stargate clean --all` attempts every
+recorded run. A run is removed only when its branch is merged into the current
+`HEAD` and Git accepts the worktree as clean. There is no force option. After
+those checks, Stargate removes the linked worktree, its `stargate/*` branch and
+the run's `.stargate/runs/<run-id>/` artifacts. A missing worktree is pruned
+through Git before the remaining branch and artifacts are removed.
 
 ## Resuming a failed run
 

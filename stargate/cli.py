@@ -49,6 +49,7 @@ class RunContext:
     slug: str
     branch: str
     base_ref: str
+    base_commit: str
     worktree: Path
     artifacts: Path
     task: str = ""
@@ -305,15 +306,80 @@ def split_plan_name(plan: str) -> tuple[str, str]:
     return name, "\n".join([*lines[:first], *lines[first + 1:]]).strip()
 
 
-def resolve_base_ref(repo: Path, requested: str | None) -> str:
+def resolve_base_ref(repo: Path, requested: str | None) -> tuple[str, str]:
     if requested:
-        git(repo, "rev-parse", "--verify", requested, capture=True)
-        return requested
-    proc = git(repo, "rev-parse", "--abbrev-ref", "HEAD", capture=True)
-    branch = proc.stdout.strip()
-    if branch == "HEAD":
-        return git(repo, "rev-parse", "HEAD").stdout.strip()
-    return branch
+        ref = requested
+    else:
+        proc = git(repo, "rev-parse", "--abbrev-ref", "HEAD", capture=True)
+        ref = proc.stdout.strip()
+        if ref == "HEAD":
+            ref = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    commit = git(
+        repo, "rev-parse", "--verify", "--end-of-options",
+        f"{ref}^{{commit}}", capture=True,
+    ).stdout.strip()
+
+    symbolic = subprocess.run(
+        ["git", "rev-parse", "--symbolic-full-name", "--verify",
+         "--end-of-options", ref],
+        cwd=str(repo), text=True, capture_output=True,
+    )
+    local_branch = symbolic.stdout.strip()
+    if symbolic.returncode == 0 and local_branch.startswith("refs/heads/"):
+        branch = local_branch.removeprefix("refs/heads/")
+        remote = subprocess.run(
+            ["git", "config", "--get", f"branch.{branch}.remote"],
+            cwd=str(repo), text=True, capture_output=True,
+        ).stdout.strip()
+        merge_ref = subprocess.run(
+            ["git", "config", "--get", f"branch.{branch}.merge"],
+            cwd=str(repo), text=True, capture_output=True,
+        ).stdout.strip()
+        if remote and merge_ref:
+            upstream = (
+                merge_ref if remote == "."
+                else f"{remote}/{merge_ref.removeprefix('refs/heads/')}"
+            )
+            if remote == ".":
+                upstream_proc = subprocess.run(
+                    ["git", "rev-parse", "--verify", "--end-of-options",
+                     f"{merge_ref}^{{commit}}"],
+                    cwd=str(repo), text=True, capture_output=True,
+                )
+            else:
+                try:
+                    upstream_proc = subprocess.run(
+                        ["git", "ls-remote", "--exit-code", "--refs",
+                         remote, merge_ref],
+                        cwd=str(repo), text=True, capture_output=True,
+                        stdin=subprocess.DEVNULL, timeout=60,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise StargateError(
+                        f"Timed out validating upstream {upstream!r}."
+                    ) from exc
+            if upstream_proc.returncode != 0 or not upstream_proc.stdout.strip():
+                detail = upstream_proc.stderr.strip() or "ref not found"
+                raise StargateError(
+                    f"Could not validate upstream {upstream!r}: {detail}"
+                )
+            upstream_commit = upstream_proc.stdout.split()[0]
+            if upstream_commit != commit:
+                contains_upstream = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", upstream_commit,
+                     commit],
+                    cwd=str(repo), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ).returncode == 0
+                if not contains_upstream:
+                    raise StargateError(
+                        f"Base branch {ref!r} is behind or diverged from "
+                        f"upstream {upstream!r}. Update it before running "
+                        "Stargate."
+                    )
+    return ref, commit
 
 
 def warn_if_dirty(repo: Path) -> None:
@@ -1174,7 +1240,7 @@ def make_context(
             file=sys.stderr,
         )
     slug = named or slugify(task)
-    base = resolve_base_ref(repo, base_ref)
+    base, base_commit = resolve_base_ref(repo, base_ref)
     run_id, branch, artifacts = reserve_run(repo, now, slug)
     tag = branch.removeprefix(f"stargate/{slug}-")
 
@@ -1193,6 +1259,7 @@ def make_context(
         slug=slug,
         branch=branch,
         base_ref=base,
+        base_commit=base_commit,
         worktree=worktree,
         artifacts=artifacts,
         task=task,
@@ -1232,6 +1299,7 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "task": ctx.task,
         "repo": str(ctx.repo),
         "base_ref": ctx.base_ref,
+        "base_commit": ctx.base_commit,
         "branch": ctx.branch,
         "worktree": str(ctx.worktree),
         "stage": ctx.stage,
@@ -1277,6 +1345,7 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         slug=slugify(state["task"]),
         branch=state["branch"],
         base_ref=state["base_ref"],
+        base_commit=str(state.get("base_commit") or state["base_ref"]),
         worktree=Path(state["worktree"]),
         artifacts=artifacts,
         task=state["task"],
@@ -1419,7 +1488,7 @@ def create_worktree(ctx: RunContext) -> None:
     exists = git(ctx.repo, "rev-parse", "--verify", ctx.branch, check=False).returncode == 0
     args = ["worktree", "add"] + (
         [str(ctx.worktree), ctx.branch] if exists
-        else ["-b", ctx.branch, str(ctx.worktree), ctx.base_ref]
+        else ["-b", ctx.branch, str(ctx.worktree), ctx.base_commit]
     )
     git(ctx.repo, *args, capture=True)
 
@@ -1436,9 +1505,99 @@ def git_quiet(repo: Path, *args: str) -> str:
     return proc.stdout
 
 
+def clean_run(repo: Path, run_id: str) -> None:
+    root = repo / ".stargate" / "runs"
+    if not run_id or Path(run_id).name != run_id or run_id in (".", ".."):
+        raise StargateError(f"Invalid run ID: {run_id!r}")
+    artifacts = root / run_id
+    if artifacts.is_symlink() or not artifacts.is_dir():
+        raise StargateError(f"No recorded run {run_id!r} in {root}")
+    try:
+        state = json.loads((artifacts / "state.json").read_text())
+    except (OSError, ValueError) as exc:
+        raise StargateError(f"Cannot clean {run_id}: unreadable state.json ({exc})") from exc
+    if not isinstance(state, dict) or state.get("run_id") != run_id:
+        raise StargateError(f"Cannot clean {run_id}: state.json has a different run ID")
+    recorded_repo = state.get("repo")
+    if not isinstance(recorded_repo, str) or Path(recorded_repo).resolve() != repo:
+        raise StargateError(f"Cannot clean {run_id}: state.json belongs to another repository")
+    branch = state.get("branch")
+    worktree_value = state.get("worktree")
+    if not isinstance(branch, str) or not branch.startswith("stargate/"):
+        raise StargateError(f"Cannot clean {run_id}: invalid Stargate branch")
+    if not isinstance(worktree_value, str) or not worktree_value:
+        raise StargateError(f"Cannot clean {run_id}: invalid worktree path")
+    worktree = Path(worktree_value).resolve()
+    branch_present = branch_exists(repo, branch)
+    worktree_present = worktree.exists()
+
+    if worktree_present:
+        checked_out = git_quiet(worktree, "symbolic-ref", "--short", "HEAD").strip()
+        if checked_out != branch:
+            raise StargateError(
+                f"Cannot clean {run_id}: {worktree} has branch {checked_out!r}, "
+                f"not {branch!r}"
+            )
+    elif not branch_present:
+        shutil.rmtree(artifacts)
+        print(f"Cleaned {run_id}: artifacts removed; worktree and branch were absent.")
+        return
+
+    if branch_present:
+        merged = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", f"refs/heads/{branch}", "HEAD"],
+            cwd=str(repo), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        if merged.returncode == 1:
+            raise StargateError(
+                f"Cannot clean {run_id}: branch {branch!r} is not merged into HEAD"
+            )
+        if merged.returncode != 0:
+            raise StargateError(f"Cannot determine whether branch {branch!r} is merged")
+
+    if worktree_present:
+        git(repo, "worktree", "remove", str(worktree))
+    else:
+        git(repo, "worktree", "prune", "--expire", "now")
+    if branch_present:
+        git(repo, "branch", "-d", "--", branch)
+    shutil.rmtree(artifacts)
+    print(f"Cleaned {run_id}: worktree, branch and artifacts removed.")
+
+
+def clean_runs(repo: Path, run_id: str | None, all_runs: bool) -> int:
+    if all_runs == (run_id is not None):
+        raise StargateError("Use either 'stargate clean <run-id>' or 'stargate clean --all'.")
+    if run_id is not None:
+        clean_run(repo, run_id)
+        return 0
+
+    root = repo / ".stargate" / "runs"
+    if not root.is_dir():
+        print(f"No recorded runs in {root}")
+        return 0
+    run_ids = sorted(
+        (path.name for path in root.iterdir() if path.is_dir()), reverse=True
+    )
+    if not run_ids:
+        print(f"No recorded runs in {root}")
+        return 0
+    failures: list[tuple[str, str]] = []
+    for candidate in run_ids:
+        try:
+            clean_run(repo, candidate)
+        except StargateError as exc:
+            failures.append((candidate, str(exc)))
+    if failures:
+        for candidate, error in failures:
+            print(f"  {candidate}: {error}", file=sys.stderr)
+        raise StargateError(f"Could not clean {len(failures)} of {len(run_ids)} runs.")
+    return 0
+
+
 def worktree_fingerprint(ctx: RunContext) -> str:
     """Digest the tracked and untracked state that an agent can change."""
-    parts = [git_quiet(ctx.worktree, "diff", ctx.base_ref)]
+    parts = [git_quiet(ctx.worktree, "diff", ctx.base_commit)]
     untracked = git_quiet(
         ctx.worktree, "ls-files", "--others", "--exclude-standard", "-z"
     )
@@ -1603,6 +1762,7 @@ def commit_message(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
         f"Stargate-Run-Id: {ctx.run_id}",
         f"Stargate-Verdict: {verdict}",
         f"Stargate-Base-Ref: {ctx.base_ref}",
+        f"Stargate-Base-Commit: {ctx.base_commit}",
     ]
     if test_exit is not None:
         trailers.append(f"Stargate-Tests-Exit: {test_exit}")
@@ -1613,6 +1773,7 @@ Task: {task}
 Verdict: {verdict}
 Tests: {tests}
 Base: {ctx.base_ref}
+Base commit: {ctx.base_commit}
 
 Produced by stargate agents, committed by the orchestrator; the agents
 themselves never run git. Plan, review and traces:
@@ -1762,11 +1923,11 @@ def finish(
         print("\nNothing was merged, pushed, or deleted automatically.")
     else:
         print("\nNothing was committed, merged, pushed, or deleted automatically.")
-    print(f"Inspect with: cd {shlex.quote(str(ctx.worktree))} && git status && git diff {shlex.quote(ctx.base_ref)}")
+    print(f"Inspect with: cd {shlex.quote(str(ctx.worktree))} && git status && git diff {shlex.quote(ctx.base_commit)}")
     if ctx.commit:
         print(
             "History: git log --oneline "
-            f"{shlex.quote(ctx.base_ref + '..' + ctx.branch)}"
+            f"{shlex.quote(ctx.base_commit + '..' + ctx.branch)}"
         )
         print(
             "Build on it with: stargate run --base-ref "
@@ -1792,12 +1953,13 @@ def write_summary(
     commit: bool,
 ) -> None:
     status = git(ctx.worktree, "status", "--short").stdout
-    diff_stat = git(ctx.worktree, "diff", "--stat", ctx.base_ref).stdout
+    diff_stat = git(ctx.worktree, "diff", "--stat", ctx.base_commit).stdout
     summary = f"""# stargate run
 
 Task: {task}
 Run: {ctx.run_id}
 Base ref: {ctx.base_ref}
+Base commit: {ctx.base_commit}
 Branch: {ctx.branch}
 Commit: {commit_summary(ctx, commit)}
 Worktree: {ctx.worktree}
@@ -1845,7 +2007,7 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     commit = commit_enabled(ctx.config) and not args.no_commit
 
     print(f"\nRun ID:   {ctx.run_id}")
-    print(f"Base:     {ctx.base_ref}")
+    print(f"Base:     {ctx.base_ref} @ {ctx.base_commit[:12]}")
     print(f"Branch:   {ctx.branch}")
     print(f"Worktree: {ctx.worktree}")
     print(f"Artifacts:{ctx.artifacts}")
@@ -2068,6 +2230,14 @@ def build_parser() -> argparse.ArgumentParser:
         "list", aliases=["runs"],
         help="List the runs recorded in this repository, newest first."
     )
+    clean = sub.add_parser(
+        "clean", help="Remove a run's merged branch, clean worktree and artifacts."
+    )
+    clean.add_argument("run_id", nargs="?", help="Run ID shown by 'stargate list'.")
+    clean.add_argument(
+        "--all", action="store_true", dest="all_runs",
+        help="Clean every recorded run that passes the safety checks.",
+    )
 
     run = sub.add_parser("run", help="Plan, implement, review and fix a task.")
     run.add_argument("task", help="Feature/bug/task description.")
@@ -2147,6 +2317,8 @@ def main() -> int:
 
         if args.command in ("list", "runs"):
             return list_runs(repo_root(Path.cwd()))
+        if args.command == "clean":
+            return clean_runs(repo_root(Path.cwd()), args.run_id, args.all_runs)
 
         config_paths = resolve_config(args.config, script_dir)
         config, layers = load_config(config_paths)

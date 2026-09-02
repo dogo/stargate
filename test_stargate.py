@@ -102,6 +102,14 @@ def runs(repo: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def clean(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "stargate", "clean", *args],
+        cwd=repo, text=True, capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+
+
 def stargate(
     repo: Path, *args: str, config_home: Path
 ) -> subprocess.CompletedProcess[str]:
@@ -142,6 +150,75 @@ def test_partial_user_config_inherits_packaged_defaults(root: Path) -> None:
     assert "(packaged defaults)" in proc.stdout, proc.stdout
     for role in ("architect", "developer", "reviewer", "fixer"):
         assert re.search(rf"(?m)^  {role}\s+", proc.stdout), proc.stdout
+
+
+def test_stale_remote_stops_before_agents_or_artifacts(root: Path) -> None:
+    repo = make_repo(root)
+    remote = root / "remote.git"
+    other = root / "other"
+    sh(f"git init -q --bare {remote}", root)
+    sh(f"git remote add origin {remote} && git push -qu origin main", repo)
+    sh(f"git clone -q {remote} {other}", root)
+    sh(
+        "git config user.email t@t && git config user.name t && "
+        "git config commit.gpgsign false && echo upstream >> app.py && "
+        "git add app.py && git commit -qm upstream && git push -q",
+        other,
+    )
+    assert git_output(repo, "rev-parse", "main") == git_output(
+        repo, "rev-parse", "origin/main"
+    ), "test setup fetched the remote advance"
+    called = root / "architect-called"
+    cfg = root / "stale.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent(f"touch {called}; echo plan")},
+            "dev": {"command": agent("echo change > impl.txt; echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"test_command": "true", "commit": False},
+    }))
+
+    proc = run(repo, cfg)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "behind or diverged from upstream 'origin/main'" in proc.stderr
+    assert not called.exists(), "architect ran before the stale-branch check"
+    assert not (repo / ".stargate").exists(), "preflight created run artifacts"
+
+
+def test_base_commit_is_frozen_before_the_architect(root: Path) -> None:
+    repo = make_repo(root)
+    sh(
+        "git switch -qc base && echo base > base.txt && git add base.txt "
+        "&& git commit -qm base && git switch -q main",
+        repo,
+    )
+    base_commit = git_output(repo, "rev-parse", "base")
+    cfg = root / "frozen-base.yaml"
+    import yaml
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent("git branch -f base main; echo plan")},
+            "dev": {"command": agent("echo change > impl.txt; echo done")},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {"architect": "arch", "developer": "dev",
+                     "reviewer": "rev", "fixer": "dev"},
+        "settings": {"test_command": "true", "commit": False},
+    }))
+
+    proc = run(repo, cfg, "demo task", "--base-ref", "base")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    worktree = Path(state["worktree"])
+    assert state["base_ref"] == "base", state
+    assert state["base_commit"] == base_commit, state
+    assert git_output(worktree, "rev-parse", "HEAD") == base_commit
+    assert (worktree / "base.txt").read_text() == "base\n"
 
 
 def test_blank_project_section_keeps_user_settings(root: Path) -> None:
@@ -1023,6 +1100,72 @@ def test_list_runs_directory_read_error_is_an_error(root: Path) -> None:
         assert "Could not read recorded runs" in str(exc), exc
     else:
         raise AssertionError("an unreadable runs directory reported success")
+
+
+def recorded_run(repo: Path, run_id: str) -> tuple[Path, Path, str]:
+    branch = f"stargate/{run_id}"
+    worktree = repo.parent / "worktrees" / run_id
+    worktree.parent.mkdir(exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", branch, str(worktree)],
+        cwd=repo, check=True,
+    )
+    (worktree / f"{run_id}.txt").write_text("change\n")
+    sh("git add -A && git commit -qm change", worktree)
+    artifacts = repo / ".stargate" / "runs" / run_id
+    artifacts.mkdir(parents=True)
+    (artifacts / "state.json").write_text(json.dumps({
+        "run_id": run_id,
+        "repo": str(repo),
+        "branch": branch,
+        "worktree": str(worktree),
+    }))
+    return artifacts, worktree, branch
+
+
+def recorded_branch_exists(repo: Path, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo,
+    ).returncode == 0
+
+
+def test_clean_one_refuses_unmerged_then_removes_the_merged_run(root: Path) -> None:
+    repo = make_repo(root)
+    artifacts, worktree, branch = recorded_run(repo, "one")
+
+    refused = clean(repo, "one")
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "is not merged into HEAD" in refused.stderr, refused.stderr
+    assert artifacts.exists() and worktree.exists()
+    assert recorded_branch_exists(repo, branch)
+
+    sh(f"git merge --ff-only -q {branch}", repo)
+    (worktree / "one.txt").write_text("dirty\n")
+    dirty = clean(repo, "one")
+    assert dirty.returncode == 1, dirty.stdout + dirty.stderr
+    assert artifacts.exists() and worktree.exists()
+    assert recorded_branch_exists(repo, branch)
+
+    (worktree / "one.txt").write_text("change\n")
+    proc = clean(repo, "one")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not artifacts.exists() and not worktree.exists()
+    assert not recorded_branch_exists(repo, branch)
+
+
+def test_clean_all_removes_every_safe_run(root: Path) -> None:
+    repo = make_repo(root)
+    recorded = []
+    for run_id in ("one", "two"):
+        recorded.append(recorded_run(repo, run_id))
+        sh(f"git merge --ff-only -q stargate/{run_id}", repo)
+
+    proc = clean(repo, "--all")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert all(not artifacts.exists() and not worktree.exists()
+               and not recorded_branch_exists(repo, branch)
+               for artifacts, worktree, branch in recorded)
 
 
 def test_doctor_probe_verifies_the_capability_a_role_uses(root: Path) -> None:
@@ -1932,6 +2075,8 @@ def test_doctor_reports_the_commit_setting(root: Path) -> None:
 if __name__ == "__main__":
     for fn in (test_settings_only_project_config_is_valid,
                test_partial_user_config_inherits_packaged_defaults,
+               test_stale_remote_stops_before_agents_or_artifacts,
+               test_base_commit_is_frozen_before_the_architect,
                test_blank_project_section_keeps_user_settings,
                test_project_config_layers_over_user_config,
                test_project_config_replaces_one_agent_only,
@@ -1968,6 +2113,8 @@ if __name__ == "__main__":
                test_list_survives_a_corrupt_state_file,
                test_list_outside_a_repository_is_an_error,
                test_list_runs_directory_read_error_is_an_error,
+               test_clean_one_refuses_unmerged_then_removes_the_merged_run,
+               test_clean_all_removes_every_safe_run,
                test_doctor_probe_verifies_the_capability_a_role_uses,
                test_developer_that_changes_nothing_stops_the_run,
                test_untracked_new_file_counts_as_work,
