@@ -1,0 +1,18 @@
+#!/bin/sh
+# kiro-cli adapter for stargate.
+#
+# Three things this works around, all verified against kiro-cli 2.21.0:
+#  1. `chat` execs a sibling kiro-cli-chat binary resolved from argv[0]'s
+#     directory, so the Homebrew symlink makes it die with os error 2. Call
+#     the binary inside the app bundle directly.
+#  2. Its reply carries ANSI escapes and a "> " marker on the first line even
+#     under NO_COLOR, and stargate wants the reviewer's verdict as the exact
+#     last line. Strip both, and hand the clean text to {output}.
+#  3. The "Credits: N" footer goes to stderr, which stargate merges into the
+#     run log; leaving it there is what lets usage_pattern see it.
+set -e
+out=$1; shift
+KIRO="${KIRO_BIN:-/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli}"
+NO_COLOR=1 "$KIRO" chat --no-interactive "$@" \
+  | perl -pe 's/\e\[[0-9;]*[a-zA-Z]//g; s/^> // if $. == 1' \
+  | tee "$out"

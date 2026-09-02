@@ -1,0 +1,39 @@
+# stargate config driving every role with kiro-cli.
+# Needs kiro-stargate on PATH; see the header of that script.
+# Verified end to end against kiro-cli 2.21.0.
+version: 4
+
+agents:
+  kiro_reader:
+    command:
+      - kiro-stargate
+      - "{output}"
+      - --trust-tools=read,grep
+    probe: "Read the file {probe_file} and reply with its contents, nothing else."
+    probe_expect: read
+    usage_pattern: 'Credits:\s+([\d.,]+)'
+
+  kiro_writer:
+    command:
+      - kiro-stargate
+      - "{output}"
+      - --trust-all-tools
+    probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+    probe_expect: write
+    # kiro-cli reports fractional credits, not tokens. Capturing the dot makes
+    # parse_usage strip it, so the budget counts hundredths of a credit --
+    # set max_task_tokens in that same unit or leave it at 0.
+    usage_pattern: 'Credits:\s+([\d.,]+)'
+
+workflow:
+  architect: kiro_reader
+  developer: kiro_writer
+  reviewer: kiro_reader
+  fixer: kiro_writer
+
+settings:
+  max_review_loops: 2
+  test_command: ""
+  test_command_detection: off
+  commit: true
+  agent_timeout_seconds: 600

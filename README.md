@@ -782,6 +782,36 @@ workflow:
 Likewise you can invert the default design and make Codex the architect and
 Claude the implementer.
 
+## Adding a different agent CLI
+
+Nothing in the package names a vendor: the only mentions of Claude or Codex in
+`stargate/*.py` are comments and the `--help` line. An agent is six YAML keys —
+`command`, `env`, `probe`, `probe_expect`, `usage_pattern`, and the `{output}` /
+`{test_command}` placeholders — so adding a CLI is a config change.
+
+Finding out *what to put* in that config is the actual work, and `doctor` only
+catches the first of the four things that go wrong:
+
+1. **It is not on PATH, or the prompt is not the last argument.** `doctor`
+   reports this immediately; `doctor --probe` also proves the CLI can read and
+   write when its role needs to.
+2. **Its stdout is a session trace, not the answer.** Then it needs `{output}`
+   (see [Final message vs. stdout](#final-message-vs-stdout)). A CLI with no
+   flag for that needs a small wrapper.
+3. **`usage_pattern` matches nothing, or matches the wrong number.** This fails
+   silently: the run finishes and reports `Tokens reported: 0`, so a
+   `max_task_tokens` budget quietly never applies.
+4. **Its permission flags are coarser than the packaged ones.** `doctor`
+   validates that the `{test_command}` placeholder expanded, not what the
+   vendor's flag actually grants.
+
+Points 2 through 4 only surface in a real run, so finish with one against a
+throwaway repository before trusting a new agent with your own.
+
+[`examples/kiro/`](examples/kiro/) is a worked example: every role on
+`kiro-cli`, including the wrapper it needs and each of the three problems above
+that it actually hit.
+
 ## Why command prefixes instead of SDKs?
 
 The CLI boundary is what keeps this small:
