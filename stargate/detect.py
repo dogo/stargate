@@ -10,7 +10,6 @@ from typing import Any
 
 from .core import Detected, StargateError
 
-
 DETECTION_MODES = ("report", "auto", "off")
 
 

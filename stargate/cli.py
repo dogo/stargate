@@ -7,8 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
-from .stages import orchestrate
 from .config import (
     PROJECT_CONFIG,
     init_config,
@@ -16,17 +14,10 @@ from .config import (
     load_config,
     resolve_config,
 )
-from .run import (
-    REDOABLE_STAGES,
-    clean_runs,
-    list_runs,
-)
+from .core import StargateError, Terminated, repo_root
 from .doctor import doctor
-from .core import (
-    StargateError,
-    Terminated,
-    repo_root,
-)
+from .run import REDOABLE_STAGES, clean_runs, list_runs
+from .stages import orchestrate
 
 
 def build_parser() -> argparse.ArgumentParser:

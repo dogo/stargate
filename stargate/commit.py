@@ -7,7 +7,6 @@ import sys
 
 from .core import RunContext, StargateError, git, git_quiet, run_process
 
-
 COMMIT_SUBJECT_CHARS = 72
 
 

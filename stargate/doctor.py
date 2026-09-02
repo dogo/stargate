@@ -15,10 +15,10 @@ from typing import Any
 import yaml
 
 from .config import (
-    ROLES,
-    TEST_COMMAND_PLACEHOLDER,
     AGENT_RETRIES_DEFAULT,
     AGENT_RETRY_BACKOFF_DEFAULT,
+    ROLES,
+    TEST_COMMAND_PLACEHOLDER,
     agent_command,
     agent_entry,
     agent_env,
@@ -33,7 +33,6 @@ from .config import (
 )
 from .core import StargateError
 from .detect import detection_mode, selected_test_command
-
 
 PROBE_TIMEOUT_DEFAULT = 120
 

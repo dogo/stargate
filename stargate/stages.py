@@ -14,8 +14,8 @@ from .commit import commit_run, commit_summary
 from .config import (
     commit_enabled,
     prompt_dirs,
-    token_cap,
     render_prompt,
+    token_cap,
 )
 from .core import (
     RunContext,
@@ -33,13 +33,12 @@ from .run import (
     load_run,
     make_context,
     save_state,
-    unique_branch,
     snapshot,
+    unique_branch,
     untracked_entries,
     warn_if_dirty,
     worktree_fingerprint,
 )
-
 
 TEST_TAIL_LINES = 200
 

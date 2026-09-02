@@ -11,7 +11,6 @@ import yaml
 
 from .core import StargateError
 
-
 # Per-project override. Deliberately NOT "agents.yaml": that name is common
 # enough that a global install would silently pick up an unrelated repo's file.
 PROJECT_CONFIG = ".stargate.yaml"

@@ -18,7 +18,6 @@ from .config import (
 )
 from .core import RunContext, StargateError, run_process
 
-
 FINGERPRINT_LINES = 20
 
 
