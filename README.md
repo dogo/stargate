@@ -784,7 +784,7 @@ Claude the implementer.
 
 ## Why command prefixes instead of SDKs?
 
-For a POC, the CLI boundary is useful:
+The CLI boundary is what keeps this small:
 
 - it uses the authentication you already have in each CLI;
 - upgrading either vendor does not couple the orchestrator to an SDK;
@@ -792,8 +792,9 @@ For a POC, the CLI boundary is useful:
 - replacing one agent is just YAML;
 - the Git worktree remains the shared protocol between agents.
 
-For a production-grade version, a typed SDK/JSON event stream is the natural
-next step.
+The cost is that agent output is parsed as text rather than consumed as a
+typed event stream. A typed SDK is the natural next step if that parsing ever
+becomes the thing that breaks.
 
 ## Safety model
 

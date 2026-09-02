@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "dogo", email = "diautilio@gmail.com" }]
 keywords = ["agents", "claude-code", "codex", "orchestrator", "git-worktree"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
