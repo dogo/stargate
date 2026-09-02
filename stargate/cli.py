@@ -66,6 +66,12 @@ class RunContext:
     commit_error: str = ""
 
 
+# How often a running agent prints that it is still alive.
+HEARTBEAT_SECONDS = 30
+# Cleanup must not turn a terminating signal into an indefinite wait.
+KILL_GRACE_SECONDS = 10
+
+
 def run_process(
     args: list[str],
     cwd: Path,
@@ -514,10 +520,6 @@ AGENT_RETRY_BACKOFF_DEFAULT = 10.0
 FINGERPRINT_LINES = 20
 PROBE_CAPABILITIES = ("read", "write")
 
-# How often a running agent prints that it is still alive.
-HEARTBEAT_SECONDS = 30
-# Cleanup must not turn a terminating signal into an indefinite wait.
-KILL_GRACE_SECONDS = 10
 
 
 def retry_settings(config: dict[str, Any]) -> tuple[int, float]:
@@ -848,6 +850,36 @@ def selected_test_command(
     return "", detected
 
 
+def prompt_dirs(config: dict[str, Any], script_dir: Path) -> list[Path]:
+    """Prompt sources, most specific first. Overrides are per-file: a custom
+    reviewer.md is picked up while the other three fall back to the defaults."""
+    configured = str(config.get("settings", {}).get("prompts_dir", "") or "").strip()
+    dirs = [Path(os.path.expanduser(configured)).resolve()] if configured else []
+    return [*dirs, user_config().parent / "prompts", script_dir / "prompts"]
+
+
+def find_prompt(dirs: list[Path], name: str) -> Path:
+    for base in dirs:
+        candidate = base / f"{name}.md"
+        if candidate.exists():
+            return candidate
+    searched = ", ".join(str(d) for d in dirs)
+    raise StargateError(f"Prompt {name}.md not found in: {searched}")
+
+
+def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
+    """Substitute only the placeholders we define, by literal replacement.
+
+    Not str.format: a custom prompt is free to contain JSON, CSS or an f-string
+    example, and every brace in it would otherwise have to be escaped or the
+    run dies with KeyError before a single agent starts.
+    """
+    text = find_prompt(dirs, name).read_text()
+    for key, value in values.items():
+        text = text.replace("{" + key + "}", value)
+    return text
+
+
 def doctor(
     config: dict[str, Any],
     layers: list[tuple[Path, dict[str, Any]]],
@@ -1005,36 +1037,6 @@ def doctor(
             ok = False
 
     return 0 if ok else 1
-
-
-def prompt_dirs(config: dict[str, Any], script_dir: Path) -> list[Path]:
-    """Prompt sources, most specific first. Overrides are per-file: a custom
-    reviewer.md is picked up while the other three fall back to the defaults."""
-    configured = str(config.get("settings", {}).get("prompts_dir", "") or "").strip()
-    dirs = [Path(os.path.expanduser(configured)).resolve()] if configured else []
-    return [*dirs, user_config().parent / "prompts", script_dir / "prompts"]
-
-
-def find_prompt(dirs: list[Path], name: str) -> Path:
-    for base in dirs:
-        candidate = base / f"{name}.md"
-        if candidate.exists():
-            return candidate
-    searched = ", ".join(str(d) for d in dirs)
-    raise StargateError(f"Prompt {name}.md not found in: {searched}")
-
-
-def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
-    """Substitute only the placeholders we define, by literal replacement.
-
-    Not str.format: a custom prompt is free to contain JSON, CSS or an f-string
-    example, and every brace in it would otherwise have to be escaped or the
-    run dies with KeyError before a single agent starts.
-    """
-    text = find_prompt(dirs, name).read_text()
-    for key, value in values.items():
-        text = text.replace("{" + key + "}", value)
-    return text
 
 
 def record_usage(ctx: RunContext, role: str, transcript: str) -> None:
