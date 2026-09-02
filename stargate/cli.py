@@ -221,6 +221,10 @@ def layer_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, An
     merged = dict(base)
     for section, value in override.items():
         inherited = merged.get(section)
+        # A bare mapping section such as `settings:` must not erase its base.
+        # ponytail: add a delete sentinel only if an overlay needs one.
+        if isinstance(inherited, dict) and value is None:
+            continue
         if isinstance(inherited, dict) and isinstance(value, dict):
             merged[section] = {**inherited, **value}
         else:
@@ -1303,36 +1307,42 @@ def read_run(path: Path) -> dict[str, Any]:
         "run_id": path.name,
         "status": "unknown",
         "stage": "-",
-        "task": "(state.json missing or unreadable)",
+        "branch": "(unknown)",
+        "worktree": "(unknown)",
+        "worktree_missing": False,
+        "task": "-",
         "updated": "-",
-        "sort_key": 0.0,
         "resumable": False,
+        "error": "",
     }
     try:
-        # Filesystem time is also available for corrupt and hand-written runs,
-        # where the timestamp inside state.json cannot be trusted or read.
-        row["sort_key"] = (
-            state_path if state_path.exists() else path
-        ).stat().st_mtime
-    except OSError:
-        pass
-
-    try:
         state = json.loads(state_path.read_text())
-    except (OSError, ValueError):
-        return row
-    if not isinstance(state, dict):
+        if not isinstance(state, dict):
+            raise ValueError("state.json is not an object")
+    except (OSError, ValueError) as exc:
+        row["error"] = f"unreadable state.json ({exc})"
         return row
 
     status = " ".join(str(state.get("status") or "unknown").split())
+    worktree = str(state.get("worktree") or "")
+    missing = False
+    if worktree:
+        try:
+            missing = not Path(worktree).exists()
+        except (OSError, ValueError):
+            missing = True
     row.update(
         run_id=" ".join(str(state.get("run_id") or path.name).split()),
         status=status,
         stage=" ".join(str(state.get("stage") or "-").split()),
+        branch=" ".join(str(state.get("branch") or "(unknown)").split()),
+        worktree=" ".join(worktree.split()) or "(unknown)",
+        worktree_missing=missing,
         updated=" ".join(str(state.get("updated_at") or "-").split()),
         # Tasks are often multi-paragraph input; one row should stay one row.
         task=(" ".join(str(state.get("task") or "").split())[:RUN_TASK_WIDTH] or "-"),
         resumable=status.lower() in RESUMABLE_STATUSES,
+        error="",
     )
     return row
 
@@ -1342,20 +1352,24 @@ def list_runs(repo: Path) -> int:
     # Listing a repository that has never run stargate must not create the
     # bookkeeping directory it is meant only to inspect.
     if not root.is_dir():
-        print(f"No runs recorded in {repo}.")
+        print(f"No recorded runs in {root}")
         return 0
 
     try:
-        rows = [read_run(path) for path in root.iterdir() if path.is_dir()]
+        paths = sorted(
+            (path for path in root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
     except OSError as exc:
-        raise StargateError(f"Could not read runs at {root}: {exc}") from exc
-    rows.sort(
-        key=lambda row: (row["sort_key"], row["run_id"]), reverse=True
-    )
-    if not rows:
-        print(f"No runs recorded in {repo}.")
+        raise StargateError(
+            f"Could not read recorded runs in {root}: {exc}"
+        ) from exc
+    if not paths:
+        print(f"No recorded runs in {root}")
         return 0
 
+    rows = [read_run(path) for path in paths]
     width = max(len(row["run_id"]) for row in rows)
     print(f"Runs in {repo} (newest first):\n")
     print(f"  {'RUN ID':{width}}  {'STATUS':17} {'STAGE':10} {'UPDATED':19} TASK")
@@ -1365,6 +1379,11 @@ def list_runs(repo: Path) -> int:
             f"{marker} {row['run_id']:{width}}  {row['status']:17} "
             f"{row['stage']:10} {row['updated']:19} {row['task']}"
         )
+        print(f"    branch    {row['branch']}")
+        missing = "  (MISSING)" if row["worktree_missing"] else ""
+        print(f"    worktree  {row['worktree']}{missing}")
+        if row["error"]:
+            print(f"    {row['error']}")
 
     newest = next((row for row in rows if row["resumable"]), None)
     if newest:
@@ -2023,8 +2042,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         default=None,
-        help=f"Config file, used exactly as given. Without it, ./{PROJECT_CONFIG} "
-        "layers over ~/.config/stargate/agents.yaml and the packaged defaults.",
+        help=f"Complete standalone config. Without it, ./{PROJECT_CONFIG}, "
+        "the user config and packaged defaults are layered.",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2046,7 +2065,8 @@ def build_parser() -> argparse.ArgumentParser:
         "can be edited without touching the install.",
     )
     sub.add_parser(
-        "runs", help="List the runs recorded in this repository, newest first."
+        "list", aliases=["runs"],
+        help="List the runs recorded in this repository, newest first."
     )
 
     run = sub.add_parser("run", help="Plan, implement, review and fix a task.")
@@ -2125,7 +2145,7 @@ def main() -> int:
             # a second path for an interrupt that is already recorded safely.
             install_signal_handlers()
 
-        if args.command == "runs":
+        if args.command in ("list", "runs"):
             return list_runs(repo_root(Path.cwd()))
 
         config_paths = resolve_config(args.config, script_dir)

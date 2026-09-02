@@ -96,7 +96,7 @@ def doctor(repo: Path, config: Path, *args: str) -> subprocess.CompletedProcess[
 
 def runs(repo: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "stargate", "runs"],
+        [sys.executable, "-m", "stargate", "list"],
         cwd=repo, text=True, capture_output=True,
         env={**os.environ, "PYTHONPATH": str(ROOT)},
     )
@@ -124,6 +124,43 @@ def test_settings_only_project_config_is_valid(root: Path) -> None:
     assert "ERROR" not in proc.stderr, proc.stderr
     assert "Effective settings:" in proc.stdout, proc.stdout
     assert "'npm test'" in proc.stdout, proc.stdout
+    assert "(packaged defaults)" in proc.stdout, proc.stdout
+    for role in ("architect", "developer", "reviewer", "fixer"):
+        assert re.search(rf"(?m)^  {role}\s+", proc.stdout), proc.stdout
+
+
+def test_partial_user_config_inherits_packaged_defaults(root: Path) -> None:
+    repo = make_repo(root)
+    config_home = root / "config"
+    user_cfg = config_home / "stargate" / "agents.yaml"
+    user_cfg.parent.mkdir(parents=True)
+    user_cfg.write_text('settings:\n  test_command: "npm test"\n')
+
+    proc = stargate(repo, "doctor", config_home=config_home)
+    assert "Config must contain" not in proc.stderr, proc.stderr
+    assert str(user_cfg.resolve()) in proc.stdout, proc.stdout
+    assert "(packaged defaults)" in proc.stdout, proc.stdout
+    for role in ("architect", "developer", "reviewer", "fixer"):
+        assert re.search(rf"(?m)^  {role}\s+", proc.stdout), proc.stdout
+
+
+def test_blank_project_section_keeps_user_settings(root: Path) -> None:
+    repo = make_repo(root)
+    config_home = root / "config"
+    user_cfg = config_home / "stargate" / "agents.yaml"
+    user_cfg.parent.mkdir(parents=True)
+    write_config(
+        user_cfg, 'echo "VERDICT: APPROVED"', test_command="echo USER"
+    )
+    (repo / ".stargate.yaml").write_text("settings:\n")
+
+    proc = stargate(repo, "doctor", config_home=config_home)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    test_line = next(
+        line for line in proc.stdout.splitlines()
+        if line.strip().startswith("test_command")
+    )
+    assert "'echo USER'" in test_line and test_line.endswith("[2]"), test_line
 
 
 def test_project_config_layers_over_user_config(root: Path) -> None:
@@ -160,7 +197,7 @@ def test_project_config_layers_over_user_config(root: Path) -> None:
     assert "developer" in frozen["agents"], "packaged base was not frozen"
 
 
-def test_project_config_overrides_one_agent_only(root: Path) -> None:
+def test_project_config_replaces_one_agent_only(root: Path) -> None:
     repo = make_repo(root)
     config_home = root / "config"
     user_cfg = config_home / "stargate" / "agents.yaml"
@@ -173,17 +210,22 @@ def test_project_config_overrides_one_agent_only(root: Path) -> None:
         "agents": {
             "noop": {"command": agent(f"echo inherited >> {inherited}; echo done")},
             "dev": {"command": agent("echo change >> impl.txt; echo done")},
-            "reviewer": {"command": agent('echo "VERDICT: APPROVED"')},
+            "reviewer": {
+                "command": agent('echo "VERDICT: APPROVED"'),
+                "usage_pattern": r"tokens used (\d+)",
+                "probe": "inherited probe",
+                "env": {"INHERITED_ENV": "secret"},
+            },
         },
         "workflow": {"architect": "noop", "developer": "dev",
                      "reviewer": "reviewer", "fixer": "dev"},
         "settings": {"max_review_loops": 0, "test_command": "true"},
     }))
+    project_command = agent(
+        f'echo project > {project}; echo "VERDICT: APPROVED"'
+    )
     (repo / ".stargate.yaml").write_text(yaml.safe_dump({
-        "agents": {"project_reviewer": {"command": agent(
-            f'echo project > {project}; echo "VERDICT: APPROVED"'
-        )}},
-        "workflow": {"reviewer": "project_reviewer"},
+        "agents": {"reviewer": {"command": project_command}},
     }))
 
     proc = stargate(
@@ -192,6 +234,9 @@ def test_project_config_overrides_one_agent_only(root: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert project.exists(), "project reviewer did not run"
     assert inherited.exists(), "agents omitted by the project were not inherited"
+    artifacts = next((repo / ".stargate" / "runs").glob("*"))
+    frozen = yaml.safe_load((artifacts / "config.yaml").read_text())
+    assert frozen["agents"]["reviewer"] == {"command": project_command}
 
 
 def test_explicit_config_is_not_layered(root: Path) -> None:
@@ -225,8 +270,8 @@ def test_doctor_reports_config_provenance(root: Path) -> None:
     proc = stargate(repo, "doctor", config_home=config_home)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "Config sources (most specific first):" in proc.stdout
-    assert f"[1] {project_cfg}" in proc.stdout
-    assert f"[2] {user_cfg}" in proc.stdout
+    assert f"[1] {project_cfg.resolve()}" in proc.stdout
+    assert f"[2] {user_cfg.resolve()}" in proc.stdout
     assert "[3]" in proc.stdout and "(packaged defaults)" in proc.stdout
     test_line = next(line for line in proc.stdout.splitlines()
                      if line.strip().startswith("test_command"))
@@ -858,14 +903,14 @@ def test_no_retries_by_default(root: Path) -> None:
     assert "attempt 1 of" not in proc.stdout, proc.stdout
 
 
-def test_runs_lists_newest_first_and_marks_resumable(root: Path) -> None:
+def test_list_runs_newest_first_and_marks_missing_worktree(root: Path) -> None:
     repo = make_repo(root)
     approved = root / "approved.yaml"
     failed = root / "failed.yaml"
     write_config(
         approved, 'echo "VERDICT: APPROVED"', test_command="true"
     )
-    first = run(repo, approved, "older approved task")
+    first = run(repo, approved, "aaa older approved task")
     assert first.returncode == 0, first.stdout + first.stderr
 
     import yaml
@@ -875,15 +920,20 @@ def test_runs_lists_newest_first_and_marks_resumable(root: Path) -> None:
                      ("architect", "developer", "reviewer", "fixer")},
         "settings": {},
     }))
-    second = run(repo, failed, "newer failed task")
+    second = run(repo, failed, "zzz newer failed task")
     assert second.returncode == 1, second.stdout + second.stderr
 
-    states = [json.loads(path.read_text()) for path in
-              (repo / ".stargate" / "runs").glob("*/state.json")]
-    approved_id = next(state["run_id"] for state in states
-                       if state["status"] == "approved")
-    failed_id = next(state["run_id"] for state in states
-                     if state["status"] == "failed")
+    state_paths = list((repo / ".stargate" / "runs").glob("*/state.json"))
+    states = [json.loads(path.read_text()) for path in state_paths]
+    approved = next(state for state in states if state["status"] == "approved")
+    failed = next(state for state in states if state["status"] == "failed")
+    approved_id = approved["run_id"]
+    failed_id = failed["run_id"]
+    # An old run touched by resume is not newer than a later run id.
+    approved_path = next(
+        path for path in state_paths if path.parent.name == approved_id
+    )
+    os.utime(approved_path, (2_000_000_000, 2_000_000_000))
     proc = runs(repo)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     failed_line = next(line for line in proc.stdout.splitlines()
@@ -891,27 +941,31 @@ def test_runs_lists_newest_first_and_marks_resumable(root: Path) -> None:
     approved_line = next(line for line in proc.stdout.splitlines()
                          if approved_id in line)
     assert failed_line.startswith("* "), failed_line
+    assert "failed" in failed_line
     assert approved_line.startswith("  "), approved_line
     assert f"Resume the newest with: stargate resume {failed_id}" in proc.stdout
     assert proc.stdout.index(failed_id) < proc.stdout.index(approved_id), proc.stdout
+    assert f"branch    {failed['branch']}" in proc.stdout
+    assert f"worktree  {failed['worktree']}  (MISSING)" in proc.stdout
+    assert proc.stdout.count("(MISSING)") == 1, proc.stdout
     assert "Traceback" not in proc.stdout + proc.stderr
 
 
-def test_runs_without_a_stargate_directory(root: Path) -> None:
+def test_list_without_a_stargate_directory(root: Path) -> None:
     repo = make_repo(root)
     proc = runs(repo)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "No runs recorded in" in proc.stdout, proc.stdout
+    assert "No recorded runs in" in proc.stdout, proc.stdout
     assert "Traceback" not in proc.stdout + proc.stderr
     assert not (repo / ".stargate").exists(), "listing created .stargate"
 
     (repo / ".stargate" / "runs").mkdir(parents=True)
     empty = runs(repo)
     assert empty.returncode == 0, empty.stdout + empty.stderr
-    assert "No runs recorded in" in empty.stdout, empty.stdout
+    assert "No recorded runs in" in empty.stdout, empty.stdout
 
 
-def test_runs_survives_a_corrupt_state_file(root: Path) -> None:
+def test_list_survives_a_corrupt_state_file(root: Path) -> None:
     repo = make_repo(root)
     run_root = repo / ".stargate" / "runs"
     corrupt = run_root / "20260831-120000-corrupt"
@@ -931,13 +985,44 @@ def test_runs_survives_a_corrupt_state_file(root: Path) -> None:
     assert "Traceback" not in proc.stdout + proc.stderr
     assert corrupt.name in proc.stdout, proc.stdout
     assert missing.name in proc.stdout, proc.stdout
-    assert "state.json missing or unreadable" in proc.stdout, proc.stdout
+    assert "unreadable state.json" in proc.stdout, proc.stdout
     assert state_path.read_bytes() == before_bytes
     after_entries = {
         path.name: sorted(child.name for child in path.iterdir())
         for path in (corrupt, missing)
     }
     assert after_entries == before_entries, "listing modified a run directory"
+
+
+def test_list_outside_a_repository_is_an_error(root: Path) -> None:
+    proc = stargate(root, "list", config_home=root / "empty-config")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Current directory is not inside a Git repository." in proc.stderr
+    assert "Traceback" not in proc.stdout + proc.stderr
+
+
+def test_list_runs_directory_read_error_is_an_error(root: Path) -> None:
+    from stargate.cli import StargateError, list_runs
+
+    class UnreadablePath:
+        def __truediv__(self, _part: str) -> "UnreadablePath":
+            return self
+
+        def __str__(self) -> str:
+            return "/unreadable/.stargate/runs"
+
+        def is_dir(self) -> bool:
+            return True
+
+        def iterdir(self):
+            raise OSError("permission denied")
+
+    try:
+        list_runs(UnreadablePath())  # type: ignore[arg-type]
+    except StargateError as exc:
+        assert "Could not read recorded runs" in str(exc), exc
+    else:
+        raise AssertionError("an unreadable runs directory reported success")
 
 
 def test_doctor_probe_verifies_the_capability_a_role_uses(root: Path) -> None:
@@ -1846,8 +1931,10 @@ def test_doctor_reports_the_commit_setting(root: Path) -> None:
 
 if __name__ == "__main__":
     for fn in (test_settings_only_project_config_is_valid,
+               test_partial_user_config_inherits_packaged_defaults,
+               test_blank_project_section_keeps_user_settings,
                test_project_config_layers_over_user_config,
-               test_project_config_overrides_one_agent_only,
+               test_project_config_replaces_one_agent_only,
                test_explicit_config_is_not_layered,
                test_doctor_reports_config_provenance,
                test_sigterm_records_a_terminal_status,
@@ -1876,9 +1963,11 @@ if __name__ == "__main__":
                test_identical_failure_stops_retrying_early,
                test_retry_counts_tokens_once_per_attempt,
                test_no_retries_by_default,
-               test_runs_lists_newest_first_and_marks_resumable,
-               test_runs_without_a_stargate_directory,
-               test_runs_survives_a_corrupt_state_file,
+               test_list_runs_newest_first_and_marks_missing_worktree,
+               test_list_without_a_stargate_directory,
+               test_list_survives_a_corrupt_state_file,
+               test_list_outside_a_repository_is_an_error,
+               test_list_runs_directory_read_error_is_an_error,
                test_doctor_probe_verifies_the_capability_a_role_uses,
                test_developer_that_changes_nothing_stops_the_run,
                test_untracked_new_file_counts_as_work,

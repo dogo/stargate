@@ -96,7 +96,8 @@ specific first:
 agent entry is replaced as a whole, so redefining one must include its complete
 `command`, `probe`, `probe_expect`, `usage_pattern` and `env` as needed; entries
 for all other agents are inherited. Top-level scalar values use the
-most-specific value.
+most-specific value. A blank mapping section such as `settings:` does not erase
+inherited settings.
 
 `--config <path>` is the exception: that file is used exactly as given, with no
 project, user or packaged config layered under it. This is also the escape hatch
@@ -146,6 +147,10 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 
 `doctor` exits `1` when a binary is missing, a prompt cannot be resolved, or a
 `--probe` call fails.
+
+`list` exits `0` even when a run has an unreadable or stale `state.json`. It
+exits `1` when the current directory is not inside a Git repository or the runs
+directory itself cannot be read.
 
 ## Check setup
 
@@ -270,7 +275,7 @@ The run ID and artifacts directory must exist before the architect runs, so an
 architect suggestion renames the branch only. Use `--name "passkey auth"` when
 the run ID should also be short; that produces
 `20260830-181500-passkey-auth`. Existing run IDs are not parsed or migrated, so
-they continue to work with `runs` and `resume`. If a name is reserved twice in
+they continue to work with `list` and `resume`. If a name is reserved twice in
 the same second, both the run ID and branch receive the same `-2`, `-3`, …
 discriminator.
 
@@ -587,27 +592,34 @@ hint are preserved.
 
 ## Listing runs
 
-`stargate runs` shows the runs recorded in the current repository, newest
+`stargate list` shows the runs recorded in the current repository, newest
 first, without requiring an active config:
 
 ```console
-$ stargate runs
+$ stargate list
 Runs in /home/me/project (newest first):
 
   RUN ID                                      STATUS            STAGE      UPDATED             TASK
 * 20260831-101304-add-passkey-authentication  failed            developer  2026-08-31T10:19:42 Add passkey authentication
+    branch    stargate/add-passkey-authentication-20260831-101304
+    worktree  /home/me/.stargate-worktrees/project/20260831-101304-add-passkey-authentication  (MISSING)
   20260830-181500-update-docs                 approved          review     2026-08-30T18:22:11 Update docs
+    branch    stargate/update-docs-20260830-181500
+    worktree  /home/me/.stargate-worktrees/project/20260830-181500-update-docs
 
 * resumable. Resume the newest with: stargate resume 20260831-101304-add-passkey-authentication
 ```
+
+The former `stargate runs` spelling remains an alias.
 
 Failed runs and rows still reading `running` are marked with `*`. A `running`
 row normally means the run is still in flight, but it can also mean the process
 was stopped by an uncatchable hard kill such as SIGKILL or power loss. Missing
 or corrupt `state.json` files are shown as unknown rather than crashing or
 hiding the run. If `.stargate/runs/` does not exist or is empty, the command
-reports that there are no runs. Listing is read-only: it never creates, repairs
-or deletes run artifacts.
+reports that there are no runs. Listing only reads recorded state: it never
+creates, repairs or deletes run artifacts, and there is no destructive `clean`
+command.
 
 ## Resuming a failed run
 
@@ -796,7 +808,7 @@ boundary; prompts are guidance, not a security boundary.
 ## Useful next additions
 
 Shipped since this list was written: token accounting, timeouts, retries,
-persistent run state, `runs`, `resume`, catchable-signal handling, capability
+persistent run state, `list`, `resume`, catchable-signal handling, capability
 probes, empty-stage detection, and terminal commits on run branches. What is
 still open, roughly in order of how much it would change the tool:
 
