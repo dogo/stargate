@@ -1353,7 +1353,7 @@ def test_fixer_that_changes_nothing_stops_the_review_loop(root: Path) -> None:
 
 
 def test_detects_the_common_project_shapes(root: Path) -> None:
-    from stargate.cli import detect_test_commands
+    from stargate.detect import detect_test_commands
 
     make = root / "make"
     make.mkdir()
@@ -1591,7 +1591,8 @@ def test_grant_matches_only_what_stargate_runs(root: Path) -> None:
 
 
 def test_test_command_expansion_rules(root: Path) -> None:
-    from stargate.cli import StargateError, expand_test_command
+    from stargate.config import expand_test_command
+    from stargate.core import StargateError
 
     command = ["claude", "-p", "--allowedTools", "Bash({test_command})"]
     assert expand_test_command(command, "make test") == [

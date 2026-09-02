@@ -273,3 +273,31 @@ def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
     for key, value in values.items():
         text = text.replace("{" + key + "}", value)
     return text
+
+
+def value_source(
+    layers: list[tuple[Path, dict[str, Any]]], section: str, key: str
+) -> str:
+    """The numbered layer that supplied one effective value."""
+    for index, (_, data) in enumerate(layers, 1):
+        block = data.get(section)
+        if isinstance(block, dict) and key in block:
+            return f"[{index}]"
+    return "(default)"
+
+
+# Committing is ON by default. The friction this removes is a default-level
+# problem: a run whose work exists only as a dirty worktree cannot be built on
+# without a hand-made branch and commit, and a `git worktree remove --force`
+# destroys it, because the artifacts hold traces and prose, not code. A flag
+# nobody knows exists does not fix that. Unlike a detected test command, this
+# executes nothing the user has not already sanctioned: the commit lands on a
+# branch stargate created, in a worktree stargate created, and is never pushed
+# or merged. The documented behaviour it changes is narrow -- `git status` in
+# the worktree goes clean, while `git diff <base>` still shows every change.
+# `commit: false` restores the old behaviour exactly.
+def commit_enabled(config: dict[str, Any]) -> bool:
+    value = config.get("settings", {}).get("commit", True)
+    if not isinstance(value, bool):
+        raise StargateError("settings.commit must be true or false.")
+    return value
