@@ -1079,7 +1079,8 @@ def test_list_outside_a_repository_is_an_error(root: Path) -> None:
 
 
 def test_list_runs_directory_read_error_is_an_error(root: Path) -> None:
-    from stargate.cli import StargateError, list_runs
+    from stargate.core import StargateError
+    from stargate.run import list_runs
 
     class UnreadablePath:
         def __truediv__(self, _part: str) -> "UnreadablePath":
@@ -1792,7 +1793,7 @@ def test_name_option_and_same_second_uniqueness(root: Path) -> None:
     )
     assert resumed.returncode == 0, resumed.stdout + resumed.stderr
 
-    from stargate.cli import reserve_run
+    from stargate.run import reserve_run
     collision_root = root / "collision"
     collision_root.mkdir()
     collision_repo = make_repo(collision_root)

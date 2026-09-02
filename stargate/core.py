@@ -206,3 +206,15 @@ def split_plan_name(plan: str) -> tuple[str, str]:
     if not name:
         return "", plan
     return name, "\n".join([*lines[:first], *lines[first + 1:]]).strip()
+
+
+def git_quiet(repo: Path, *args: str) -> str:
+    """Read Git state without burying run output under a full printed diff."""
+    proc = subprocess.run(
+        ["git", *args], cwd=str(repo), text=True, capture_output=True
+    )
+    if proc.returncode:
+        raise StargateError(
+            f"git {' '.join(args)} failed in {repo}: {proc.stderr.strip()}"
+        )
+    return proc.stdout
