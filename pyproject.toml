@@ -21,6 +21,9 @@ classifiers = [
 ]
 dependencies = ["PyYAML>=6,<7"]
 
+[project.optional-dependencies]
+dev = ["ruff>=0.16"]
+
 [project.urls]
 Homepage = "https://github.com/dogo/stargate"
 Source = "https://github.com/dogo/stargate"
@@ -36,3 +39,12 @@ packages = ["stargate"]
 # __file__-relative lookups keep working once installed.
 [tool.setuptools.package-data]
 stargate = ["agents.yaml", "prompts/*.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/F are the real errors, I keeps the module seams sorted now that the
+# package is nine files, B and UP catch the bugs and dead idioms worth a diff.
+select = ["E", "F", "I", "UP", "B"]

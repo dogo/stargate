@@ -180,7 +180,10 @@ def make_context(
     tag = branch.removeprefix(f"stargate/{slug}-")
 
     configured = str(config.get("settings", {}).get("worktree_root", "") or "").strip()
-    worktree_root = Path(os.path.expanduser(configured)).resolve() if configured else default_worktree_root(repo)
+    worktree_root = (
+        Path(os.path.expanduser(configured)).resolve()
+        if configured else default_worktree_root(repo)
+    )
     worktree = worktree_root / run_id
     # Keep run artifacts out of the target repo's git status without touching
     # the user's own .gitignore.

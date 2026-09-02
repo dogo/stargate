@@ -182,7 +182,10 @@ def finish(
         print("\nNothing was merged, pushed, or deleted automatically.")
     else:
         print("\nNothing was committed, merged, pushed, or deleted automatically.")
-    print(f"Inspect with: cd {shlex.quote(str(ctx.worktree))} && git status && git diff {shlex.quote(ctx.base_commit)}")
+    print(
+        f"Inspect with: cd {shlex.quote(str(ctx.worktree))} "
+        f"&& git status && git diff {shlex.quote(ctx.base_commit)}"
+    )
     if ctx.commit:
         print(
             "History: git log --oneline "
@@ -213,6 +216,8 @@ def write_summary(
 ) -> None:
     status = git(ctx.worktree, "status", "--short").stdout
     diff_stat = git(ctx.worktree, "diff", "--stat", ctx.base_commit).stdout
+    cap = token_cap(ctx.config)
+    tokens = f"{ctx.tokens_used:,}" + (f" of {cap:,}" if cap else "")
     summary = f"""# stargate run
 
 Task: {task}
@@ -225,7 +230,7 @@ Worktree: {ctx.worktree}
 Verdict: {verdict}
 Test command: {ctx.test_command or "(none)"} ({ctx.test_source})
 Test exit: {test_exit}
-Tokens reported: {ctx.tokens_used:,}{" of " + format(token_cap(ctx.config), ",") if token_cap(ctx.config) else ""}
+Tokens reported: {tokens}
 
 ## git status
 

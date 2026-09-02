@@ -65,7 +65,8 @@ def unique_agents(config: dict[str, Any]) -> dict[Any, tuple[list[str], Any, dic
         declared = entry.get("env") or {}
         key = (
             tuple(agent_command(config, role)),
-            tuple(sorted((str(k), v) for k, v in declared.items())) if isinstance(declared, dict) else None,
+            tuple(sorted((str(k), v) for k, v in declared.items()))
+            if isinstance(declared, dict) else None,
         )
         names, prober, first = agents.get(key, ([], None, entry))
         names.append(config["workflow"][role])

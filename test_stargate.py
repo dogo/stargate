@@ -535,8 +535,11 @@ def test_doctor_probe_reports_missing_git_without_crashing(root: Path) -> None:
 def test_prose_mentioning_approved_is_not_an_approval(root: Path) -> None:
     repo = make_repo(root)
     cfg = root / "a.yaml"
-    write_config(cfg, 'echo "I cannot give VERDICT: APPROVED yet."; echo "VERDICT: CHANGES_REQUESTED"',
-                 test_command="true")
+    write_config(
+        cfg,
+        'echo "I cannot give VERDICT: APPROVED yet."; echo "VERDICT: CHANGES_REQUESTED"',
+        test_command="true",
+    )
     proc = run(repo, cfg)
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "Verdict:   CHANGES_REQUESTED" in proc.stdout, proc.stdout
@@ -780,7 +783,10 @@ def test_agent_env_sets_and_unsets(root: Path) -> None:
     cfg.write_text(yaml.safe_dump({
         "agents": {
             "arch": {
-                "command": agent(f'echo "KEY=[$STARGATE_KEY] INHERITED=[$STARGATE_INHERITED]" > {seen}; echo plan'),
+                "command": agent(
+                    f'echo "KEY=[$STARGATE_KEY] '
+                    f'INHERITED=[$STARGATE_INHERITED]" > {seen}; echo plan'
+                ),
                 "env": {"STARGATE_KEY": "from-config", "STARGATE_INHERITED": None},
             },
             "noop": {"command": agent("echo done")},
@@ -1083,7 +1089,7 @@ def test_list_runs_directory_read_error_is_an_error(root: Path) -> None:
     from stargate.run import list_runs
 
     class UnreadablePath:
-        def __truediv__(self, _part: str) -> "UnreadablePath":
+        def __truediv__(self, _part: str) -> UnreadablePath:
             return self
 
         def __str__(self) -> str:
