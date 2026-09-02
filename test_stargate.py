@@ -758,12 +758,12 @@ def test_prompts_are_frozen_into_the_run(root: Path) -> None:
 
 def test_slow_agent_prints_a_heartbeat(root: Path) -> None:
     """A silent multi-minute agent must not look like a hang."""
-    import stargate.cli
-    stargate.cli.HEARTBEAT_SECONDS = 1  # only affects this in-process check
+    import stargate.core
+    stargate.core.HEARTBEAT_SECONDS = 1  # only affects this in-process check
 
     repo = make_repo(root)
     log = root / "slow.log"
-    proc = stargate.cli.run_process(
+    proc = stargate.core.run_process(
         ["/bin/sh", "-c", "echo starting; sleep 2.5; echo done"],
         repo, log_path=log, timeout=30,
     )
