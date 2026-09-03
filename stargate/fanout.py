@@ -28,7 +28,7 @@ from .run import (
     warn_if_dirty,
     worktree_fingerprint,
 )
-from .stages import plan_tests, review_and_finish, run_tests
+from .stages import finish, plan_tests, review_and_finish, run_tests
 
 TASK_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,47}\Z")
 MAX_FANOUT_TASKS_DEFAULT = 8
@@ -314,6 +314,23 @@ def _new_task_records(
 
 
 def _merge(worktree: Path, branch: str, purpose: str) -> None:
+    # A process can die after Git writes MERGE_HEAD but before our failure path
+    # gets to `merge --abort`. Generated worktrees have no legitimate reason to
+    # retain that state between scheduler invocations, so make an old merge
+    # recoverable before attempting the next one.
+    if _merge_residue(worktree):
+        print(f"Recovering an interrupted merge in {worktree}.", flush=True)
+        _reset_worktree(worktree, "HEAD", clean_untracked=False)
+
+    tracked = git_quiet(
+        worktree, "status", "--porcelain", "--untracked-files=no"
+    ).strip()
+    if tracked:
+        raise StargateError(
+            f"Could not merge {branch!r} while {purpose}: {worktree} has "
+            "uncommitted tracked changes."
+        )
+
     proc = subprocess.run(
         ["git", "merge", "--no-edit", branch],
         cwd=str(worktree),
@@ -325,17 +342,122 @@ def _merge(worktree: Path, branch: str, purpose: str) -> None:
         print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
     if proc.returncode == 0:
         return
-    subprocess.run(
+    abort = subprocess.run(
         ["git", "merge", "--abort"],
         cwd=str(worktree),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
     )
+    cleanup_error = ""
+    tracked = git_quiet(
+        worktree, "status", "--porcelain", "--untracked-files=no"
+    ).strip()
+    if _merge_residue(worktree) or tracked:
+        try:
+            _reset_worktree(worktree, "HEAD", clean_untracked=False)
+        except StargateError as exc:
+            cleanup_error = str(exc)
+    residue = _merge_residue(worktree)
+    tracked = git_quiet(
+        worktree, "status", "--porcelain", "--untracked-files=no"
+    ).strip()
+    if residue or tracked:
+        abort_tail = "\n".join((abort.stdout or "").strip().splitlines()[-5:])
+        cleanup_error = cleanup_error or abort_tail or "Git left merge state behind."
     tail = "\n".join((proc.stdout or "").strip().splitlines()[-20:])
     raise StargateError(
         f"Could not merge {branch!r} while {purpose}."
         + (f"\nLast Git output:\n{tail}" if tail else "")
+        + (
+            f"\nCould not restore a clean worktree: {cleanup_error}"
+            if cleanup_error
+            else ""
+        )
     )
+
+
+def _merge_residue(worktree: Path) -> bool:
+    merge_head = subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        cwd=str(worktree),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    unmerged = subprocess.run(
+        ["git", "ls-files", "-u"],
+        cwd=str(worktree),
+        text=True,
+        capture_output=True,
+    )
+    return merge_head.returncode == 0 or bool(unmerged.stdout.strip())
+
+
+def _reset_worktree(
+    worktree: Path, revision: str, *, clean_untracked: bool
+) -> None:
+    commands = [["reset", "--hard", revision]]
+    if clean_untracked:
+        # Task worktrees are generated scratch space. An unfinished attempt must
+        # not silently influence the next developer, including via ignored
+        # build output or a nested repository.
+        commands.append(["clean", "-ffdx"])
+    for command in commands:
+        proc = subprocess.run(
+            ["git", *command],
+            cwd=str(worktree),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        if proc.returncode:
+            detail = "\n".join((proc.stdout or "").strip().splitlines()[-10:])
+            raise StargateError(
+                f"Could not reset task worktree {worktree} with "
+                f"'git {' '.join(command)}'."
+                + (f"\nLast Git output:\n{detail}" if detail else "")
+            )
+
+
+def _assert_branch(worktree: Path, expected: str, purpose: str) -> None:
+    proc = subprocess.run(
+        ["git", "symbolic-ref", "--short", "HEAD"],
+        cwd=str(worktree),
+        text=True,
+        capture_output=True,
+    )
+    checked_out = proc.stdout.strip() if proc.returncode == 0 else "(detached HEAD)"
+    if checked_out != expected:
+        raise StargateError(
+            f"{purpose} worktree {worktree} is on {checked_out!r}, "
+            f"not {expected!r}."
+        )
+
+
+def _ref_commit(repo: Path, branch: str) -> str:
+    proc = subprocess.run(
+        [
+            "git",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            f"refs/heads/{branch}^{{commit}}",
+        ],
+        cwd=str(repo),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=str(repo),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
 
 
 def _task_context(ctx: RunContext, record: dict[str, Any]) -> RunContext:
@@ -372,28 +494,73 @@ def _prepare_task(ctx: RunContext, record: dict[str, Any]) -> RunContext:
         )
 
     initial_base = dependencies[0]["commit"] if dependencies else ctx.base_commit
-    if not record.get("base_commit"):
-        record["base_commit"] = initial_base
+    recorded_base = str(record.get("base_commit") or "")
+    preparation_base = recorded_base or initial_base
     task_ctx = _task_context(ctx, record)
-    task_ctx.base_commit = initial_base
+    task_ctx.base_commit = preparation_base
+    existed = task_ctx.worktree.exists() or bool(
+        _ref_commit(ctx.repo, task_ctx.branch)
+    )
     create_worktree(task_ctx)
+    _assert_branch(task_ctx.worktree, task_ctx.branch, "Task")
 
-    checked_out = git_quiet(
-        task_ctx.worktree, "symbolic-ref", "--short", "HEAD"
-    ).strip()
-    if checked_out != task_ctx.branch:
+    if existed:
+        print(
+            f"Clean retry for task {record['id']}: resetting {task_ctx.worktree} "
+            f"to {preparation_base[:12]} and discarding the unfinished "
+            "attempt's edits.",
+            flush=True,
+        )
+        _reset_worktree(task_ctx.worktree, preparation_base, clean_untracked=True)
+
+    head = git_quiet(task_ctx.worktree, "rev-parse", "HEAD").strip()
+    if head != preparation_base:
         raise StargateError(
-            f"Task worktree {task_ctx.worktree} is on {checked_out!r}, "
-            f"not {task_ctx.branch!r}."
+            f"Task {record['id']!r} branch {task_ctx.branch!r} starts at "
+            f"{head}, not its recorded base {preparation_base}."
         )
-    for dependency in dependencies:
-        _merge(
-            task_ctx.worktree,
-            dependency["branch"],
-            f"preparing task {record['id']!r}",
+
+    if recorded_base:
+        missing_from_base = [
+            dependency["id"]
+            for dependency in dependencies
+            if not _is_ancestor(ctx.repo, dependency["commit"], recorded_base)
+        ]
+        if missing_from_base:
+            raise StargateError(
+                f"Task {record['id']!r} recorded base does not contain "
+                f"dependency task(s): {', '.join(missing_from_base)}."
+            )
+    else:
+        for dependency in dependencies:
+            branch_head = _ref_commit(ctx.repo, dependency["branch"])
+            if branch_head != dependency["commit"]:
+                raise StargateError(
+                    f"Dependency task {dependency['id']!r} branch "
+                    f"{dependency['branch']!r} is at {branch_head or '(missing)'}, "
+                    f"not its recorded commit {dependency['commit']}."
+                )
+            _merge(
+                task_ctx.worktree,
+                dependency["commit"],
+                f"preparing task {record['id']!r} from dependency "
+                f"{dependency['id']!r}",
+            )
+        task_ctx.base_commit = git_quiet(
+            task_ctx.worktree, "rev-parse", "HEAD"
+        ).strip()
+        record["base_commit"] = task_ctx.base_commit
+
+    missing_from_head = [
+        dependency["id"]
+        for dependency in dependencies
+        if not _is_ancestor(ctx.repo, dependency["commit"], task_ctx.base_commit)
+    ]
+    if missing_from_head:
+        raise StargateError(
+            f"Task {record['id']!r} worktree does not contain dependency "
+            f"task(s): {', '.join(missing_from_head)}."
         )
-    task_ctx.base_commit = git_quiet(task_ctx.worktree, "rev-parse", "HEAD").strip()
-    record["base_commit"] = task_ctx.base_commit
     record["stage"] = "ready"
     return task_ctx
 
@@ -436,6 +603,9 @@ def _execute_task(
         task_ctx.worktree,
         task_ctx.artifacts / "developer.txt",
     )
+    # Persist usage immediately after the billable phase. The outer scheduler
+    # reconciles this total into its own state once the future completes.
+    save_state(task_ctx, "running")
     if worktree_fingerprint(task_ctx) == before:
         raise StargateError(
             f"Developer changed nothing for fan-out task {task.id!r} in "
@@ -472,32 +642,77 @@ def _recover_task(ctx: RunContext, record: dict[str, Any]) -> bool:
         state = json.loads(state_path.read_text())
     except (OSError, ValueError):
         return False
-    commit = str(state.get("commit") or "")
-    if state.get("status") != "task_complete" or not commit:
+    if not isinstance(state, dict):
         return False
-    exists = subprocess.run(
-        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+    branch_head = _ref_commit(ctx.repo, record["branch"])
+    if not branch_head:
+        return False
+    state_commit = str(state.get("commit") or "")
+    if state.get("status") == "task_complete" and state_commit:
+        if state_commit != branch_head:
+            return False
+    commit = branch_head
+    message_proc = subprocess.run(
+        ["git", "show", "-s", "--format=%B", commit],
         cwd=str(ctx.repo),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    ).returncode == 0
-    if not exists:
+        text=True,
+        capture_output=True,
+    )
+    if message_proc.returncode:
+        return False
+    trailers = {
+        key: value
+        for line in message_proc.stdout.splitlines()
+        if ": " in line
+        for key, value in [line.split(": ", 1)]
+    }
+    base_commit = str(record.get("base_commit") or "")
+    if (
+        trailers.get("Stargate-Run-Id") != ctx.run_id
+        or trailers.get("Stargate-Verdict") != "TASK_COMPLETE"
+        or trailers.get("Stargate-Base-Commit") != base_commit
+        or not base_commit
+        or not _is_ancestor(ctx.repo, base_commit, commit)
+    ):
         return False
     result_path = state_path.parent / "result.json"
     try:
         result = json.loads(result_path.read_text())
     except (OSError, ValueError):
         result = {}
+    if not isinstance(result, dict) or (
+        result.get("commit") and result.get("commit") != commit
+    ):
+        result = {}
+    try:
+        tokens_used = max(
+            0,
+            int(state.get("tokens_used", 0)),
+            int(result.get("tokens_used", 0)),
+        )
+    except (TypeError, ValueError):
+        return False
+    test_exit = result.get("test_exit")
+    if test_exit is None and "Stargate-Tests-Exit" in trailers:
+        try:
+            test_exit = int(trailers["Stargate-Tests-Exit"])
+        except ValueError:
+            test_exit = None
     record.update(
         status="complete",
         stage="complete",
         commit=commit,
-        test_exit=result.get("test_exit"),
-        tokens_used=int(result.get("tokens_used", state.get("tokens_used", 0))),
+        test_exit=test_exit,
+        tokens_used=tokens_used,
         test_artifacts=list(
             result.get("test_artifacts", state.get("test_artifacts", []))
         ),
         error=None,
+    )
+    print(
+        f"Recovered completed task {record['id']} at {commit[:12]} from its "
+        "task branch.",
+        flush=True,
     )
     return True
 
@@ -509,6 +724,7 @@ def _run_scheduler(
     graph: str,
     max_parallel: int,
 ) -> int | None:
+    enter_stage(ctx, "tasks")
     by_id = {task.id: task for task in tasks}
     records = ctx.fanout["tasks"]
     for task in tasks:
@@ -528,44 +744,59 @@ def _run_scheduler(
 
     running: dict[Future[dict[str, Any]], tuple[str, RunContext]] = {}
     budget_reached = False
+    interrupted: BaseException | None = None
     executor = ThreadPoolExecutor(
         max_workers=max_parallel, thread_name_prefix="stargate-task"
     )
     try:
         while True:
-            for task in tasks:
-                if len(running) >= max_parallel:
-                    break
-                record = records[task.id]
-                if record["status"] != "pending":
-                    continue
-                if not all(
-                    records[dependency]["status"] == "complete"
-                    for dependency in task.depends_on
-                ):
-                    continue
-                if budget_spent(ctx, f"fan-out task {task.id}"):
+            if not budget_reached:
+                pending = [
+                    task.id
+                    for task in tasks
+                    if records[task.id]["status"] == "pending"
+                ]
+                next_phase = f"fan-out task {pending[0]}" if pending else "integration"
+                if budget_spent(ctx, next_phase):
                     budget_reached = True
-                    break
-                try:
-                    task_ctx = _prepare_task(ctx, record)
-                except StargateError as exc:
-                    record.update(
-                        status="failed", stage="prepare", error=str(exc)
+                    print(
+                        "The cap is enforced between task agents. Up to "
+                        f"{max_parallel} concurrently started task agent(s) may "
+                        "finish above it; no more task agents will be scheduled.",
+                        file=sys.stderr,
                     )
+
+            if not budget_reached:
+                for task in tasks:
+                    if len(running) >= max_parallel:
+                        break
+                    record = records[task.id]
+                    if record["status"] != "pending":
+                        continue
+                    if not all(
+                        records[dependency]["status"] == "complete"
+                        for dependency in task.depends_on
+                    ):
+                        continue
+                    try:
+                        task_ctx = _prepare_task(ctx, record)
+                    except StargateError as exc:
+                        record.update(
+                            status="failed", stage="prepare", error=str(exc)
+                        )
+                        save_state(ctx, "running")
+                        continue
+                    record.update(status="running", stage="developer", error=None)
                     save_state(ctx, "running")
-                    continue
-                record.update(status="running", stage="developer", error=None)
-                save_state(ctx, "running")
-                future = executor.submit(
-                    _execute_task, ctx, task_ctx, by_id[task.id], prompts, graph
-                )
-                running[future] = (task.id, task_ctx)
-                print(
-                    f"Scheduled {task.id} on {record['branch']} "
-                    f"({len(running)}/{max_parallel} slots)",
-                    flush=True,
-                )
+                    future = executor.submit(
+                        _execute_task, ctx, task_ctx, by_id[task.id], prompts, graph
+                    )
+                    running[future] = (task.id, task_ctx)
+                    print(
+                        f"Scheduled {task.id} on {record['branch']} "
+                        f"({len(running)}/{max_parallel} slots)",
+                        flush=True,
+                    )
             if not running:
                 break
 
@@ -590,6 +821,7 @@ def _run_scheduler(
                     )
                     print(f"\nTask {task_id} failed: {exc}", file=sys.stderr)
                 else:
+                    previous_tokens = int(record.get("tokens_used", 0))
                     record.update(
                         status="complete",
                         stage="complete",
@@ -599,22 +831,82 @@ def _run_scheduler(
                         test_artifacts=result["test_artifacts"],
                         error=None,
                     )
-                    ctx.tokens_used += result["token_delta"]
+                    ctx.tokens_used += max(
+                        0, int(result["tokens_used"]) - previous_tokens
+                    )
                     print(
                         f"\nTask {task_id} complete at "
                         f"{result['commit'][:12]}",
                         flush=True,
                     )
                 save_state(ctx, "running")
+    except BaseException as exc:
+        interrupted = exc
     finally:
         executor.shutdown(wait=True, cancel_futures=True)
 
-    if budget_reached:
-        save_state(ctx, "budget_exceeded")
-        print(
-            f"\nResume with a larger token budget: stargate resume {ctx.run_id}",
-            file=sys.stderr,
+    if interrupted is not None:
+        for future, (task_id, task_ctx) in running.items():
+            record = records[task_id]
+            previous_tokens = int(record.get("tokens_used", 0))
+            if future.cancelled():
+                record.update(
+                    status="pending",
+                    stage="interrupted",
+                    error="Interrupted before the task agent started; safe to retry.",
+                )
+                continue
+            try:
+                result = future.result()
+            except BaseException:
+                record.update(
+                    status="pending",
+                    stage="interrupted",
+                    tokens_used=task_ctx.tokens_used,
+                    test_artifacts=sorted(task_ctx.test_artifacts),
+                    error=(
+                        "Interrupted before task completion; retry will use the "
+                        "clean-retry policy."
+                    ),
+                )
+                ctx.tokens_used += max(
+                    0, task_ctx.tokens_used - previous_tokens
+                )
+            else:
+                record.update(
+                    status="complete",
+                    stage="complete",
+                    commit=result["commit"],
+                    test_exit=result["test_exit"],
+                    tokens_used=result["tokens_used"],
+                    test_artifacts=result["test_artifacts"],
+                    error=None,
+                )
+                ctx.tokens_used += max(
+                    0, int(result["tokens_used"]) - previous_tokens
+                )
+        for task in tasks:
+            record = records[task.id]
+            if record["status"] == "running":
+                record.update(
+                    status="pending",
+                    stage="interrupted",
+                    error=(
+                        "Interrupted while scheduling the task; retry will use "
+                        "the clean-retry policy."
+                    ),
+                )
+        save_state(
+            ctx,
+            "failed",
+            f"{type(interrupted).__name__}: {interrupted}",
         )
+        raise interrupted
+
+    if budget_reached:
+        if all(records[task.id]["status"] == "complete" for task in tasks):
+            complete_stage(ctx, "tasks")
+        save_state(ctx, "budget_exceeded")
         return 4
 
     failed = [task.id for task in tasks if records[task.id]["status"] == "failed"]
@@ -639,12 +931,24 @@ def _integrate(ctx: RunContext, tasks: list[FanoutTask]) -> None:
     enter_stage(ctx, "integration")
     print("\n=== INTEGRATION ===")
     create_worktree(ctx)
+    _assert_branch(ctx.worktree, ctx.branch, "Integration")
     integrated = ctx.fanout.setdefault("integrated", [])
     for task in tasks:
         if task.id in integrated:
             continue
         record = ctx.fanout["tasks"][task.id]
-        _merge(ctx.worktree, record["branch"], f"integrating task {task.id!r}")
+        branch_head = _ref_commit(ctx.repo, record["branch"])
+        if branch_head != record["commit"]:
+            raise StargateError(
+                f"Task {task.id!r} branch {record['branch']!r} is at "
+                f"{branch_head or '(missing)'}, not its recorded commit "
+                f"{record['commit']}."
+            )
+        _merge(
+            ctx.worktree,
+            record["commit"],
+            f"integrating task {task.id!r} from branch {record['branch']!r}",
+        )
         integrated.append(task.id)
         ctx.commit = git_quiet(ctx.worktree, "rev-parse", "HEAD").strip()
         save_state(ctx, "running")
@@ -737,8 +1041,32 @@ def orchestrate_fanout(
 ) -> int:
     """Run or resume the opt-in DAG workflow."""
     resuming = args.command == "resume"
+    commit_error = (
+        "Fan-out requires commits to move work between task branches; "
+        "remove --no-commit and enable settings.commit."
+    )
+
+    # Invocation errors must not reserve a new run or rewrite an existing run's
+    # resumable status. A resume still validates the frozen/explicit config
+    # after loading it below.
+    if resuming and getattr(args, "redo", []):
+        raise StargateError("--redo is not supported for fan-out runs.")
+    if args.no_commit:
+        raise StargateError(commit_error)
+    if not resuming:
+        if not commit_enabled(config):
+            raise StargateError(commit_error)
+        max_tasks, max_parallel = fanout_limits(
+            config, args.max_parallel_tasks
+        )
+
     if resuming:
         ctx = load_run(repo, args.run_id, config, use_frozen=args.config is None)
+        if not commit_enabled(ctx.config):
+            raise StargateError(commit_error)
+        max_tasks, max_parallel = fanout_limits(
+            ctx.config, args.max_parallel_tasks
+        )
         prompts = [ctx.artifacts / "prompts"]
         print(f"\nResuming fan-out {ctx.run_id}: {ctx.task}")
     else:
@@ -747,22 +1075,6 @@ def orchestrate_fanout(
         ctx.mode = "fanout"
         prompts = snapshot(ctx, prompt_dirs(config, script_dir))
         save_state(ctx, "running")
-
-    try:
-        if resuming and getattr(args, "redo", []):
-            raise StargateError("--redo is not supported for fan-out runs.")
-        if not commit_enabled(ctx.config) or args.no_commit:
-            raise StargateError(
-                "Fan-out requires commits to move work between task branches; "
-                "remove --no-commit and enable settings.commit."
-            )
-        max_tasks, max_parallel = fanout_limits(
-            ctx.config, args.max_parallel_tasks
-        )
-    except StargateError as exc:
-        save_state(ctx, "failed", f"{type(exc).__name__}: {exc}")
-        print(f"\nResume with: stargate resume {ctx.run_id}", file=sys.stderr)
-        raise
 
     print(f"\nRun ID:   {ctx.run_id}")
     print(f"Mode:     fan-out ({max_parallel} parallel tasks)")
@@ -774,18 +1086,27 @@ def orchestrate_fanout(
     try:
         plan_tests(ctx)
         tasks, graph = _load_or_create_graph(ctx, prompts, max_tasks)
-        if budget_spent(ctx, "the first fan-out task"):
-            save_state(ctx, "budget_exceeded")
-            print(
-                f"\nResume with a larger token budget: stargate resume {ctx.run_id}",
-                file=sys.stderr,
-            )
-            return 4
         scheduler_exit = _run_scheduler(
             ctx, tasks, prompts, graph, max_parallel
         )
         if scheduler_exit is not None:
-            return scheduler_exit
+            # `finish` gives this resumable terminal path the same summary and
+            # RESULT block as every other budget stop. The integration worktree
+            # may not exist yet, so create only its untouched base branch.
+            create_worktree(ctx)
+            _assert_branch(ctx.worktree, ctx.branch, "Integration")
+            exit_code = finish(
+                ctx,
+                ctx.task,
+                "BUDGET_EXCEEDED",
+                None,
+                commit=True,
+            )
+            print(
+                f"\nResume with a larger token budget: stargate resume {ctx.run_id}",
+                file=sys.stderr,
+            )
+            return exit_code
         _integrate(ctx, tasks)
         test_exit, test_report = run_tests(ctx, "integration")
         return review_and_finish(
