@@ -8,7 +8,8 @@ BASE REF:
 
 Inspect the repository before decomposing the work. Do not edit files.
 
-Return ONLY one JSON object, with no Markdown fence or surrounding prose:
+Return ONLY one bare JSON object, with no Markdown fence, commentary, or other
+surrounding text:
 
 {
   "name": "two to four words naming the work",
@@ -24,8 +25,15 @@ Return ONLY one JSON object, with no Markdown fence or surrounding prose:
 
 Rules:
 - Produce between 1 and {max_tasks} tasks.
-- `id` must match `[a-z0-9][a-z0-9-]*` and be unique.
-- `depends_on` contains only IDs from this same object.
+- `name` is required and must be a usable, non-empty string. Give it a short
+  ASCII letter/digit word so it can name the run branch.
+- Every item in `tasks` must be an object with a unique `id` and a non-empty
+  string `task`.
+- `id` must match `[a-z0-9][a-z0-9-]{0,47}` (1 to 48 characters).
+- `depends_on` is optional and defaults to `[]`. When present, it must be a list
+  of unique task IDs from this same object; a task cannot depend on itself.
+- `acceptance` is optional and defaults to `[]`. When present, it must be a list
+  of non-empty strings; the list itself may be empty.
 - Dependencies must form a directed acyclic graph.
 - Use a dependency when a task needs files or contracts produced by another.
 - Keep independent tasks independent so they can run concurrently.

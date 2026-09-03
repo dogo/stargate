@@ -120,7 +120,7 @@ settings:
   worktree_root: ""
 
   # Directory of custom <role>.md prompts. Overrides are per-file: drop a
-  # single reviewer.md here and the other three still use the defaults.
+  # single reviewer.md here and the other four still use the defaults.
   # Lookup order: this, then ~/.config/stargate/prompts/, then the packaged
   # prompts. A relative path resolves against the repo you run in.
   # See `stargate init-prompts` and `stargate doctor`.
