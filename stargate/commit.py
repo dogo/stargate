@@ -168,6 +168,30 @@ def commit_run(
     return "committed"
 
 
+def terminal_commit_at_head(ctx: RunContext, verdict: str) -> str:
+    """Recover a terminal commit made just before state persistence stopped.
+
+    A signal can arrive after ``git commit`` succeeds but before ``finish``
+    records the terminal fields in state.json.  The commit trailers make that
+    narrow window distinguishable from both task commits and user commits, so
+    a resume can adopt the commit instead of adding another empty one.
+    """
+    if not ctx.worktree.exists():
+        return ""
+    try:
+        head = git_quiet(ctx.worktree, "rev-parse", "HEAD").strip()
+        message = git_quiet(ctx.worktree, "log", "-1", "--format=%B", "HEAD")
+    except StargateError:
+        return ""
+    trailers = set(message.splitlines())
+    if (
+        f"Stargate-Run-Id: {ctx.run_id}" in trailers
+        and f"Stargate-Verdict: {verdict}" in trailers
+    ):
+        return head
+    return ""
+
+
 def commit_summary(ctx: RunContext, enabled: bool) -> str:
     if not enabled:
         return "disabled"
