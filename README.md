@@ -1,10 +1,11 @@
 # Stargate
 
-A deliberately small local orchestrator that lets **Claude Code** and the
-**Codex CLI** collaborate on the same software task without concurrently
-editing the same checkout.
+A deliberately small, local, vendor-agnostic orchestrator that lets AI coding
+agents collaborate on the same software task without concurrently editing the
+same checkout. Agents are command prefixes assigned to roles, so a workflow can
+mix vendors or run every role through the same CLI.
 
-Default flow:
+One possible mixed-agent flow:
 
 ```text
 you
@@ -22,7 +23,7 @@ Codex / developer (implementation)
 tests (optional)
  │
  ▼
-Claude / reviewer
+Kiro / reviewer
  │
  ├── APPROVED ─────────────► orchestrator commit ──► done
  │
@@ -36,6 +37,12 @@ Claude / reviewer
           │
           └──────────────► review again
 ```
+
+**Claude Code**, **Codex CLI**, and **Kiro CLI** are validated integrations, not
+a closed list of supported agents. The packaged configuration uses Claude for
+the architect and reviewer and Codex for the developer and fixer; the
+[`examples/`](examples/) directory includes verified single-vendor
+configurations for all three CLIs and documents the differences between them.
 
 Every terminal result with changes is committed on the run's own branch,
 including a reviewer that still requests changes, a failing test command, or a
@@ -51,8 +58,12 @@ themselves remain forbidden to commit.
 
 - Python 3.10+
 - Git
-- Claude Code installed and authenticated
-- Codex CLI installed and authenticated
+- The agent CLI or CLIs referenced by your effective configuration, installed
+  and authenticated
+
+The packaged default requires Claude Code and Codex CLI. A single-vendor setup
+can instead start from one of the verified configurations in
+[`examples/`](examples/); the Kiro configuration also uses its included wrapper.
 
 ## Install (global)
 
@@ -771,16 +782,16 @@ workflow:
   fixer: fixer
 ```
 
-Every agent is just a command prefix. For example, swapping the reviewer to
-Codex only requires another agent definition plus:
+Every agent is just a command prefix. For example, assigning the reviewer role
+to a Kiro agent only requires its agent definition plus:
 
 ```yaml
 workflow:
-  reviewer: codex_reviewer
+  reviewer: kiro_reviewer
 ```
 
-Likewise you can invert the default design and make Codex the architect and
-Claude the implementer.
+The mapping is vendor-agnostic: Claude, Codex, Kiro, or another compatible CLI
+can fill any role whose permission and output requirements it supports.
 
 ## Adding a different agent CLI
 
@@ -818,7 +829,7 @@ notes on which of the four problems each one actually hit.
 The CLI boundary is what keeps this small:
 
 - it uses the authentication you already have in each CLI;
-- upgrading either vendor does not couple the orchestrator to an SDK;
+- upgrading an agent CLI does not couple the orchestrator to an SDK;
 - each role can have independent permissions/model flags;
 - replacing one agent is just YAML;
 - the Git worktree remains the shared protocol between agents.
