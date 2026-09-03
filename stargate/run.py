@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -233,7 +234,7 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
     restarting the whole flow and leaving a second plan, branch and worktree."""
     path = ctx.artifacts / "state.json"
     started = json.loads(path.read_text()).get("started_at") if path.exists() else None
-    path.write_text(json.dumps({
+    contents = json.dumps({
         "run_id": ctx.run_id,
         "task": ctx.task,
         "repo": str(ctx.repo),
@@ -254,7 +255,26 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "fanout": ctx.fanout or None,
         "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
         "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-    }, indent=2) + "\n")
+    }, indent=2) + "\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
 
 
 def enter_stage(ctx: RunContext, stage: str) -> None:
@@ -311,7 +331,7 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
 RUN_TASK_WIDTH = 60
 
 
-RESUMABLE_STATUSES = ("running", "failed")
+RESUMABLE_STATUSES = ("running", "failed", "budget_exceeded")
 
 
 def read_run(path: Path) -> dict[str, Any]:
@@ -355,13 +375,7 @@ def read_run(path: Path) -> dict[str, Any]:
         updated=" ".join(str(state.get("updated_at") or "-").split()),
         # Tasks are often multi-paragraph input; one row should stay one row.
         task=(" ".join(str(state.get("task") or "").split())[:RUN_TASK_WIDTH] or "-"),
-        resumable=(
-            status.lower() in RESUMABLE_STATUSES
-            or (
-                state.get("mode") == "fanout"
-                and status.lower() == "budget_exceeded"
-            )
-        ),
+        resumable=status.lower() in RESUMABLE_STATUSES,
         error="",
     )
     return row
@@ -432,19 +446,87 @@ def snapshot(ctx: RunContext, dirs: list[Path]) -> list[Path]:
     return [frozen]
 
 
+def _registered_worktrees(
+    repo: Path,
+) -> tuple[dict[Path, str | None], set[Path]]:
+    """Return registered worktree branches and paths locked against removal."""
+    raw = git_quiet(repo, "worktree", "list", "--porcelain", "-z")
+    registrations: dict[Path, str | None] = {}
+    locked: set[Path] = set()
+    for record in raw.split("\0\0"):
+        fields = [field for field in record.split("\0") if field]
+        path_value = next(
+            (field.removeprefix("worktree ") for field in fields
+             if field.startswith("worktree ")),
+            None,
+        )
+        if path_value is None:
+            continue
+        branch = next(
+            (field.removeprefix("branch refs/heads/") for field in fields
+             if field.startswith("branch refs/heads/")),
+            None,
+        )
+        path = Path(path_value).resolve()
+        registrations[path] = branch
+        if any(field == "locked" or field.startswith("locked ") for field in fields):
+            locked.add(path)
+    return registrations, locked
+
+
 def create_worktree(ctx: RunContext) -> None:
+    worktree = ctx.worktree.resolve()
+    registrations, _ = _registered_worktrees(ctx.repo)
+    registered = worktree in registrations
+    registered_branch = registrations.get(worktree)
     if ctx.worktree.exists():
+        if not registered:
+            raise StargateError(
+                f"Worktree path {ctx.worktree} exists but is not a registered "
+                f"Git worktree for {ctx.repo}; refusing to reuse it."
+            )
+        if registered_branch != ctx.branch:
+            raise StargateError(
+                f"Worktree path {ctx.worktree} is registered on branch "
+                f"{registered_branch!r}, not expected branch {ctx.branch!r}; "
+                "refusing to reuse it."
+            )
         print(f"Reusing existing worktree: {ctx.worktree}")
         return
-    exists = git(ctx.repo, "rev-parse", "--verify", ctx.branch, check=False).returncode == 0
+    if registered:
+        raise StargateError(
+            f"Worktree path {ctx.worktree} is registered on branch "
+            f"{registered_branch!r}, but the path is missing; refusing to recreate it."
+        )
+    branch_worktree = next(
+        (path for path, branch in registrations.items() if branch == ctx.branch),
+        None,
+    )
+    if branch_worktree is not None:
+        raise StargateError(
+            f"Branch {ctx.branch!r} is already registered at {branch_worktree}, "
+            f"not the expected worktree {ctx.worktree}."
+        )
+    if ctx.mode.startswith("fanout"):
+        exists = branch_exists(ctx.repo, ctx.branch)
+        if exists:
+            raise StargateError(
+                f"Branch {ctx.branch!r} already exists without the expected registered "
+                "worktree; refusing to adopt it."
+            )
+    else:
+        exists = (
+            git(ctx.repo, "rev-parse", "--verify", ctx.branch, check=False).returncode == 0
+        )
     args = ["worktree", "add"] + (
-        [str(ctx.worktree), ctx.branch] if exists
+        [str(ctx.worktree), ctx.branch]
+        if exists
         else ["-b", ctx.branch, str(ctx.worktree), ctx.base_commit]
     )
     git(ctx.repo, *args, capture=True)
 
 
-def clean_run(repo: Path, run_id: str) -> None:
+def clean_run(repo: Path, run_id: str, *, validate_only: bool = False) -> None:
     root = repo / ".stargate" / "runs"
     if not run_id or Path(run_id).name != run_id or run_id in (".", ".."):
         raise StargateError(f"Invalid run ID: {run_id!r}")
@@ -476,10 +558,10 @@ def clean_run(repo: Path, run_id: str) -> None:
         for task_id, record in records.items():
             task_branch = record.get("branch") if isinstance(record, dict) else None
             task_worktree = record.get("worktree") if isinstance(record, dict) else None
+            expected_branch = f"{branch}-{task_id}"
             if (
                 not isinstance(task_id, str)
                 or not isinstance(task_branch, str)
-                or not task_branch.startswith(f"{branch}-")
                 or not isinstance(task_worktree, str)
                 or not task_worktree
             ):
@@ -487,19 +569,28 @@ def clean_run(repo: Path, run_id: str) -> None:
                     f"Cannot clean {run_id}: invalid fan-out task target {task_id!r}"
                 )
             task_path = Path(task_worktree).resolve()
-            if task_path.parent != worktree.parent:
+            branch_matches = task_branch == expected_branch or re.fullmatch(
+                rf"{re.escape(expected_branch)}-(?:[2-9]|[1-9][0-9]+)",
+                task_branch,
+            )
+            expected_path = (worktree.parent / f"{run_id}-{task_id}").resolve()
+            if not branch_matches or task_path != expected_path:
                 raise StargateError(
-                    f"Cannot clean {run_id}: fan-out worktree is outside its run root"
+                    f"Cannot clean {run_id}: fan-out task {task_id!r} does not match "
+                    "its recorded branch/worktree naming"
                 )
             targets.append((task_branch, task_path))
 
+    registrations, locked = _registered_worktrees(repo)
     present = [
         (target_branch, target_worktree, branch_exists(repo, target_branch),
-         target_worktree.exists())
+         target_worktree.exists(), target_worktree in registrations)
         for target_branch, target_worktree in targets
     ]
-    if not any(branch_present or worktree_present
-               for _, _, branch_present, worktree_present in present):
+    if not any(branch_present or worktree_present or registered
+               for _, _, branch_present, worktree_present, registered in present):
+        if validate_only:
+            return
         shutil.rmtree(artifacts)
         print(
             f"Cleaned {run_id}: artifacts removed; worktrees and branches were absent."
@@ -508,16 +599,41 @@ def clean_run(repo: Path, run_id: str) -> None:
 
     # Validate every target before removing the first one. A dirty sibling must
     # not turn a fan-out cleanup into a partially destructive operation.
-    for target_branch, target_worktree, branch_present, worktree_present in present:
+    for (
+        target_branch,
+        target_worktree,
+        branch_present,
+        worktree_present,
+        registered,
+    ) in present:
+        registered_branch = registrations.get(target_worktree)
+        if worktree_present and not registered:
+            raise StargateError(
+                f"Cannot clean {run_id}: {target_worktree} is not a registered "
+                "Git worktree"
+            )
+        if registered and registered_branch != target_branch:
+            raise StargateError(
+                f"Cannot clean {run_id}: {target_worktree} is registered on branch "
+                f"{registered_branch!r}, not {target_branch!r}"
+            )
+        if registered and target_worktree in locked:
+            raise StargateError(
+                f"Cannot clean {run_id}: worktree {target_worktree} is locked"
+            )
+        other_path = next(
+            (
+                path for path, checked_out in registrations.items()
+                if checked_out == target_branch and path != target_worktree
+            ),
+            None,
+        )
+        if other_path is not None:
+            raise StargateError(
+                f"Cannot clean {run_id}: branch {target_branch!r} is registered "
+                f"at {other_path}, not {target_worktree}"
+            )
         if worktree_present:
-            checked_out = git_quiet(
-                target_worktree, "symbolic-ref", "--short", "HEAD"
-            ).strip()
-            if checked_out != target_branch:
-                raise StargateError(
-                    f"Cannot clean {run_id}: {target_worktree} has branch "
-                    f"{checked_out!r}, not {target_branch!r}"
-                )
             if git_quiet(target_worktree, "status", "--porcelain"):
                 raise StargateError(
                     f"Cannot clean {run_id}: worktree {target_worktree} is dirty"
@@ -540,12 +656,16 @@ def clean_run(repo: Path, run_id: str) -> None:
                 f"Cannot determine whether branch {target_branch!r} is merged"
             )
 
-    for _, target_worktree, _, worktree_present in reversed(present):
+    if validate_only:
+        return
+    for _, target_worktree, _, worktree_present, registered in reversed(present):
         if worktree_present:
             git(repo, "worktree", "remove", str(target_worktree))
-    if not any(worktree_present for _, _, _, worktree_present in present):
-        git(repo, "worktree", "prune", "--expire", "now")
-    for target_branch, _, branch_present, _ in reversed(present):
+        elif registered:
+            # Remove only this stale registration. A global prune could also
+            # discard an unrelated user's temporarily missing worktree.
+            git(repo, "worktree", "remove", "--force", str(target_worktree))
+    for target_branch, _, branch_present, _, _ in reversed(present):
         if branch_present:
             git(repo, "branch", "-d", "--", target_branch)
     shutil.rmtree(artifacts)
@@ -572,13 +692,15 @@ def clean_runs(repo: Path, run_id: str | None, all_runs: bool) -> int:
     failures: list[tuple[str, str]] = []
     for candidate in run_ids:
         try:
-            clean_run(repo, candidate)
+            clean_run(repo, candidate, validate_only=True)
         except StargateError as exc:
             failures.append((candidate, str(exc)))
     if failures:
         for candidate, error in failures:
             print(f"  {candidate}: {error}", file=sys.stderr)
         raise StargateError(f"Could not clean {len(failures)} of {len(run_ids)} runs.")
+    for candidate in run_ids:
+        clean_run(repo, candidate)
     return 0
 
 
