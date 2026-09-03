@@ -53,13 +53,9 @@ class FanoutTask:
 
 def _positive_setting(config: dict[str, Any], key: str, default: int) -> int:
     value = config.get("settings", {}).get(key, default)
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError) as exc:
-        raise StargateError(f"settings.{key} must be a positive integer.") from exc
-    if parsed < 1:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise StargateError(f"settings.{key} must be a positive integer.")
-    return parsed
+    return value
 
 
 def fanout_limits(
@@ -75,9 +71,15 @@ def fanout_limits(
             config, "max_parallel_tasks", MAX_PARALLEL_TASKS_DEFAULT
         )
     )
-    if max_parallel < 1:
+    if (
+        isinstance(max_parallel, bool)
+        or not isinstance(max_parallel, int)
+        or max_parallel < 1
+    ):
         raise StargateError("--max-parallel-tasks must be a positive integer.")
-    return max_tasks, min(max_parallel, max_tasks)
+    # The configured graph ceiling is not a concurrency ceiling. The scheduler
+    # naturally limits active workers to the number of ready graph nodes.
+    return max_tasks, max_parallel
 
 
 def parse_task_graph(
@@ -103,9 +105,15 @@ def parse_task_graph(
     if not isinstance(raw_tasks, list) or not raw_tasks:
         raise StargateError("Fan-out architect output needs a non-empty 'tasks' list.")
     if max_tasks is not None and len(raw_tasks) > max_tasks:
+        extra = raw_tasks[max_tasks]
+        extra_id = extra.get("id") if isinstance(extra, dict) else None
+        where = f"tasks[{max_tasks}]"
+        if extra_id is not None:
+            where += f" ({extra_id!r})"
         raise StargateError(
-            f"Fan-out architect returned {len(raw_tasks)} tasks; "
-            f"settings.max_fanout_tasks is {max_tasks}."
+            f"Fan-out graph contains {len(raw_tasks)} tasks; "
+            f"settings.max_fanout_tasks is {max_tasks}. "
+            f"First excess entry: {where}."
         )
 
     tasks: list[FanoutTask] = []
@@ -117,27 +125,48 @@ def parse_task_graph(
         task_id = item.get("id")
         if not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
             raise StargateError(
-                f"{where}.id must match [a-z0-9][a-z0-9-]{{0,47}}."
+                f"{where}.id ({task_id!r}) must match "
+                "[a-z0-9][a-z0-9-]{0,47}."
             )
         if task_id in seen:
-            raise StargateError(f"Duplicate fan-out task id: {task_id!r}.")
+            raise StargateError(
+                f"{where}.id duplicates fan-out task {task_id!r}."
+            )
         seen.add(task_id)
+        task_where = f"Fan-out task {task_id!r} at {where}"
 
         description = item.get("task")
         if not isinstance(description, str) or not description.strip():
-            raise StargateError(f"{where}.task must be a non-empty string.")
+            raise StargateError(f"{task_where}.task must be a non-empty string.")
         dependencies = item.get("depends_on", [])
         if not isinstance(dependencies, list) or not all(
             isinstance(value, str) for value in dependencies
         ):
-            raise StargateError(f"{where}.depends_on must be a list of task IDs.")
+            raise StargateError(
+                f"{task_where}.depends_on must be a list of task IDs."
+            )
         if len(set(dependencies)) != len(dependencies):
-            raise StargateError(f"{where}.depends_on contains a duplicate task ID.")
+            duplicate = next(
+                value
+                for offset, value in enumerate(dependencies)
+                if value in dependencies[:offset]
+            )
+            raise StargateError(
+                f"{task_where}.depends_on contains duplicate task ID "
+                f"{duplicate!r}."
+            )
         acceptance = item.get("acceptance", [])
-        if not isinstance(acceptance, list) or not all(
-            isinstance(value, str) and value.strip() for value in acceptance
+        if (
+            not isinstance(acceptance, list)
+            or ("acceptance" in item and not acceptance)
+            or not all(
+                isinstance(value, str) and value.strip() for value in acceptance
+            )
         ):
-            raise StargateError(f"{where}.acceptance must be a list of strings.")
+            raise StargateError(
+                f"{task_where}.acceptance, when present, must be a non-empty "
+                "list of non-empty strings."
+            )
         tasks.append(
             FanoutTask(
                 id=task_id,
@@ -175,17 +204,50 @@ def parse_task_graph(
             if indegree[child] == 0:
                 ready.append(child)
     if len(order) != len(tasks):
-        cyclic = [task_id for task_id, degree in indegree.items() if degree]
+        visiting: dict[str, int] = {}
+        visited: set[str] = set()
+        stack: list[str] = []
+
+        def find_cycle(task_id: str) -> list[str] | None:
+            visiting[task_id] = len(stack)
+            stack.append(task_id)
+            for dependency in by_id[task_id].depends_on:
+                if dependency in visiting:
+                    return [*stack[visiting[dependency] :], dependency]
+                if dependency not in visited:
+                    cycle = find_cycle(dependency)
+                    if cycle is not None:
+                        return cycle
+            stack.pop()
+            visiting.pop(task_id)
+            visited.add(task_id)
+            return None
+
+        cycle = next(
+            (
+                found
+                for task in tasks
+                if task.id not in visited
+                and (found := find_cycle(task.id)) is not None
+            ),
+            [],
+        )
         raise StargateError(
-            "Fan-out task dependencies contain a cycle involving: "
-            f"{', '.join(cyclic)}."
+            "Fan-out task dependencies contain a cycle: "
+            f"{' -> '.join(cycle)}."
         )
     return name, [by_id[task_id] for task_id in order]
 
 
 def normalized_graph(name: str, tasks: list[FanoutTask]) -> str:
+    graph_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        item = task.as_dict()
+        if not task.acceptance:
+            item.pop("acceptance")
+        graph_tasks.append(item)
     return json.dumps(
-        {"name": name, "tasks": [task.as_dict() for task in tasks]},
+        {"name": name, "tasks": graph_tasks},
         indent=2,
     ) + "\n"
 
@@ -221,8 +283,15 @@ def _new_task_records(
     ctx: RunContext, name: str, tasks: list[FanoutTask]
 ) -> dict[str, Any]:
     records: dict[str, dict[str, Any]] = {}
+    reserved_branches: set[str] = set()
     for task in tasks:
-        branch = unique_branch(ctx.repo, f"{ctx.branch}-{task.id}")
+        branch_base = f"{ctx.branch}-{task.id}"
+        branch = unique_branch(ctx.repo, branch_base)
+        suffix = 2
+        while branch in reserved_branches:
+            branch = unique_branch(ctx.repo, f"{branch_base}-{suffix}")
+            suffix += 1
+        reserved_branches.add(branch)
         records[task.id] = {
             **task.as_dict(),
             "status": "pending",
@@ -587,11 +656,44 @@ def _load_or_create_graph(
     prompts: list[Path],
     max_tasks: int,
 ) -> tuple[list[FanoutTask], str]:
+    """Load or create the frozen graph, enforcing current configured limits."""
     graph_path = ctx.artifacts / "tasks.json"
-    reusing = "architect" in ctx.done and graph_path.exists()
-    if reusing:
-        raw = graph_path.read_text()
-        print(f"\n=== ARCHITECT (skipped, reusing {graph_path}) ===")
+    architect_complete = "architect" in ctx.done
+    if architect_complete:
+        if not ctx.fanout:
+            raise StargateError(
+                "tasks.json no longer matches the fan-out graph frozen in state.json."
+            )
+        if graph_path.exists():
+            raw = graph_path.read_text()
+            print(f"\n=== ARCHITECT (skipped, reusing {graph_path}) ===")
+        else:
+            order = ctx.fanout.get("order")
+            records = ctx.fanout.get("tasks")
+            if not isinstance(order, list) or not isinstance(records, dict):
+                raise StargateError(
+                    "tasks.json no longer matches the fan-out graph frozen in "
+                    "state.json."
+                )
+            frozen_tasks: list[dict[str, Any]] = []
+            for task_id in order:
+                record = records.get(task_id)
+                if not isinstance(record, dict):
+                    raise StargateError(
+                        "tasks.json no longer matches the fan-out graph frozen in "
+                        "state.json."
+                    )
+                frozen_task = {
+                    key: record.get(key)
+                    for key in ("id", "task", "depends_on")
+                }
+                if record.get("acceptance"):
+                    frozen_task["acceptance"] = record["acceptance"]
+                frozen_tasks.append(frozen_task)
+            raw = json.dumps(
+                {"name": ctx.fanout.get("name"), "tasks": frozen_tasks}
+            )
+            print(f"\n=== ARCHITECT (skipped, restoring {graph_path}) ===")
     else:
         enter_stage(ctx, "architect")
         architect_prompt = render_prompt(
@@ -610,17 +712,19 @@ def _load_or_create_graph(
             ctx.artifacts / "architect-tasks.json",
         ).strip()
 
-    name, tasks = parse_task_graph(raw, None if reusing else max_tasks)
+    name, tasks = parse_task_graph(raw, max_tasks)
     graph = normalized_graph(name, tasks)
-    graph_path.write_text(graph)
     _validate_frozen_graph(ctx, name, tasks)
+    graph_path.write_text(graph)
     if not ctx.named_by_user and ctx.tag and not ctx.fanout:
         proposed = f"stargate/{short_name(name)}-{ctx.tag}"
         ctx.branch = unique_branch(ctx.repo, proposed)
         print(f"Branch:   {ctx.branch}   (named by the architect)")
+        # Freeze the architect-selected parent before deriving task branches.
+        save_state(ctx, "running")
     if not ctx.fanout:
         ctx.fanout = _new_task_records(ctx, name, tasks)
-    if "architect" not in ctx.done:
+    if not architect_complete:
         complete_stage(ctx, "architect")
     return tasks, graph
 
