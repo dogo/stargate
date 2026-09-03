@@ -5,6 +5,7 @@ Run with: .venv/bin/python test_stargate.py
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import re
@@ -12,146 +13,27 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
+from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-
-
-def sh(cmd: str, cwd: Path) -> None:
-    subprocess.run(cmd, cwd=cwd, shell=True, check=True, capture_output=True)
-
-
-def git_output(repo: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=repo, text=True, capture_output=True, check=True
-    ).stdout.strip()
-
-
-def make_repo(root: Path) -> Path:
-    repo = root / "repo"
-    repo.mkdir()
-    sh(
-        "git init -q -b main && git config user.email t@t && "
-        "git config user.name t && git config commit.gpgsign false",
-        repo,
-    )
-    (repo / "app.py").write_text("x = 1\n")
-    sh("git add -A && git commit -qm init", repo)
-    return repo
-
-
-def agent(script: str) -> list[str]:
-    # `sh -c script <prompt>` puts the orchestrator's prompt in $0.
-    return ["/bin/sh", "-c", script]
-
-
-def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0,
-                 agent_timeout: int = 60, prompts_dir: str = "",
-                 test_command_detection: str | None = None,
-                 commit: bool | str | None = None,
-                 reviewer_args: tuple[str, ...] = ()) -> None:
-    import yaml
-    reviewer_command = agent(reviewer)
-    if reviewer_args:
-        # Preserve $0 for the shell while exposing configured argv from $1 on.
-        reviewer_command = [*reviewer_command, "_", *reviewer_args]
-    cfg = {
-        "agents": {
-            "noop": {"command": agent('printf "%s" "$0" > /dev/null; echo done')},
-            "dev": {"command": agent("echo change >> impl.txt; echo done")},
-            "reviewer": {"command": reviewer_command},
-        },
-        "workflow": {"architect": "noop", "developer": "dev",
-                     "reviewer": "reviewer", "fixer": "dev"},
-        "settings": {"max_review_loops": loops, "test_command": test_command,
-                     "agent_timeout_seconds": agent_timeout, "test_timeout_seconds": 30,
-                     "prompts_dir": prompts_dir},
-    }
-    if test_command_detection is not None:
-        cfg["settings"]["test_command_detection"] = test_command_detection
-    if commit is not None:
-        cfg["settings"]["commit"] = commit
-    path.write_text(yaml.safe_dump(cfg))
-
-
-def write_fanout_config(
-    path: Path,
-    graph: Path,
-    developer: str,
-    *,
-    reviewer: str = 'echo "VERDICT: APPROVED"',
-    architect_marker: Path | None = None,
-    max_parallel: int = 2,
-) -> None:
-    import yaml
-
-    marker = f"echo called >> {architect_marker}; " if architect_marker else ""
-    cfg = {
-        "agents": {
-            "arch": {"command": agent(f"{marker}cat {graph}")},
-            "dev": {"command": agent(developer)},
-            "rev": {"command": agent(reviewer)},
-        },
-        "workflow": {
-            "architect": "arch",
-            "developer": "dev",
-            "reviewer": "rev",
-            "fixer": "dev",
-        },
-        "settings": {
-            "max_review_loops": 0,
-            "test_command": "true",
-            "max_parallel_tasks": max_parallel,
-        },
-    }
-    path.write_text(yaml.safe_dump(cfg))
-
-
-def run(
-    repo: Path, config: Path, task: str = "demo task", *run_args: str
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "stargate", "--config", str(config), "run",
-         *run_args, task],
-        cwd=repo, text=True, capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
-    )
-
-
-def doctor(repo: Path, config: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "stargate", "--config", str(config),
-         "doctor", *args],
-        cwd=repo, text=True, capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
-    )
-
-
-def runs(repo: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "stargate", "list"],
-        cwd=repo, text=True, capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
-    )
-
-
-def clean(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "stargate", "clean", *args],
-        cwd=repo, text=True, capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
-    )
-
-
-def stargate(
-    repo: Path, *args: str, config_home: Path
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-m", "stargate", *args],
-        cwd=repo, text=True, capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT),
-             "XDG_CONFIG_HOME": str(config_home)},
-    )
+from tests.harness import (
+    ROOT,
+    agent,
+    clean,
+    doctor,
+    git_output,
+    make_repo,
+    recorded_branch_exists,
+    recorded_run,
+    run,
+    runs,
+    sh,
+    stargate,
+    write_config,
+    write_fanout_config,
+)
 
 
 def test_settings_only_project_config_is_valid(root: Path) -> None:
@@ -1140,34 +1022,6 @@ def test_list_runs_directory_read_error_is_an_error(root: Path) -> None:
         assert "Could not read recorded runs" in str(exc), exc
     else:
         raise AssertionError("an unreadable runs directory reported success")
-
-
-def recorded_run(repo: Path, run_id: str) -> tuple[Path, Path, str]:
-    branch = f"stargate/{run_id}"
-    worktree = repo.parent / "worktrees" / run_id
-    worktree.parent.mkdir(exist_ok=True)
-    subprocess.run(
-        ["git", "worktree", "add", "-q", "-b", branch, str(worktree)],
-        cwd=repo, check=True,
-    )
-    (worktree / f"{run_id}.txt").write_text("change\n")
-    sh("git add -A && git commit -qm change", worktree)
-    artifacts = repo / ".stargate" / "runs" / run_id
-    artifacts.mkdir(parents=True)
-    (artifacts / "state.json").write_text(json.dumps({
-        "run_id": run_id,
-        "repo": str(repo),
-        "branch": branch,
-        "worktree": str(worktree),
-    }))
-    return artifacts, worktree, branch
-
-
-def recorded_branch_exists(repo: Path, branch: str) -> bool:
-    return subprocess.run(
-        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-        cwd=repo,
-    ).returncode == 0
 
 
 def test_clean_one_refuses_unmerged_then_removes_the_merged_run(root: Path) -> None:
@@ -2397,81 +2251,65 @@ def test_fanout_sigterm_kills_agents_in_parallel_workers(root: Path) -> None:
     assert not finished.exists(), "a fan-out agent continued after termination"
 
 
-if __name__ == "__main__":
-    for fn in (test_settings_only_project_config_is_valid,
-               test_partial_user_config_inherits_packaged_defaults,
-               test_stale_remote_stops_before_agents_or_artifacts,
-               test_base_commit_is_frozen_before_the_architect,
-               test_blank_project_section_keeps_user_settings,
-               test_project_config_layers_over_user_config,
-               test_project_config_replaces_one_agent_only,
-               test_explicit_config_is_not_layered,
-               test_doctor_reports_config_provenance,
-               test_sigterm_records_a_terminal_status,
-               test_doctor_probe_is_opt_in_and_deduplicated,
-               test_doctor_probe_reports_cli_failure,
-               test_doctor_probe_rejects_empty_output_and_skips_missing_probe,
-               test_doctor_probe_reports_missing_git_without_crashing,
-               test_prose_mentioning_approved_is_not_an_approval,
-               test_reviewer_receives_test_output,
-               test_missing_verdict_is_an_error,
-               test_custom_prompts_dir_overrides_one_file,
-               test_output_placeholder_forwards_file_not_stdout,
-               test_output_placeholder_empty_file_is_an_error,
-               test_token_cap_stops_the_run,
-               test_no_cap_means_no_limit,
-               test_resume_reuses_plan_and_worktree,
-               test_literal_braces_in_a_prompt_survive,
-               test_prompts_are_frozen_into_the_run,
-               test_slow_agent_prints_a_heartbeat,
-               test_agent_env_sets_and_unsets,
-               test_probe_dedup_separates_agents_by_env,
-               test_env_values_are_never_printed,
-               test_hung_agent_times_out,
-               test_retry_recovers_a_transient_failure,
-               test_retries_exhausted_fails_exactly_like_today,
-               test_identical_failure_stops_retrying_early,
-               test_retry_counts_tokens_once_per_attempt,
-               test_no_retries_by_default,
-               test_list_runs_newest_first_and_marks_missing_worktree,
-               test_list_without_a_stargate_directory,
-               test_list_survives_a_corrupt_state_file,
-               test_list_outside_a_repository_is_an_error,
-               test_list_runs_directory_read_error_is_an_error,
-               test_clean_one_refuses_unmerged_then_removes_the_merged_run,
-               test_clean_all_removes_every_safe_run,
-               test_doctor_probe_verifies_the_capability_a_role_uses,
-               test_developer_that_changes_nothing_stops_the_run,
-               test_untracked_new_file_counts_as_work,
-               test_resume_redo_reruns_a_completed_stage,
-               test_fixer_that_changes_nothing_stops_the_review_loop,
-               test_detects_the_common_project_shapes,
-               test_detected_test_command_is_reported_not_run,
-               test_detection_auto_runs_the_top_candidate,
-               test_explicit_test_command_beats_detection,
-               test_detection_off_and_invalid_mode,
-               test_doctor_reports_the_detected_test_command,
-               test_test_command_grant_reaches_the_reviewer,
-               test_no_test_command_drops_the_grant_and_its_flag,
-               test_grant_matches_only_what_stargate_runs,
-               test_test_command_expansion_rules,
-               test_doctor_shows_and_probes_the_effective_grant,
-               test_architect_names_the_branch,
-               test_missing_or_malformed_name_falls_back,
-               test_name_option_and_same_second_uniqueness,
-               test_run_commits_on_its_own_branch,
-               test_commit_message_names_the_run_and_the_verdict,
-               test_unapproved_result_is_committed_and_labelled,
-               test_commit_can_be_disabled,
-               test_test_artifacts_are_not_committed,
-               test_resume_does_not_commit_twice,
-               test_commit_failure_is_explained_and_work_survives,
-               test_doctor_reports_the_commit_setting,
-               test_fanout_runs_ready_tasks_in_parallel_and_integrates_the_dag,
-               test_fanout_rejects_a_cyclic_graph_before_running_developers,
-               test_fanout_resume_keeps_completed_tasks_and_retries_failures,
-               test_fanout_sigterm_kills_agents_in_parallel_workers):
-        with tempfile.TemporaryDirectory() as tmp:
-            fn(Path(tmp))
-        print(f"ok  {fn.__name__}")
+TestFunction = Callable[[Path], None]
+
+
+def _discover_tests() -> tuple[list[tuple[str, TestFunction]], list[tuple[str, str]]]:
+    modules = [("test_stargate", sys.modules[__name__])]
+    import_failures: list[tuple[str, str]] = []
+    for path in sorted((ROOT / "tests").glob("test_*.py")):
+        module_name = f"tests.{path.stem}"
+        try:
+            modules.append((module_name, importlib.import_module(module_name)))
+        except Exception:
+            import_failures.append((module_name, traceback.format_exc()))
+
+    discovered = [
+        (module_name, name, value)
+        for module_name, module in modules
+        for name, value in vars(module).items()
+        if name.startswith("test_") and callable(value)
+    ]
+    name_counts = Counter(name for _, name, _ in discovered)
+    tests = [
+        (
+            name if name_counts[name] == 1 else f"{module_name}.{name}",
+            function,
+        )
+        for module_name, name, function in discovered
+    ]
+    return sorted(tests, key=lambda item: item[0]), import_failures
+
+
+def _run_tests() -> int:
+    tests, failures = _discover_tests()
+    failed_tests = 0
+    for name, function in tests:
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                function(Path(tmp))
+        except KeyboardInterrupt:
+            raise
+        except (Exception, SystemExit):
+            failed_tests += 1
+            failures.append((name, traceback.format_exc()))
+            print(f"not ok  {name}")
+        else:
+            print(f"ok  {name}")
+
+    if failures:
+        print("\nfailures:", file=sys.stderr)
+        for name, details in failures:
+            print(f"\n--- {name} ---\n{details.rstrip()}", file=sys.stderr)
+        print(
+            f"\n{len(failures)} failed, {len(tests) - failed_tests} passed",
+            file=sys.stderr,
+        )
+        return 1
+
     print("\nall good")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_run_tests())
