@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 
 from .config import (
     PROJECT_CONFIG,
+    commit_enabled,
     init_config,
     init_prompts,
     load_config,
@@ -18,6 +20,52 @@ from .core import StargateError, Terminated, repo_root, terminate_active_process
 from .doctor import doctor
 from .run import REDOABLE_STAGES, clean_runs, list_runs
 from .stages import orchestrate
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _validate_run_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Reject run-only flag combinations before reserving any run artifacts."""
+    if args.fan_out and args.no_commit:
+        parser.error("--no-commit cannot be combined with --fan-out")
+    if not args.fan_out and args.max_parallel_tasks is not None:
+        parser.error("--max-parallel-tasks requires --fan-out")
+
+
+def _saved_run_mode(repo: Path, run_id: str) -> str | None:
+    """Read enough state for flag validation; the run loader owns bad-state errors."""
+    state_path = repo / ".stargate" / "runs" / run_id / "state.json"
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict):
+        return None
+    return "fanout" if state.get("mode") == "fanout" else "linear"
+
+
+def _validate_resume_arguments(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    repo: Path,
+) -> None:
+    """Reject mode-specific resume flags when saved state identifies the mode."""
+    mode = _saved_run_mode(repo, args.run_id)
+    if mode == "fanout":
+        if args.redo:
+            parser.error("--redo is not supported for fan-out runs")
+        if args.no_commit:
+            parser.error("--no-commit is not supported for fan-out runs")
+    elif mode == "linear" and args.max_parallel_tasks is not None:
+        parser.error("--max-parallel-tasks is only supported for fan-out runs")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,7 +116,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--fan-out",
         action="store_true",
-        help="Split the task into a DAG and run ready tasks concurrently.",
+        help="Split the task into a DAG and run ready tasks concurrently. "
+        "Requires settings.commit: true and cannot be combined with --no-commit.",
     )
     run.add_argument(
         "--base-ref",
@@ -86,22 +135,32 @@ def build_parser() -> argparse.ArgumentParser:
         "resume",
         help="Continue a run that failed partway, reusing its plan, worktree, "
         "config and prompts.",
+        description="Continue a run that failed partway, reusing its saved state. "
+        "Fan-out mode is restored automatically; resume has no --fan-out switch.",
     )
     resume.add_argument("run_id", help="Run ID, as printed by the original run.")
     resume.add_argument(
         "--redo", action="append", default=[], choices=REDOABLE_STAGES,
         metavar="STAGE",
         help="Run this completed stage again instead of skipping it "
-        f"({', '.join(REDOABLE_STAGES)}). Repeatable.",
+        f"({', '.join(REDOABLE_STAGES)}). Repeatable. Linear runs only; "
+        "fan-out resumes reject this option.",
+    )
+
+    run.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="Leave a linear run's work uncommitted in its worktree. Cannot be "
+        "combined with --fan-out; that error is reported before a run is created.",
+    )
+    resume.add_argument(
+        "--no-commit",
+        action="store_true",
+        help="Leave a resumed linear run's work uncommitted in its worktree. "
+        "Fan-out resumes reject this option.",
     )
 
     for parser_ in (run, resume):
-        parser_.add_argument(
-            "--no-commit",
-            action="store_true",
-            help="Leave the run's work uncommitted in the worktree "
-            "(overrides settings.commit; incompatible with --fan-out).",
-        )
         parser_.add_argument(
             "--max-review-loops",
             type=int,
@@ -110,9 +169,15 @@ def build_parser() -> argparse.ArgumentParser:
         )
         parser_.add_argument(
             "--max-parallel-tasks",
-            type=int,
+            type=_positive_int,
             default=None,
-            help="Override settings.max_parallel_tasks for a fan-out run.",
+            help=(
+                "Override settings.max_parallel_tasks. Requires --fan-out; linear "
+                "runs reject this option."
+                if parser_ is run
+                else "Override settings.max_parallel_tasks when resuming a fan-out "
+                "run; linear resumes reject this option."
+            ),
         )
     return parser
 
@@ -140,6 +205,9 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.command == "run":
+        _validate_run_arguments(parser, args)
+
     if args.command == "init-config":
         return init_config(script_dir)
     if args.command == "init-prompts":
@@ -149,6 +217,9 @@ def main() -> int:
         if args.command in ("run", "resume"):
             # The shared handler also kills agents owned by fan-out workers.
             install_signal_handlers()
+
+        if args.command == "resume":
+            _validate_resume_arguments(parser, args, repo_root(Path.cwd()))
 
         if args.command in ("list", "runs"):
             return list_runs(repo_root(Path.cwd()))
@@ -166,6 +237,14 @@ def main() -> int:
                 explicit_config=args.config is not None,
             )
         if args.command in ("run", "resume"):
+            if (
+                args.command == "run"
+                and args.fan_out
+                and not commit_enabled(config)
+            ):
+                raise StargateError(
+                    "Fan-out requires settings.commit: true; no run was created."
+                )
             return orchestrate(args, script_dir, config)
         parser.error("Unknown command")
         return 2

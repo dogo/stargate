@@ -44,15 +44,17 @@ the architect and reviewer and Codex for the developer and fixer; the
 [`examples/`](examples/) directory includes verified single-vendor
 configurations for all three CLIs and documents the differences between them.
 
-Every terminal result with changes is committed on the run's own branch,
+Every linear terminal result with changes is committed on the run's own branch,
 including a reviewer that still requests changes, a failing test command, or a
-token-budget stop. The verdict is part of the commit message. A run that
-crashes does not commit; `resume` does so when the run eventually reaches a
-terminal result.
+token-budget stop. A fan-out run also commits each completed task and its final
+integration verdict. The verdict is part of the commit message. A run that
+crashes does not create a terminal commit; `resume` does so when the run
+eventually reaches a verdict. A fan-out token-budget stop before integration is
+the exception: it is resumable but has no terminal commit yet.
 
-The orchestrator never merges, rebases, pushes, deletes the worktree, or
-touches the branch checked out in the user's original repository. The agents
-themselves remain forbidden to commit.
+The orchestrator never merges into or otherwise changes the branch checked out
+in the user's original repository, and it never rebases, pushes, or deletes a
+worktree during a run. The agents themselves remain forbidden to commit.
 
 ## Requirements
 
@@ -128,10 +130,10 @@ Everything under `settings:` in the layered effective config. All are optional.
 |---|---|---|
 | `test_command` | `""` | Shell command run in the worktree after the developer and after every fixer pass. The same effective command is available to agent commands through `{test_command}`, which the packaged reviewer uses so it can verify the suite. An explicit value always wins over detection. |
 | `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
-| `commit` | `true` | Commit a terminal result on the run's own branch. Set to `false`, or pass `--no-commit` to `run` or `resume`, to leave the worktree dirty as older versions did. |
+| `commit` | `true` | Commit results on the run's own branch. Linear runs can set this to `false`, or pass `--no-commit`, to leave the worktree dirty. Fan-out requires `true` and rejects `--no-commit`. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
 | `max_fanout_tasks` | `8` | Maximum number of DAG nodes the fan-out architect may return. |
-| `max_parallel_tasks` | `2` | Maximum ready fan-out tasks run concurrently. Overridable per run with `--max-parallel-tasks`. |
+| `max_parallel_tasks` | `2` | Maximum ready fan-out tasks run concurrently. Overridable for fan-out runs and resumes with `--max-parallel-tasks`; linear invocations reject that flag. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
 | `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
 | `agent_retries` | `0` | Retries after a failed agent invocation. `0` preserves the single-attempt behavior; `2` allows up to three attempts. |
@@ -149,10 +151,10 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 | code | meaning |
 |---|---|
 | `0` | Approved, and the test command passed or no command ran (`report`, `off`, or no match). |
-| `1` | The run failed — an agent errored, timed out, or config was invalid. `resume` is offered. |
-| `2` | The reviewer still requested changes after the last allowed fixer pass, or the fixer changed nothing and the loop stopped early. |
+| `1` | An agent errored or timed out, configuration was invalid, or another operational error stopped the command. `resume` is offered when a run was already created. |
+| `2` | The CLI arguments were invalid, the reviewer still requested changes after the last allowed fixer pass, or the fixer changed nothing and the loop stopped early. |
 | `3` | Approved, but the explicit test command or an `auto`-detected command failed. |
-| `4` | `max_task_tokens` was reached; the run stopped between phases. |
+| `4` | `max_task_tokens` was reached; the run stopped between phases. A linear stop goes through the normal RESULT/summary/commit path. A fan-out stop before integration records resumable state and returns immediately, without a RESULT block, `summary.md`, or terminal commit. |
 | `5` | The run reached a verdict, but Git could not create its commit. The work remains intact and staged where possible; the error prints a manual recovery command. |
 | `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
 | `130` | The run was interrupted with Ctrl-C/SIGINT. Its state is recorded as failed and `resume` is offered. |
@@ -172,10 +174,10 @@ stargate doctor
 ```
 
 It prints the numbered config layers and provenance of the effective settings
-and agents, each role's resolved command, the prompt file each role would use,
-and the configured or detected project test commands with their evidence. It
-makes no external calls, so `FOUND` means only that the executable is on `PATH`
-— see
+and agents, each role's resolved command, all five resolved prompt files
+(including `fanout.md`), and the configured or detected project test commands
+with their evidence. It makes no external calls, so `FOUND` means only that the
+executable is on `PATH` — see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
 
 ## Probing agents
@@ -280,9 +282,10 @@ stargate run --fan-out --max-parallel-tasks 3 \
 ```
 
 The architect returns a validated `tasks.json` instead of a prose plan. Each
-node has an ID, a self-contained task, acceptance criteria, and `depends_on`
-edges. Stargate rejects duplicate IDs, unknown dependencies, cycles, malformed
-JSON, and graphs larger than `max_fanout_tasks` before a developer starts.
+node has an ID and a self-contained task; `acceptance` and `depends_on` are
+optional lists. Stargate rejects duplicate or malformed IDs, unknown, duplicate
+or self-dependencies, cycles, malformed JSON, and graphs larger than
+`max_fanout_tasks` before a developer starts.
 
 Ready nodes run concurrently, each on its own branch and worktree. A dependent
 node starts from the commits produced by its dependencies, so it sees their
@@ -293,9 +296,13 @@ combined tree.
 
 Fan-out requires `commit: true`: commits are the protocol that moves work
 between isolated worktrees, even though nothing is merged into the user's
-original branch or pushed. `resume` reuses `tasks.json` and every completed task
-commit, retrying only unfinished or failed nodes. The effective parallelism can
-be changed when resuming with `--max-parallel-tasks`.
+original branch or pushed. `--no-commit` is rejected before a new run is
+created. `resume` restores fan-out mode from `state.json`; it reuses the frozen
+config and prompts, `tasks.json`, task branches/worktrees and every completed
+task commit, plus the integration branch/worktree if they were already created.
+Only unfinished or failed nodes are retried. The effective parallelism can be
+changed when resuming with `--max-parallel-tasks`; `--redo` is not supported for
+fan-out resumes.
 
 The contract produced by the architect is:
 
@@ -341,10 +348,11 @@ not move. A follow-up can branch directly from it:
 stargate run --base-ref stargate/passkey-auth-20260830-181500 "Add recovery codes"
 ```
 
-The packaged architect prompt asks for a `NAME:` first line. Stargate strips a
-valid line before forwarding the plan to the developer, reviewer, and fixer. A
-custom/older prompt that omits it, or a malformed name, safely falls back to the
-task slug and leaves the plan untouched.
+For a linear run, the packaged architect prompt asks for a `NAME:` first line.
+Stargate strips a valid line before forwarding the plan to the developer,
+reviewer, and fixer. A custom/older prompt that omits it, or a malformed name,
+safely falls back to the task slug and leaves the plan untouched. The fan-out
+prompt carries the corresponding name in the top-level JSON `name` field.
 
 The run ID and artifacts directory must exist before the architect runs, so an
 architect suggestion renames the branch only. Use `--name "passkey auth"` when
@@ -384,8 +392,33 @@ my-project/.stargate/runs/<run-id>/
 ```
 
 A fan-out run additionally stores `tasks.json` and one `tasks/<id>/` artifact
-directory per node. Its integration worktree uses the normal run path; task
-worktrees sit beside it with the task ID appended.
+directory per node. Each task branch is normally `<run-branch>-<task-id>` (with
+a numeric suffix if that branch already exists).
+The integration worktree uses the normal run path. Each task worktree is its
+sibling at `<run-worktree-parent>/<run-id>-<task-id>`.
+
+The tree above shows the linear stage filenames. Fan-out uses
+`architect-tasks.json` and `tasks.json` in place of `plan.md`, then records each
+task separately:
+
+```text
+my-project/.stargate/runs/<run-id>/
+├── architect-tasks.json      # architect's raw final response
+├── architect-tasks.json.log  # architect's full trace
+├── tasks.json                # validated, normalized DAG reused by resume
+└── tasks/
+    └── <id>/
+        ├── developer.txt
+        ├── developer.txt.log
+        ├── state.json
+        ├── tests-task.txt     # when a test command runs
+        ├── commit-message.txt # when the task commit is attempted
+        └── result.json        # after successful task completion
+```
+
+Integration tests, reviews, fixes, the terminal commit message and `summary.md`
+remain at the run-artifact root. A fan-out budget stop before integration does
+not create `summary.md`; resume continues from the saved task state.
 
 Each role prints its `.log` path before starting, so it can be followed with
 `tail -f`, and its exit code and duration when it ends. While an agent runs it
@@ -488,8 +521,8 @@ settings:
 
 ## Customize prompts
 
-The five packaged prompts are what you actually tune: four role prompts plus
-the fan-out architect contract. Copy them somewhere writable:
+The version 5 packaged configuration includes five prompts to tune: four role
+prompts plus the fan-out architect contract. Copy them somewhere writable:
 
 ```bash
 stargate init-prompts        # writes ~/.config/stargate/prompts/*.md
@@ -600,21 +633,25 @@ Committing is on by default. This changes older behavior deliberately: a
 default-off feature would leave every user who did not discover the setting
 with the same manual branching and committing step, while completed work would
 still exist only in a removable worktree. The scope of the mutation stays
-narrow: Git advances only the run branch inside the run worktree. Use
-`settings.commit: false` or `--no-commit` when that tradeoff is not wanted.
+narrow: Git advances only Stargate-created branches inside Stargate worktrees.
+For a linear run, use `settings.commit: false` or `--no-commit` when that
+tradeoff is not wanted. Fan-out requires commits and rejects both configurations.
 
-Stargate commits only after a terminal verdict, never after individual fixer
-passes. A normal run therefore produces one commit. A resume of already
-committed work finds an empty index and produces no second commit; a later
-`--redo` that genuinely adds work can produce a new terminal commit. Empty
-commits are never created.
+The linear workflow commits only after a terminal verdict, never after
+individual fixer passes, and therefore normally produces one commit. A resume
+of already committed work finds an empty index and produces no second commit; a
+later `--redo` that genuinely adds work can produce a new terminal commit.
+Empty commits are not created in the linear workflow. Fan-out commits completed
+tasks, merges those commits into the integration branch, then records the
+integration verdict in a terminal commit; that final commit can be empty when
+the merges already contain every file change.
 
-Red outcomes are durable too. `CHANGES_REQUESTED`, a failed test command and
-`BUDGET_EXCEEDED` are recorded in the subject and
-`Stargate-Verdict` trailer rather than being presented as success. Crashes,
-agent errors, invalid reviewer output and catchable signals do not reach the
-finish path, so they remain uncommitted until a successful `resume` reaches a
-verdict.
+Red outcomes that reach the finish path are durable too. `CHANGES_REQUESTED`, a
+failed test command and a linear `BUDGET_EXCEEDED` are recorded in the subject
+and `Stargate-Verdict` trailer rather than being presented as success. A fan-out
+budget stop before integration, crashes, agent errors, invalid reviewer output
+and catchable signals do not reach that path, so they have no terminal commit
+until a successful `resume` reaches a verdict.
 
 The commit stages tracked edits and deletions plus new untracked implementation
 files. Gitignored files remain ignored. Stargate also snapshots untracked
@@ -724,10 +761,11 @@ upgrade removes the install mid-run — the run stops and prints:
 Resume with: stargate resume 20260831-101304-add-passkey-authentication
 ```
 
-`resume` reuses the plan, branch, worktree, frozen config and frozen prompts,
-and skips the stages already marked complete. It does not produce a second
-plan, branch or worktree. A developer that exited successfully but changed
-nothing is deliberately not marked complete, so plain `resume` reruns it.
+For a linear run, `resume` reuses the plan, branch, worktree, frozen config and
+frozen prompts, and skips the stages already marked complete. It does not
+produce a second plan, branch or worktree. A developer that exited successfully
+but changed nothing is deliberately not marked complete, so plain `resume`
+reruns it. Fan-out reuse is described in [Fan-out](#fan-out).
 Untracked test-artifact exclusions are stored in `state.json`, so output
 created before a crash remains excluded when a later process resumes. If a
 previous invocation already committed and no new work was added, the resumed
@@ -741,14 +779,15 @@ override that, which is how you resume past a broken agent definition:
 stargate --config ./fixed.yaml resume <run-id>
 ```
 
-To rerun a stage that was already recorded as complete, use the supported
+To rerun a linear stage that was already recorded as complete, use the supported
 `--redo` option instead of editing `state.json`:
 
 ```bash
 stargate resume <run-id> --redo developer
 ```
 
-`--redo` accepts `architect` or `developer` and is repeatable. Redoing only the
+For linear runs, `--redo` accepts `architect` or `developer` and is repeatable.
+Fan-out resumes reject it. Redoing only the
 architect leaves the developer marked complete, which means the new plan would
 not be implemented; stargate warns in that case, and you can pass both
 `--redo architect --redo developer`.
