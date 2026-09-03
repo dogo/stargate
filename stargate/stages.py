@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .agent import invoke_agent
-from .commit import commit_run, commit_summary
+from .commit import commit_run, commit_summary, terminal_commit_at_head
 from .config import (
     commit_enabled,
     prompt_dirs,
@@ -159,10 +159,18 @@ def finish(
     commit: bool,
 ) -> int:
     if commit:
-        needs_terminal_commit = (
-            ctx.mode == "fanout"
-            and ctx.fanout.get("terminal_verdict") != verdict
-        )
+        needs_terminal_commit = False
+        if ctx.mode == "fanout":
+            terminal_commit = str(ctx.fanout.get("terminal_commit") or "")
+            terminal_verdict = str(ctx.fanout.get("terminal_verdict") or "")
+            if terminal_verdict != verdict or not terminal_commit:
+                recovered = terminal_commit_at_head(ctx, verdict)
+                if recovered:
+                    ctx.commit = recovered
+                    ctx.fanout["terminal_commit"] = recovered
+                    ctx.fanout["terminal_verdict"] = verdict
+                else:
+                    needs_terminal_commit = True
         commit_outcome = commit_run(
             ctx, verdict, test_exit, allow_empty=needs_terminal_commit
         )
@@ -183,6 +191,8 @@ def finish(
     print(f"Branch:    {ctx.branch}")
     print(f"Commit:    {commit_summary(ctx, commit)}")
     print(f"Worktree:  {ctx.worktree}")
+    if ctx.mode == "fanout":
+        print("Review/fix: integration worktree only")
     print(f"Artifacts: {ctx.artifacts}")
     if ctx.tokens_used:
         cap = token_cap(ctx.config)
@@ -190,8 +200,11 @@ def finish(
     if ctx.commit:
         if ctx.mode == "fanout":
             print(
-                "\nTask branches were merged only into the Stargate integration "
-                "branch.\nNothing was merged into your original branch, pushed, "
+                "\nFinal review and fixer passes ran only on the Stargate "
+                "integration branch; fixer edits were not copied back to task "
+                "branches.\nTask branches were merged only into the Stargate "
+                "integration branch.\nNothing was merged into your original "
+                "branch, pushed, "
                 "or deleted automatically."
             )
         else:
@@ -230,10 +243,27 @@ def write_summary(
     test_exit: int | None,
     commit: bool,
 ) -> None:
-    status = git(ctx.worktree, "status", "--short").stdout
-    diff_stat = git(ctx.worktree, "diff", "--stat", ctx.base_commit).stdout
+    if ctx.worktree.exists():
+        try:
+            status = git(ctx.worktree, "status", "--short").stdout
+            diff_stat = git(
+                ctx.worktree, "diff", "--stat", ctx.base_commit
+            ).stdout
+        except StargateError as exc:
+            status = f"(Git status unavailable: {exc})"
+            diff_stat = "(Git diff unavailable)"
+    else:
+        status = "(integration worktree not created)"
+        diff_stat = "(integration worktree not created)"
     cap = token_cap(ctx.config)
     tokens = f"{ctx.tokens_used:,}" + (f" of {cap:,}" if cap else "")
+    fanout_details = ""
+    if ctx.mode == "fanout":
+        fanout_details = (
+            "Mode: fan-out\n"
+            "Review/fixer scope: integration worktree only; fixer edits are "
+            "not copied back to task branches.\n"
+        )
     summary = f"""# stargate run
 
 Task: {task}
@@ -243,7 +273,7 @@ Base commit: {ctx.base_commit}
 Branch: {ctx.branch}
 Commit: {commit_summary(ctx, commit)}
 Worktree: {ctx.worktree}
-Verdict: {verdict}
+{fanout_details}Verdict: {verdict}
 Test command: {ctx.test_command or "(none)"} ({ctx.test_source})
 Test exit: {test_exit}
 Tokens reported: {tokens}
@@ -257,19 +287,132 @@ Tokens reported: {tokens}
 {diff_stat or "(no tracked diff)"}
 """
     if ctx.mode == "fanout":
-        records = ctx.fanout.get("tasks", {})
-        lines = ["\n## fan-out tasks\n", "| task | status | tests | commit |", "|---|---|---:|---|"]
+        saved_records = ctx.fanout.get("tasks", {})
+        records = saved_records if isinstance(saved_records, dict) else {}
+        lines = [
+            "\n## fan-out tasks\n",
+            "| task | status | tests | tokens | commit | error |",
+            "|---|---|---:|---:|---|---|",
+        ]
         for task_id in ctx.fanout.get("order", []):
-            record = records.get(task_id, {})
+            saved_record = records.get(task_id)
+            if not isinstance(saved_record, dict):
+                lines.append(
+                    f"| {_summary_cell(task_id)} | missing | not run | - | - | "
+                    "Task record is missing from state.json. |"
+                )
+                continue
+            record = saved_record
             test_exit_value = record.get("test_exit")
             tests = "not run" if test_exit_value is None else str(test_exit_value)
+            reported = _summary_tokens(record.get("tokens_used"))
             task_commit = str(record.get("commit") or "")
+            error = str(record.get("error") or "-")
             lines.append(
-                f"| {task_id} | {record.get('status', 'unknown')} | {tests} | "
-                f"{task_commit[:12] or '-'} |"
+                f"| {_summary_cell(task_id)} | "
+                f"{_summary_cell(record.get('status', 'unknown'))} | "
+                f"{_summary_cell(tests)} | {_summary_cell(reported)} | "
+                f"{_summary_cell(task_commit[:12] or '-')} | "
+                f"{_summary_cell(error)} |"
             )
         summary += "\n".join(lines) + "\n"
     (ctx.artifacts / "summary.md").write_text(summary)
+
+
+def _summary_cell(value: object) -> str:
+    """Keep persisted diagnostic text inside one Markdown table cell."""
+    return str(value).replace("|", "\\|").replace("\r\n", "\n").replace(
+        "\n", "<br>"
+    )
+
+
+def _summary_tokens(value: object) -> str:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"{value:,}"
+    return "-" if value is None else str(value)
+
+
+def _resume_context(
+    repo: Path,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+) -> RunContext:
+    """Load resume state once mode has been validated for safe dispatch."""
+    state_path = repo / ".stargate" / "runs" / args.run_id / "state.json"
+    if not state_path.exists():
+        raise StargateError(f"No run state at {state_path}")
+    try:
+        state = json.loads(state_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise StargateError(
+            f"Cannot resume {args.run_id}: unreadable state.json ({exc})"
+        ) from exc
+    if not isinstance(state, dict):
+        raise StargateError(
+            f"Cannot resume {args.run_id}: state.json is not a JSON object."
+        )
+    mode = state.get("mode")
+    if mode not in ("linear", "fanout"):
+        raise StargateError(
+            f"Cannot resume {args.run_id}: state.json has no valid mode "
+            "(expected 'linear' or 'fanout')."
+        )
+    try:
+        return load_run(
+            repo, args.run_id, config, use_frozen=args.config is None
+        )
+    except (OSError, TypeError, ValueError, KeyError) as exc:
+        raise StargateError(
+            f"Cannot resume {args.run_id}: invalid state.json ({exc})"
+        ) from exc
+
+
+def _recorded_run_ids(repo: Path) -> set[str]:
+    run_root = repo / ".stargate" / "runs"
+    if not run_root.is_dir():
+        return set()
+    try:
+        return {path.name for path in run_root.iterdir() if path.is_dir()}
+    except OSError:
+        return set()
+
+
+def _failed_fanout_context(
+    repo: Path,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    previous_runs: set[str],
+) -> RunContext | None:
+    if args.command == "resume":
+        run_ids = [args.run_id]
+    else:
+        run_ids = sorted(_recorded_run_ids(repo) - previous_runs)
+    contexts: list[RunContext] = []
+    for run_id in run_ids:
+        try:
+            candidate = load_run(repo, run_id, config, use_frozen=False)
+        except (StargateError, OSError, TypeError, ValueError, KeyError):
+            continue
+        if candidate.mode == "fanout" and candidate.task == getattr(args, "task", candidate.task):
+            contexts.append(candidate)
+    # Never guess between concurrent same-task runs in the same repository.
+    return contexts[0] if len(contexts) == 1 else None
+
+
+def _write_failed_fanout_summary(
+    repo: Path,
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    previous_runs: set[str],
+) -> None:
+    ctx = _failed_fanout_context(repo, args, config, previous_runs)
+    if ctx is None:
+        return
+    try:
+        write_summary(ctx, ctx.task, "FAILED", None, True)
+    except (StargateError, OSError, TypeError, ValueError, KeyError):
+        # The original orchestration failure remains the actionable error.
+        return
 
 
 def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, Any]) -> int:
@@ -277,21 +420,22 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     resuming = args.command == "resume"
 
     fanout = bool(getattr(args, "fan_out", False))
+    ctx = None
     if resuming:
-        state_path = repo / ".stargate" / "runs" / args.run_id / "state.json"
-        if state_path.exists():
-            try:
-                fanout = json.loads(state_path.read_text()).get("mode") == "fanout"
-            except (OSError, ValueError):
-                # load_run below owns the detailed error path for malformed state.
-                pass
+        ctx = _resume_context(repo, args, config)
+        fanout = ctx.mode == "fanout"
     if fanout:
         from .fanout import orchestrate_fanout
 
-        return orchestrate_fanout(args, script_dir, config, repo)
+        previous_runs = _recorded_run_ids(repo)
+        try:
+            return orchestrate_fanout(args, script_dir, config, repo)
+        except StargateError:
+            _write_failed_fanout_summary(repo, args, config, previous_runs)
+            raise
 
     if resuming:
-        ctx = load_run(repo, args.run_id, config, use_frozen=args.config is None)
+        assert ctx is not None
         prompts = [ctx.artifacts / "prompts"]
         print(f"\nResuming {ctx.run_id}: {ctx.task}")
         if redo := set(args.redo):
