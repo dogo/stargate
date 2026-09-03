@@ -1,4 +1,4 @@
-version: 4
+version: 5
 
 # claude -p --output-format text already prints only the final message, so the
 # Claude roles need no {output} placeholder.
@@ -92,6 +92,13 @@ workflow:
 
 settings:
   max_review_loops: 2
+
+  # Fan-out is opt-in with `stargate run --fan-out`. The architect may create
+  # at most this many DAG nodes, and no more than this many ready nodes run at
+  # once. Parallel agents may overshoot max_task_tokens together before the
+  # scheduler gets control back.
+  max_fanout_tasks: 8
+  max_parallel_tasks: 2
 
   # Empty means: don't run a test command automatically or grant it to an
   # agent command that declares {test_command}.

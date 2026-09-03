@@ -14,7 +14,7 @@ from .config import (
     load_config,
     resolve_config,
 )
-from .core import StargateError, Terminated, repo_root
+from .core import StargateError, Terminated, repo_root, terminate_active_processes
 from .doctor import doctor
 from .run import REDOABLE_STAGES, clean_runs, list_runs
 from .stages import orchestrate
@@ -23,7 +23,7 @@ from .stages import orchestrate
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stargate",
-        description="Tiny Claude Code + Codex CLI multi-agent orchestrator.",
+        description="Tiny vendor-agnostic multi-agent orchestrator.",
     )
     parser.add_argument(
         "--config",
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="List the runs recorded in this repository, newest first."
     )
     clean = sub.add_parser(
-        "clean", help="Remove a run's merged branch, clean worktree and artifacts."
+        "clean", help="Remove a run's merged branches, clean worktrees and artifacts."
     )
     clean.add_argument("run_id", nargs="?", help="Run ID shown by 'stargate list'.")
     clean.add_argument(
@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Plan, implement, review and fix a task.")
     run.add_argument("task", help="Feature/bug/task description.")
+    run.add_argument(
+        "--fan-out",
+        action="store_true",
+        help="Split the task into a DAG and run ready tasks concurrently.",
+    )
     run.add_argument(
         "--base-ref",
         default=None,
@@ -95,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--no-commit",
             action="store_true",
             help="Leave the run's work uncommitted in the worktree "
-            "(overrides settings.commit).",
+            "(overrides settings.commit; incompatible with --fan-out).",
         )
         parser_.add_argument(
             "--max-review-loops",
@@ -103,13 +108,19 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Override settings.max_review_loops.",
         )
+        parser_.add_argument(
+            "--max-parallel-tasks",
+            type=int,
+            default=None,
+            help="Override settings.max_parallel_tasks for a fan-out run.",
+        )
     return parser
 
 
 def install_signal_handlers() -> None:
     """Turn catchable termination into the existing resumable failure path."""
     handled = [
-        signum for name in ("SIGTERM", "SIGHUP")
+        signum for name in ("SIGINT", "SIGTERM", "SIGHUP")
         if (signum := getattr(signal, name, None)) is not None
     ]
 
@@ -117,6 +128,7 @@ def install_signal_handlers() -> None:
         # One shot lets a second signal terminate even if cleanup gets stuck.
         for handled_signum in handled:
             signal.signal(handled_signum, signal.SIG_DFL)
+        terminate_active_processes()
         raise Terminated(signum)
 
     for signum in handled:
@@ -135,8 +147,7 @@ def main() -> int:
 
     try:
         if args.command in ("run", "resume"):
-            # SIGINT already becomes KeyboardInterrupt; replacing it would add
-            # a second path for an interrupt that is already recorded safely.
+            # The shared handler also kills agents owned by fan-out workers.
             install_signal_handlers()
 
         if args.command in ("list", "runs"):

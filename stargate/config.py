@@ -19,6 +19,9 @@ PROJECT_CONFIG = ".stargate.yaml"
 ROLES = ("architect", "developer", "reviewer", "fixer")
 
 
+PROMPTS = (*ROLES, "fanout")
+
+
 def user_config() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME") or "~/.config"
     return Path(os.path.expanduser(base)) / "stargate" / "agents.yaml"
@@ -43,7 +46,7 @@ def resolve_config(arg: str | None, script_dir: Path) -> list[Path]:
 def init_prompts(script_dir: Path) -> int:
     target = user_config().parent / "prompts"
     target.mkdir(parents=True, exist_ok=True)
-    for name in ROLES:
+    for name in PROMPTS:
         dest = target / f"{name}.md"
         if dest.exists():
             print(f"kept    {dest}")

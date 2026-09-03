@@ -16,7 +16,7 @@ from .config import (
     retry_settings,
     token_cap,
 )
-from .core import RunContext, StargateError, run_process
+from .core import RunContext, StargateError, run_process, termination_requested
 
 FINGERPRINT_LINES = 20
 
@@ -106,6 +106,8 @@ def invoke_agent(
                 f"Could not start the agent for role '{role}': {exc}"
             ) from exc
         except StargateError as exc:
+            if termination_requested():
+                raise
             if retries:
                 trace = log_path.read_text() if log_path.exists() else ""
                 record_usage(ctx, role, trace)

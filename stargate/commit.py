@@ -95,7 +95,13 @@ def commit_failure(ctx: RunContext, reason: str, output: str = "") -> None:
     print(f"\n{message}", file=sys.stderr)
 
 
-def commit_run(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
+def commit_run(
+    ctx: RunContext,
+    verdict: str,
+    test_exit: int | None,
+    *,
+    allow_empty: bool = False,
+) -> str:
     """Make at most one commit after the run reaches a terminal verdict.
 
     Red results are committed too: they are the results most in need of a
@@ -120,14 +126,20 @@ def commit_run(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
     except StargateError as exc:
         commit_failure(ctx, f"staging failed: {exc}")
         return "failed"
-    if not changed:
+    if not changed and not allow_empty:
         return "empty"
 
     message_path = ctx.artifacts / "commit-message.txt"
     message_path.write_text(commit_message(ctx, verdict, test_exit))
     try:
         proc = run_process(
-            ["git", "commit", "-F", str(message_path)],
+            [
+                "git",
+                "commit",
+                *(("--allow-empty",) if allow_empty else ()),
+                "-F",
+                str(message_path),
+            ],
             ctx.worktree,
             check=False,
             timeout=COMMIT_TIMEOUT_SECONDS,

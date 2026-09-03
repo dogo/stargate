@@ -130,6 +130,8 @@ Everything under `settings:` in the layered effective config. All are optional.
 | `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
 | `commit` | `true` | Commit a terminal result on the run's own branch. Set to `false`, or pass `--no-commit` to `run` or `resume`, to leave the worktree dirty as older versions did. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
+| `max_fanout_tasks` | `8` | Maximum number of DAG nodes the fan-out architect may return. |
+| `max_parallel_tasks` | `2` | Maximum ready fan-out tasks run concurrently. Overridable per run with `--max-parallel-tasks`. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
 | `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
 | `agent_retries` | `0` | Retries after a failed agent invocation. `0` preserves the single-attempt behavior; `2` allows up to three attempts. |
@@ -267,6 +269,61 @@ stargate run --name "passkey auth" "Add passkey authentication to account settin
 `--name` takes precedence over the architect's suggestion and uses at most five
 whole words (32 characters), never a word truncated in the middle.
 
+## Fan-out
+
+Use `--fan-out` when one request contains work that can be split across
+independent branches:
+
+```bash
+stargate run --fan-out --max-parallel-tasks 3 \
+  "Add passkey authentication across the backend, frontend, and docs"
+```
+
+The architect returns a validated `tasks.json` instead of a prose plan. Each
+node has an ID, a self-contained task, acceptance criteria, and `depends_on`
+edges. Stargate rejects duplicate IDs, unknown dependencies, cycles, malformed
+JSON, and graphs larger than `max_fanout_tasks` before a developer starts.
+
+Ready nodes run concurrently, each on its own branch and worktree. A dependent
+node starts from the commits produced by its dependencies, so it sees their
+files rather than merely waiting for them. Completed nodes are committed by the
+orchestrator, merged in topological order into the run's integration branch,
+tested together, and passed through the normal reviewer/fixer loop as one
+combined tree.
+
+Fan-out requires `commit: true`: commits are the protocol that moves work
+between isolated worktrees, even though nothing is merged into the user's
+original branch or pushed. `resume` reuses `tasks.json` and every completed task
+commit, retrying only unfinished or failed nodes. The effective parallelism can
+be changed when resuming with `--max-parallel-tasks`.
+
+The contract produced by the architect is:
+
+```json
+{
+  "name": "passkey authentication",
+  "tasks": [
+    {
+      "id": "api-contract",
+      "task": "Define the passkey data model and API contract.",
+      "depends_on": [],
+      "acceptance": ["Request and response shapes are documented"]
+    },
+    {
+      "id": "backend",
+      "task": "Implement the passkey endpoints and focused tests.",
+      "depends_on": ["api-contract"],
+      "acceptance": ["Registration and authentication tests pass"]
+    }
+  ]
+}
+```
+
+Tasks that modify the same files should be joined by a dependency or kept as
+one node. Git conflicts during dependency preparation or final integration stop
+the run without merging into the original checkout; fix the task split or the
+preserved branch, then resume.
+
 ## What gets created
 
 Suppose the architect names the work `passkey auth`. The implementation gets a
@@ -313,7 +370,7 @@ Run artifacts are stored under the target repo:
 my-project/.stargate/runs/<run-id>/
 ├── state.json         # stage, status, commit, exclusions -- what `resume` reads
 ├── config.yaml        # the fully merged effective config, frozen at run start
-├── prompts/           # the four prompts, frozen at run start
+├── prompts/           # role and fan-out prompts, frozen at run start
 ├── plan.md
 ├── plan.md.log        # the agent's full trace, written live
 ├── plan.md.attempt-2.log  # later attempts keep separate traces
@@ -325,6 +382,10 @@ my-project/.stargate/runs/<run-id>/
 ├── commit-message.txt # exact traceable message passed to Git, if attempted
 └── summary.md
 ```
+
+A fan-out run additionally stores `tasks.json` and one `tasks/<id>/` artifact
+directory per node. Its integration worktree uses the normal run path; task
+worktrees sit beside it with the task ID appended.
 
 Each role prints its `.log` path before starting, so it can be followed with
 `tail -f`, and its exit code and duration when it ends. While an agent runs it
@@ -427,7 +488,8 @@ settings:
 
 ## Customize prompts
 
-The four prompts are what you actually tune. Copy them somewhere writable:
+The five packaged prompts are what you actually tune: four role prompts plus
+the fan-out architect contract. Copy them somewhere writable:
 
 ```bash
 stargate init-prompts        # writes ~/.config/stargate/prompts/*.md
@@ -440,13 +502,17 @@ wins:
 2. `~/.config/stargate/prompts/`
 3. the prompts packaged with the install
 
-So keeping only a custom `reviewer.md` leaves the other three on the defaults.
-`stargate doctor` prints the file each role resolved to.
+So keeping only a custom `reviewer.md` leaves the other four on the defaults.
+`stargate doctor` prints the file each prompt resolved to.
 
 The packaged `architect.md` also asks the architect to begin its response with
 `NAME: <two to four words>`. Stargate treats that line as optional for custom
 and frozen prompts: only a valid first non-empty `NAME:` line is removed, and
 the rest of the plan is forwarded unchanged.
+
+`fanout.md` is separate because its output is machine-readable. It requires a
+bare JSON object and receives `{max_tasks}` in addition to the task and base
+ref; malformed output stops before any implementation work starts.
 
 Prompts committed with a project:
 
@@ -461,7 +527,8 @@ Two things the prompt templates have to respect:
 - Only known placeholders are substituted, by literal replacement: `{task}` and
   `{base_ref}` everywhere, plus `{plan}` (developer, reviewer, fixer),
   `{tests}` (reviewer, fixer) and `{review}` (fixer). Every other brace is left
-  alone, so a prompt may contain JSON, CSS or an f-string example verbatim.
+  alone, so a prompt may contain JSON, CSS or an f-string example verbatim. The
+  fan-out prompt additionally receives `{max_tasks}`.
   These are separate from the agent-command placeholders described below.
 - `reviewer.md` is a contract with the orchestrator: the model's last line has
   to be exactly `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`. Anything
@@ -855,8 +922,10 @@ The important separation is:
   prompt.
 - At a terminal result, the orchestrator creates a local commit on the run's
   own branch using the repository's identity, signing configuration and hooks.
-- The orchestrator does not merge, rebase, push, delete the worktree, modify
-  remotes, or touch the branch/index/worktree in the user's original checkout.
+- A fan-out run merges task branches only into its own integration branch. The
+  orchestrator never merges into the user's original branch, rebases, pushes,
+  deletes worktrees during a run, modifies remotes, or touches the
+  branch/index/worktree in the user's original checkout.
 - The final branch/worktree and its traceable commit are left for human
   inspection.
 
@@ -865,14 +934,12 @@ boundary; prompts are guidance, not a security boundary.
 
 ## Useful next additions
 
-Shipped since this list was written: token accounting, timeouts, retries,
+Shipped since this list was written: fan-out DAG execution, token accounting,
+timeouts, retries,
 persistent run state, `list`, `resume`, catchable-signal handling, capability
 probes, empty-stage detection, and terminal commits on run branches. What is
 still open, roughly in order of how much it would change the tool:
 
-- **Fan-out.** A `tasks.json` produced by the architect, one worktree per task,
-  DAG scheduling, then an integrated review across the branches. This is the
-  real v2 and everything else is small next to it.
 - **Structured review output** (JSON findings instead of a prose verdict).
 - **GitHub issue / PR as task input.**
 

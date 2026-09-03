@@ -74,6 +74,39 @@ def write_config(path: Path, reviewer: str, *, test_command: str, loops: int = 0
     path.write_text(yaml.safe_dump(cfg))
 
 
+def write_fanout_config(
+    path: Path,
+    graph: Path,
+    developer: str,
+    *,
+    reviewer: str = 'echo "VERDICT: APPROVED"',
+    architect_marker: Path | None = None,
+    max_parallel: int = 2,
+) -> None:
+    import yaml
+
+    marker = f"echo called >> {architect_marker}; " if architect_marker else ""
+    cfg = {
+        "agents": {
+            "arch": {"command": agent(f"{marker}cat {graph}")},
+            "dev": {"command": agent(developer)},
+            "rev": {"command": agent(reviewer)},
+        },
+        "workflow": {
+            "architect": "arch",
+            "developer": "dev",
+            "reviewer": "rev",
+            "fixer": "dev",
+        },
+        "settings": {
+            "max_review_loops": 0,
+            "test_command": "true",
+            "max_parallel_tasks": max_parallel,
+        },
+    }
+    path.write_text(yaml.safe_dump(cfg))
+
+
 def run(
     repo: Path, config: Path, task: str = "demo task", *run_args: str
 ) -> subprocess.CompletedProcess[str]:
@@ -156,7 +189,7 @@ def test_stale_remote_stops_before_agents_or_artifacts(root: Path) -> None:
     repo = make_repo(root)
     remote = root / "remote.git"
     other = root / "other"
-    sh(f"git init -q --bare {remote}", root)
+    sh(f"git init -q --bare -b main {remote}", root)
     sh(f"git remote add origin {remote} && git push -qu origin main", repo)
     sh(f"git clone -q {remote} {other}", root)
     sh(
@@ -572,7 +605,7 @@ def test_custom_prompts_dir_overrides_one_file(root: Path) -> None:
     repo = make_repo(root)
     custom = root / "myprompts"
     custom.mkdir()
-    # Only reviewer.md is overridden; the other three must still resolve.
+    # Only reviewer.md is overridden; every other prompt must still resolve.
     (custom / "reviewer.md").write_text(
         "CUSTOM_REVIEWER {task} {base_ref} {plan} {tests}\nVERDICT line goes last.\n"
     )
@@ -1682,7 +1715,7 @@ def test_doctor_shows_and_probes_the_effective_grant(root: Path) -> None:
     assert "WARN" in warned.stdout and "real repository" in warned.stdout
 
     packaged = yaml.safe_load((ROOT / "stargate" / "agents.yaml").read_text())
-    assert packaged["version"] == 4
+    assert packaged["version"] == 5
     reviewer_command = packaged["agents"]["reviewer"]["command"]
     architect_command = packaged["agents"]["architect"]["command"]
     assert "Bash({test_command})" in reviewer_command
@@ -2080,6 +2113,290 @@ def test_doctor_reports_the_commit_setting(root: Path) -> None:
     assert "settings.commit must be true or false" in proc.stderr, proc.stderr
 
 
+def test_fanout_runs_ready_tasks_in_parallel_and_integrates_the_dag(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    graph = root / "tasks.json"
+    graph.write_text(json.dumps({
+        "name": "parallel delivery",
+        "tasks": [
+            {
+                "id": "foundation",
+                "task": "Create the shared foundation.",
+                "depends_on": [],
+                "acceptance": ["foundation.txt exists"],
+            },
+            {
+                "id": "alpha",
+                "task": "Build alpha on the shared foundation.",
+                "depends_on": ["foundation"],
+                "acceptance": ["alpha.txt exists"],
+            },
+            {
+                "id": "beta",
+                "task": "Build beta on the shared foundation.",
+                "depends_on": ["foundation"],
+                "acceptance": ["beta.txt exists"],
+            },
+        ],
+    }))
+    alpha_started = root / "alpha-started"
+    beta_started = root / "beta-started"
+    reviewer_prompt = root / "fanout-review.txt"
+    developer = (
+        'case "$0" in '
+        '*"ASSIGNED TASK ID: foundation"*) echo shared > foundation.txt ;; '
+        f'*"ASSIGNED TASK ID: alpha"*) test -f foundation.txt || exit 7; '
+        f'touch {alpha_started}; i=0; while test ! -e {beta_started} && '
+        'test "$i" -lt 100; do sleep 0.02; i=$((i + 1)); done; '
+        f'test -e {beta_started} || exit 8; echo alpha > alpha.txt ;; '
+        f'*"ASSIGNED TASK ID: beta"*) test -f foundation.txt || exit 9; '
+        f'touch {beta_started}; i=0; while test ! -e {alpha_started} && '
+        'test "$i" -lt 100; do sleep 0.02; i=$((i + 1)); done; '
+        f'test -e {alpha_started} || exit 10; echo beta > beta.txt ;; '
+        '*) exit 11 ;; esac; echo done'
+    )
+    cfg = root / "fanout.yaml"
+    write_fanout_config(
+        cfg,
+        graph,
+        developer,
+        reviewer=(
+            f'printf "%s" "$0" > {reviewer_prompt}; '
+            'echo "VERDICT: APPROVED"'
+        ),
+    )
+    main_before = git_output(repo, "rev-parse", "main")
+
+    proc = run(repo, cfg, "deliver three pieces", "--fan-out")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert state["mode"] == "fanout", state
+    assert state["completed"] == ["architect", "integration", "review", "tasks"]
+    assert state["fanout"]["integrated"] == ["foundation", "alpha", "beta"]
+    assert all(
+        item["status"] == "complete"
+        for item in state["fanout"]["tasks"].values()
+    ), state
+    assert alpha_started.exists() and beta_started.exists(), proc.stdout
+    integration = Path(state["worktree"])
+    assert (integration / "foundation.txt").read_text() == "shared\n"
+    assert (integration / "alpha.txt").read_text() == "alpha\n"
+    assert (integration / "beta.txt").read_text() == "beta\n"
+    assert git_output(repo, "rev-parse", "main") == main_before
+    terminal_message = git_output(integration, "log", "-1", "--format=%B")
+    assert "Stargate-Verdict: APPROVED" in terminal_message, terminal_message
+    assert state["fanout"]["terminal_commit"] == state["commit"]
+    summary = (state_path.parent / "summary.md").read_text()
+    assert "## fan-out tasks" in summary and "| beta | complete | 0 |" in summary
+    assert json.loads((state_path.parent / "tasks.json").read_text())["name"] == (
+        "parallel delivery"
+    )
+    review = reviewer_prompt.read_text()
+    assert '"depends_on": [' in review and '"foundation"' in review, review
+    assert "Task branches were merged only" in proc.stdout, proc.stdout
+
+    task_targets = [
+        (item["branch"], Path(item["worktree"]))
+        for item in state["fanout"]["tasks"].values()
+    ]
+    sh(f"git merge --ff-only -q {state['branch']}", repo)
+    cleaned = clean(repo, state["run_id"])
+    assert cleaned.returncode == 0, cleaned.stdout + cleaned.stderr
+    assert not state_path.parent.exists() and not integration.exists()
+    assert all(
+        not worktree.exists() and not recorded_branch_exists(repo, branch)
+        for branch, worktree in task_targets
+    )
+
+
+def test_fanout_rejects_a_cyclic_graph_before_running_developers(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    graph = root / "cycle.json"
+    graph.write_text(json.dumps({
+        "name": "cyclic work",
+        "tasks": [
+            {"id": "one", "task": "one", "depends_on": ["two"]},
+            {"id": "two", "task": "two", "depends_on": ["one"]},
+        ],
+    }))
+    called = root / "developer-called"
+    cfg = root / "cycle.yaml"
+    write_fanout_config(cfg, graph, f"touch {called}; echo change > change.txt")
+
+    proc = run(repo, cfg, "cycle", "--fan-out")
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "dependencies contain a cycle" in proc.stderr, proc.stderr
+    assert not called.exists(), "developer ran for an invalid DAG"
+    state = json.loads(
+        next((repo / ".stargate" / "runs").glob("*/state.json")).read_text()
+    )
+    assert state["mode"] == "fanout" and state["status"] == "failed", state
+
+
+def test_fanout_resume_keeps_completed_tasks_and_retries_failures(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    graph = root / "resume-tasks.json"
+    graph.write_text(json.dumps({
+        "name": "resumable graph",
+        "tasks": [
+            {"id": "alpha", "task": "write alpha", "depends_on": []},
+            {"id": "beta", "task": "write beta", "depends_on": []},
+        ],
+    }))
+    architect_calls = root / "architect-calls"
+    alpha_calls = root / "alpha-calls"
+    beta_calls = root / "beta-calls"
+    broken = root / "fanout-broken.yaml"
+    write_fanout_config(
+        broken,
+        graph,
+        (
+            'case "$0" in '
+            f'*"ASSIGNED TASK ID: alpha"*) echo called >> {alpha_calls}; '
+            'echo alpha > alpha.txt ;; '
+            f'*"ASSIGNED TASK ID: beta"*) echo called >> {beta_calls}; exit 12 ;; '
+            'esac'
+        ),
+        architect_marker=architect_calls,
+    )
+
+    first = run(repo, broken, "resumable fanout", "--fan-out")
+    assert first.returncode == 1, first.stdout + first.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    assert state["fanout"]["tasks"]["alpha"]["status"] == "complete", state
+    assert state["fanout"]["tasks"]["beta"]["status"] == "failed", state
+
+    fixed = root / "fanout-fixed.yaml"
+    write_fanout_config(
+        fixed,
+        graph,
+        (
+            'case "$0" in '
+            f'*"ASSIGNED TASK ID: alpha"*) echo called >> {alpha_calls}; '
+            'echo alpha-again > alpha.txt ;; '
+            f'*"ASSIGNED TASK ID: beta"*) echo called >> {beta_calls}; '
+            'echo beta > beta.txt ;; esac'
+        ),
+        architect_marker=architect_calls,
+    )
+    resumed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "stargate",
+            "--config",
+            str(fixed),
+            "resume",
+            state["run_id"],
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    state = json.loads(state_path.read_text())
+    assert state["status"] == "approved", state
+    assert all(
+        item["status"] == "complete"
+        for item in state["fanout"]["tasks"].values()
+    ), state
+    assert architect_calls.read_text().count("called") == 1
+    assert alpha_calls.read_text().count("called") == 1
+    assert beta_calls.read_text().count("called") == 2
+    integration = Path(state["worktree"])
+    assert (integration / "alpha.txt").read_text() == "alpha\n"
+    assert (integration / "beta.txt").read_text() == "beta\n"
+
+
+def test_fanout_sigterm_kills_agents_in_parallel_workers(root: Path) -> None:
+    repo = make_repo(root)
+    graph = root / "signal-tasks.json"
+    graph.write_text(json.dumps({
+        "name": "parallel signal",
+        "tasks": [
+            {"id": "alpha", "task": "slow alpha", "depends_on": []},
+            {"id": "beta", "task": "slow beta", "depends_on": []},
+        ],
+    }))
+    pids = root / "fanout-pids"
+    finished = root / "fanout-finished"
+    slow = (
+        "import os, pathlib, time; "
+        f"p=pathlib.Path({str(pids)!r}); "
+        "h=p.open('a'); h.write(str(os.getpid())+'\\n'); h.close(); "
+        "time.sleep(30); "
+        f"pathlib.Path({str(finished)!r}).write_text('done')"
+    )
+    import yaml
+    cfg = root / "fanout-signal.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "agents": {
+            "arch": {"command": agent(f"cat {graph}")},
+            "slow": {"command": [sys.executable, "-c", slow]},
+            "rev": {"command": agent('echo "VERDICT: APPROVED"')},
+        },
+        "workflow": {
+            "architect": "arch",
+            "developer": "slow",
+            "reviewer": "rev",
+            "fixer": "slow",
+        },
+        "settings": {
+            "test_command": "true",
+            "max_parallel_tasks": 2,
+            "agent_timeout_seconds": 60,
+        },
+    }))
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "stargate",
+            "--config",
+            str(cfg),
+            "run",
+            "--fan-out",
+            "signal fanout",
+        ],
+        cwd=repo,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    deadline = time.monotonic() + 15
+    while proc.poll() is None and time.monotonic() < deadline:
+        if pids.exists() and len(pids.read_text().splitlines()) == 2:
+            break
+        time.sleep(0.05)
+    else:
+        proc.kill()
+        out, err = proc.communicate(timeout=10)
+        raise AssertionError(f"parallel agents did not start\n{out}\n{err}")
+
+    agent_pids = [int(value) for value in pids.read_text().splitlines()]
+    proc.terminate()
+    out, err = proc.communicate(timeout=15)
+    assert proc.returncode == 143, out + err
+    assert "Resume with: stargate resume" in err, err
+    for agent_pid in agent_pids:
+        try:
+            os.kill(agent_pid, 0)
+        except ProcessLookupError:
+            continue
+        raise AssertionError(f"fan-out agent process {agent_pid} survived SIGTERM")
+    assert not finished.exists(), "a fan-out agent continued after termination"
+
+
 if __name__ == "__main__":
     for fn in (test_settings_only_project_config_is_valid,
                test_partial_user_config_inherits_packaged_defaults,
@@ -2149,7 +2466,11 @@ if __name__ == "__main__":
                test_test_artifacts_are_not_committed,
                test_resume_does_not_commit_twice,
                test_commit_failure_is_explained_and_work_survives,
-               test_doctor_reports_the_commit_setting):
+               test_doctor_reports_the_commit_setting,
+               test_fanout_runs_ready_tasks_in_parallel_and_integrates_the_dag,
+               test_fanout_rejects_a_cyclic_graph_before_running_developers,
+               test_fanout_resume_keeps_completed_tasks_and_retries_failures,
+               test_fanout_sigterm_kills_agents_in_parallel_workers):
         with tempfile.TemporaryDirectory() as tmp:
             fn(Path(tmp))
         print(f"ok  {fn.__name__}")

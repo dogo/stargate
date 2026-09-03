@@ -2,7 +2,7 @@
 # is the single-vendor version, useful when you only have one subscription.
 #
 # Verified against Claude Code 2.1.236.
-version: 4
+version: 5
 
 agents:
   # `claude -p --output-format text` prints only the final message, so these

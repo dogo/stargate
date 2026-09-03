@@ -2,7 +2,7 @@
 # this is the single-vendor version.
 #
 # Verified against codex-cli 0.152.0.
-version: 4
+version: 5
 
 agents:
   # codex exec streams the whole session to stdout, so every role needs

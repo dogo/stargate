@@ -1,7 +1,7 @@
 # stargate config driving every role with kiro-cli.
 # Needs kiro-stargate on PATH; see the header of that script.
 # Verified end to end against kiro-cli 2.21.0.
-version: 4
+version: 5
 
 agents:
   kiro_reader:

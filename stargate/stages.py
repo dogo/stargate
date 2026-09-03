@@ -3,8 +3,8 @@ and summary that bracket them."""
 from __future__ import annotations
 
 import argparse
+import json
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +22,7 @@ from .core import (
     StargateError,
     git,
     repo_root,
+    run_process,
     split_plan_name,
 )
 from .detect import detection_mode, selected_test_command
@@ -117,19 +118,18 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
     timeout = float(settings.get("test_timeout_seconds", 900)) or None
     before = untracked_entries(ctx.worktree)
     try:
-        try:
-            proc = subprocess.run(
-                ["/bin/sh", "-lc", command],
-                cwd=str(ctx.worktree),
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-            )
-            output, code = proc.stdout or "", proc.returncode
-        except subprocess.TimeoutExpired as exc:
-            output = (exc.output or "") + f"\n\n[timed out after {timeout}s]"
-            code = 124
+        artifact = ctx.artifacts / f"tests-{label}.txt"
+        proc = run_process(
+            ["/bin/sh", "-lc", command],
+            ctx.worktree,
+            check=False,
+            timeout=timeout,
+            log_path=artifact,
+            timeout_is_error=False,
+        )
+        output, code = proc.stdout or "", proc.returncode
+        if code == 124:
+            output += f"\n\n[timed out after {timeout}s]"
     finally:
         # Test suites commonly leave .venv/, *.egg-info/, target/ or
         # node_modules/. A tidy project ignores them, but an incomplete
@@ -140,7 +140,7 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
         save_state(ctx, "running")
 
     print(output, end="" if output.endswith("\n") else "\n")
-    (ctx.artifacts / f"tests-{label}.txt").write_text(
+    artifact.write_text(
         f"$ {command}\n\n{output}\n\nexit_code={code}\n"
     )
 
@@ -159,7 +159,16 @@ def finish(
     commit: bool,
 ) -> int:
     if commit:
-        commit_outcome = commit_run(ctx, verdict, test_exit)
+        needs_terminal_commit = (
+            ctx.mode == "fanout"
+            and ctx.fanout.get("terminal_verdict") != verdict
+        )
+        commit_outcome = commit_run(
+            ctx, verdict, test_exit, allow_empty=needs_terminal_commit
+        )
+        if ctx.mode == "fanout" and commit_outcome == "committed":
+            ctx.fanout["terminal_commit"] = ctx.commit
+            ctx.fanout["terminal_verdict"] = verdict
     else:
         # A failed commit belongs to the invocation that attempted it. If the
         # user deliberately resumes without committing, preserving that error
@@ -179,7 +188,14 @@ def finish(
         cap = token_cap(ctx.config)
         print(f"Tokens:    {ctx.tokens_used:,}" + (f" of {cap:,}" if cap else " (no cap)"))
     if ctx.commit:
-        print("\nNothing was merged, pushed, or deleted automatically.")
+        if ctx.mode == "fanout":
+            print(
+                "\nTask branches were merged only into the Stargate integration "
+                "branch.\nNothing was merged into your original branch, pushed, "
+                "or deleted automatically."
+            )
+        else:
+            print("\nNothing was merged, pushed, or deleted automatically.")
     else:
         print("\nNothing was committed, merged, pushed, or deleted automatically.")
     print(
@@ -240,12 +256,39 @@ Tokens reported: {tokens}
 
 {diff_stat or "(no tracked diff)"}
 """
+    if ctx.mode == "fanout":
+        records = ctx.fanout.get("tasks", {})
+        lines = ["\n## fan-out tasks\n", "| task | status | tests | commit |", "|---|---|---:|---|"]
+        for task_id in ctx.fanout.get("order", []):
+            record = records.get(task_id, {})
+            test_exit_value = record.get("test_exit")
+            tests = "not run" if test_exit_value is None else str(test_exit_value)
+            task_commit = str(record.get("commit") or "")
+            lines.append(
+                f"| {task_id} | {record.get('status', 'unknown')} | {tests} | "
+                f"{task_commit[:12] or '-'} |"
+            )
+        summary += "\n".join(lines) + "\n"
     (ctx.artifacts / "summary.md").write_text(summary)
 
 
 def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, Any]) -> int:
     repo = repo_root(Path.cwd())
     resuming = args.command == "resume"
+
+    fanout = bool(getattr(args, "fan_out", False))
+    if resuming:
+        state_path = repo / ".stargate" / "runs" / args.run_id / "state.json"
+        if state_path.exists():
+            try:
+                fanout = json.loads(state_path.read_text()).get("mode") == "fanout"
+            except (OSError, ValueError):
+                # load_run below owns the detailed error path for malformed state.
+                pass
+    if fanout:
+        from .fanout import orchestrate_fanout
+
+        return orchestrate_fanout(args, script_dir, config, repo)
 
     if resuming:
         ctx = load_run(repo, args.run_id, config, use_frozen=args.config is None)
@@ -292,7 +335,6 @@ def run_stages(
     *,
     commit: bool,
 ) -> int:
-    config = ctx.config
     plan_path = ctx.artifacts / "plan.md"
     architect_ran = False
 
@@ -374,8 +416,35 @@ def run_stages(
 
     test_exit, test_report = run_tests(ctx, "developer")
 
+    return review_and_finish(
+        ctx,
+        args,
+        prompts,
+        task=ctx.task,
+        plan=plan,
+        test_exit=test_exit,
+        test_report=test_report,
+        commit=commit,
+    )
+
+
+def review_and_finish(
+    ctx: RunContext,
+    args: argparse.Namespace,
+    prompts: list[Path],
+    *,
+    task: str,
+    plan: str,
+    test_exit: int | None,
+    test_report: str,
+    commit: bool,
+) -> int:
+    """Run the shared review/fix tail for a linear or integrated worktree."""
+
     # 4. Review/fix loop.
-    configured_loops = int(config.get("settings", {}).get("max_review_loops", 2))
+    configured_loops = int(
+        ctx.config.get("settings", {}).get("max_review_loops", 2)
+    )
     max_loops = args.max_review_loops if args.max_review_loops is not None else configured_loops
     verdict = "CHANGES_REQUESTED"
 
@@ -386,12 +455,12 @@ def run_stages(
     for attempt in range(max_loops + 1):
         if budget_spent(ctx, f"review {attempt + 1}"):
             return finish(
-                ctx, ctx.task, "BUDGET_EXCEEDED", test_exit, commit=commit
+                ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit
             )
         review_prompt = render_prompt(
             prompts,
             "reviewer",
-            task=ctx.task,
+            task=task,
             base_ref=ctx.base_ref,
             plan=plan,
             tests=test_report,
@@ -425,7 +494,7 @@ def run_stages(
         fixer_prompt = render_prompt(
             prompts,
             "fixer",
-            task=ctx.task,
+            task=task,
             base_ref=ctx.base_ref,
             plan=plan,
             review=review,
@@ -433,7 +502,7 @@ def run_stages(
         )
         if budget_spent(ctx, f"fixer {attempt + 1}"):
             return finish(
-                ctx, ctx.task, "BUDGET_EXCEEDED", test_exit, commit=commit
+                ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit
             )
 
         before = worktree_fingerprint(ctx)
@@ -457,4 +526,4 @@ def run_stages(
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
     complete_stage(ctx, "review")
-    return finish(ctx, ctx.task, verdict, test_exit, commit=commit)
+    return finish(ctx, task, verdict, test_exit, commit=commit)

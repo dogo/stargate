@@ -17,6 +17,7 @@ import yaml
 from .config import (
     AGENT_RETRIES_DEFAULT,
     AGENT_RETRY_BACKOFF_DEFAULT,
+    PROMPTS,
     ROLES,
     TEST_COMMAND_PLACEHOLDER,
     agent_command,
@@ -263,6 +264,8 @@ def doctor(
     print("\nEffective settings:")
     for key, default in (
         ("max_review_loops", 2),
+        ("max_fanout_tasks", 8),
+        ("max_parallel_tasks", 2),
         ("test_command", ""),
         ("test_command_detection", "report"),
         ("commit", True),
@@ -351,7 +354,7 @@ def doctor(
 
     print("\nPrompts:")
     dirs = prompt_dirs(config, script_dir)
-    for role in ROLES:
+    for role in PROMPTS:
         try:
             print(f"  {role:10} {find_prompt(dirs, role)}")
         except StargateError as exc:

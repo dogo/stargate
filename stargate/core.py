@@ -7,6 +7,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +55,8 @@ class RunContext:
     test_artifacts: set[str] = field(default_factory=set)
     commit: str = ""
     commit_error: str = ""
+    mode: str = "linear"
+    fanout: dict[str, Any] = field(default_factory=dict)
 
 
 # How often a running agent prints that it is still alive.
@@ -62,6 +65,25 @@ HEARTBEAT_SECONDS = 30
 
 # Cleanup must not turn a terminating signal into an indefinite wait.
 KILL_GRACE_SECONDS = 10
+
+
+_ACTIVE_PROCESS_LOCK = threading.RLock()
+_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+_TERMINATION_REQUESTED = threading.Event()
+
+
+def terminate_active_processes() -> None:
+    """Kill agent processes owned by any fan-out worker before unwinding."""
+    _TERMINATION_REQUESTED.set()
+    with _ACTIVE_PROCESS_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+    for proc in processes:
+        with contextlib.suppress(OSError):
+            proc.kill()
+
+
+def termination_requested() -> bool:
+    return _TERMINATION_REQUESTED.is_set()
 
 
 def run_process(
@@ -73,7 +95,10 @@ def run_process(
     timeout: float | None = None,
     log_path: Path | None = None,
     env: dict[str, str] | None = None,
+    timeout_is_error: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    if termination_requested():
+        raise StargateError("Orchestrator is terminating.")
     print(f"\n$ {shlex.join(args)}", flush=True)
     if log_path is not None:
         # Straight to disk, so a silent multi-minute agent can be tailed live
@@ -83,8 +108,14 @@ def run_process(
                 args, cwd=str(cwd), text=True, stdout=handle,
                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
             )
+            with _ACTIVE_PROCESS_LOCK:
+                _ACTIVE_PROCESSES.add(proc)
+            if termination_requested():
+                with contextlib.suppress(OSError):
+                    proc.kill()
             started = time.monotonic()
             deadline = None if timeout is None else started + timeout
+            timed_out = False
             try:
                 while True:
                     try:
@@ -95,10 +126,13 @@ def run_process(
                     if deadline is not None and time.monotonic() > deadline:
                         proc.kill()
                         proc.wait()
-                        raise StargateError(
-                            f"Command timed out after {timeout}s "
-                            f"(partial trace in {log_path}): {shlex.join(args)}"
-                        )
+                        if timeout_is_error:
+                            raise StargateError(
+                                f"Command timed out after {timeout}s "
+                                f"(partial trace in {log_path}): {shlex.join(args)}"
+                            )
+                        timed_out = True
+                        break
                     # Growing byte count is the "still moving, not hung" signal;
                     # the trace itself stays out of the terminal.
                     size = log_path.stat().st_size if log_path.exists() else 0
@@ -115,13 +149,17 @@ def run_process(
                 with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                     proc.wait(timeout=KILL_GRACE_SECONDS)
                 raise
+            finally:
+                with _ACTIVE_PROCESS_LOCK:
+                    _ACTIVE_PROCESSES.discard(proc)
         output = log_path.read_text() if log_path.exists() else ""
-        if check and proc.returncode != 0:
+        returncode = 124 if timed_out else proc.returncode
+        if check and returncode != 0:
             raise StargateError(
-                f"Command failed with exit code {proc.returncode} "
+                f"Command failed with exit code {returncode} "
                 f"(trace in {log_path}): {shlex.join(args)}"
             )
-        return subprocess.CompletedProcess(args, proc.returncode, output, None)
+        return subprocess.CompletedProcess(args, returncode, output, None)
     try:
         proc = subprocess.run(
             args,

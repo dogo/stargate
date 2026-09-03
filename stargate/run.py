@@ -16,7 +16,7 @@ from typing import Any
 
 import yaml
 
-from .config import ROLES, find_prompt, token_cap
+from .config import PROMPTS, find_prompt, token_cap
 from .core import (
     RunContext,
     StargateError,
@@ -250,6 +250,8 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "test_artifacts": sorted(ctx.test_artifacts),
         "commit": ctx.commit or None,
         "commit_error": ctx.commit_error or None,
+        "mode": ctx.mode,
+        "fanout": ctx.fanout or None,
         "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
         "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }, indent=2) + "\n")
@@ -294,6 +296,8 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         test_artifacts=set(state.get("test_artifacts", [])),
         commit=str(state.get("commit") or ""),
         commit_error=str(state.get("commit_error") or ""),
+        mode=str(state.get("mode") or "linear"),
+        fanout=dict(state.get("fanout") or {}),
         tag=(
             match.group(1)
             if (match := re.search(
@@ -351,7 +355,13 @@ def read_run(path: Path) -> dict[str, Any]:
         updated=" ".join(str(state.get("updated_at") or "-").split()),
         # Tasks are often multi-paragraph input; one row should stay one row.
         task=(" ".join(str(state.get("task") or "").split())[:RUN_TASK_WIDTH] or "-"),
-        resumable=status.lower() in RESUMABLE_STATUSES,
+        resumable=(
+            status.lower() in RESUMABLE_STATUSES
+            or (
+                state.get("mode") == "fanout"
+                and status.lower() == "budget_exceeded"
+            )
+        ),
         error="",
     )
     return row
@@ -417,8 +427,8 @@ def snapshot(ctx: RunContext, dirs: list[Path]) -> list[Path]:
     (ctx.artifacts / "config.yaml").write_text(yaml.safe_dump(ctx.config, sort_keys=False))
     frozen = ctx.artifacts / "prompts"
     frozen.mkdir(exist_ok=True)
-    for role in ROLES:
-        (frozen / f"{role}.md").write_text(find_prompt(dirs, role).read_text())
+    for name in PROMPTS:
+        (frozen / f"{name}.md").write_text(find_prompt(dirs, name).read_text())
     return [frozen]
 
 
@@ -457,41 +467,89 @@ def clean_run(repo: Path, run_id: str) -> None:
     if not isinstance(worktree_value, str) or not worktree_value:
         raise StargateError(f"Cannot clean {run_id}: invalid worktree path")
     worktree = Path(worktree_value).resolve()
-    branch_present = branch_exists(repo, branch)
-    worktree_present = worktree.exists()
+    targets = [(branch, worktree)]
+    fanout = state.get("fanout") if state.get("mode") == "fanout" else None
+    if fanout:
+        records = fanout.get("tasks") if isinstance(fanout, dict) else None
+        if not isinstance(records, dict):
+            raise StargateError(f"Cannot clean {run_id}: invalid fan-out task state")
+        for task_id, record in records.items():
+            task_branch = record.get("branch") if isinstance(record, dict) else None
+            task_worktree = record.get("worktree") if isinstance(record, dict) else None
+            if (
+                not isinstance(task_id, str)
+                or not isinstance(task_branch, str)
+                or not task_branch.startswith(f"{branch}-")
+                or not isinstance(task_worktree, str)
+                or not task_worktree
+            ):
+                raise StargateError(
+                    f"Cannot clean {run_id}: invalid fan-out task target {task_id!r}"
+                )
+            task_path = Path(task_worktree).resolve()
+            if task_path.parent != worktree.parent:
+                raise StargateError(
+                    f"Cannot clean {run_id}: fan-out worktree is outside its run root"
+                )
+            targets.append((task_branch, task_path))
 
-    if worktree_present:
-        checked_out = git_quiet(worktree, "symbolic-ref", "--short", "HEAD").strip()
-        if checked_out != branch:
-            raise StargateError(
-                f"Cannot clean {run_id}: {worktree} has branch {checked_out!r}, "
-                f"not {branch!r}"
-            )
-    elif not branch_present:
+    present = [
+        (target_branch, target_worktree, branch_exists(repo, target_branch),
+         target_worktree.exists())
+        for target_branch, target_worktree in targets
+    ]
+    if not any(branch_present or worktree_present
+               for _, _, branch_present, worktree_present in present):
         shutil.rmtree(artifacts)
-        print(f"Cleaned {run_id}: artifacts removed; worktree and branch were absent.")
+        print(
+            f"Cleaned {run_id}: artifacts removed; worktrees and branches were absent."
+        )
         return
 
-    if branch_present:
+    # Validate every target before removing the first one. A dirty sibling must
+    # not turn a fan-out cleanup into a partially destructive operation.
+    for target_branch, target_worktree, branch_present, worktree_present in present:
+        if worktree_present:
+            checked_out = git_quiet(
+                target_worktree, "symbolic-ref", "--short", "HEAD"
+            ).strip()
+            if checked_out != target_branch:
+                raise StargateError(
+                    f"Cannot clean {run_id}: {target_worktree} has branch "
+                    f"{checked_out!r}, not {target_branch!r}"
+                )
+            if git_quiet(target_worktree, "status", "--porcelain"):
+                raise StargateError(
+                    f"Cannot clean {run_id}: worktree {target_worktree} is dirty"
+                )
+        if not branch_present:
+            continue
         merged = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", f"refs/heads/{branch}", "HEAD"],
+            [
+                "git", "merge-base", "--is-ancestor",
+                f"refs/heads/{target_branch}", "HEAD",
+            ],
             cwd=str(repo), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         if merged.returncode == 1:
             raise StargateError(
-                f"Cannot clean {run_id}: branch {branch!r} is not merged into HEAD"
+                f"Cannot clean {run_id}: branch {target_branch!r} is not merged into HEAD"
             )
         if merged.returncode != 0:
-            raise StargateError(f"Cannot determine whether branch {branch!r} is merged")
+            raise StargateError(
+                f"Cannot determine whether branch {target_branch!r} is merged"
+            )
 
-    if worktree_present:
-        git(repo, "worktree", "remove", str(worktree))
-    else:
+    for _, target_worktree, _, worktree_present in reversed(present):
+        if worktree_present:
+            git(repo, "worktree", "remove", str(target_worktree))
+    if not any(worktree_present for _, _, _, worktree_present in present):
         git(repo, "worktree", "prune", "--expire", "now")
-    if branch_present:
-        git(repo, "branch", "-d", "--", branch)
+    for target_branch, _, branch_present, _ in reversed(present):
+        if branch_present:
+            git(repo, "branch", "-d", "--", target_branch)
     shutil.rmtree(artifacts)
-    print(f"Cleaned {run_id}: worktree, branch and artifacts removed.")
+    print(f"Cleaned {run_id}: worktrees, branches and artifacts removed.")
 
 
 def clean_runs(repo: Path, run_id: str | None, all_runs: bool) -> int:
