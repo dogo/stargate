@@ -16,9 +16,22 @@ from .config import (
     retry_settings,
     token_cap,
 )
-from .core import RunContext, StargateError, run_process, termination_requested
+from .core import (
+    RunContext,
+    StargateError,
+    print_output,
+    run_process,
+    termination_requested,
+    wait_for_termination,
+)
 
 FINGERPRINT_LINES = 20
+
+
+def _role_label(ctx: RunContext, role: str) -> str:
+    if ctx.mode == "fanout-task":
+        return f"task {ctx.slug}/{role}"
+    return role
 
 
 def record_usage(ctx: RunContext, role: str, transcript: str) -> None:
@@ -30,8 +43,8 @@ def record_usage(ctx: RunContext, role: str, transcript: str) -> None:
     if used:
         cap = token_cap(ctx.config)
         budget = f" of {cap:,}" if cap else ""
-        print(
-            f"\n[{role}] reported {used:,} tokens; "
+        print_output(
+            f"\n[{_role_label(ctx, role)}] reported {used:,} tokens; "
             f"{ctx.tokens_used:,}{budget} used so far."
         )
 
@@ -83,10 +96,23 @@ def invoke_agent(
     retries, backoff = retry_settings(ctx.config)
     attempts = retries + 1
     previous_failure: tuple[str, str] | None = None
+    process_label = (
+        _role_label(ctx, role) if ctx.mode == "fanout-task" else None
+    )
+    role_label = _role_label(ctx, role)
 
     for attempt in range(1, attempts + 1):
+        if termination_requested():
+            raise StargateError("Orchestrator is terminating.")
         log_path = attempt_log_path(output_path, attempt)
-        print(f"trace: tail -f {shlex.quote(str(log_path))}", flush=True)
+        # Starting this attempt would replace the same path anyway. Removing
+        # it first prevents a termination race before Popen from charging an
+        # earlier invocation's transcript as this attempt's usage.
+        log_path.unlink(missing_ok=True)
+        trace_prefix = f"[{process_label}] " if process_label else ""
+        print_output(
+            f"{trace_prefix}trace: tail -f {shlex.quote(str(log_path))}"
+        )
 
         # A retry or explicitly redone stage must not inherit an earlier
         # answer and pass the output contract after writing nothing.
@@ -97,7 +123,7 @@ def invoke_agent(
         try:
             proc = run_process(
                 [*cmd, prompt], cwd, timeout=timeout or None, log_path=log_path,
-                env=env,
+                env=env, output_label=process_label,
             )
         except OSError as exc:
             # A process that cannot be started will fail the same way after a
@@ -105,15 +131,20 @@ def invoke_agent(
             raise StargateError(
                 f"Could not start the agent for role '{role}': {exc}"
             ) from exc
+        except KeyboardInterrupt:
+            trace = log_path.read_text() if log_path.exists() else ""
+            record_usage(ctx, role, trace)
+            raise
         except StargateError as exc:
+            trace = log_path.read_text() if log_path.exists() else ""
             if termination_requested():
+                record_usage(ctx, role, trace)
                 raise
             if retries:
-                trace = log_path.read_text() if log_path.exists() else ""
                 record_usage(ctx, role, trace)
-                print(
-                    f"\n[{role}] attempt {attempt} of {attempts} failed: {exc}",
-                    flush=True,
+                print_output(
+                    f"\n[{role_label}] attempt {attempt} of {attempts} "
+                    f"failed: {exc}"
                 )
             else:
                 # Keeping retries disabled must preserve the original failure
@@ -126,28 +157,26 @@ def invoke_agent(
             fingerprint = failure_fingerprint(exc, trace)
             if fingerprint == previous_failure:
                 remaining = attempts - attempt
-                print(
-                    f"[{role}] failed identically twice; not retrying "
-                    f"{remaining} more time(s).",
-                    flush=True,
+                print_output(
+                    f"[{role_label}] failed identically twice; not retrying "
+                    f"{remaining} more time(s)."
                 )
                 raise
             previous_failure = fingerprint
 
             wait = backoff * 2 ** (attempt - 1)
-            print(
-                f"[{role}] retrying in {wait:g}s "
-                f"(attempt {attempt + 1} of {attempts}).",
-                flush=True,
+            print_output(
+                f"[{role_label}] retrying in {wait:g}s "
+                f"(attempt {attempt + 1} of {attempts})."
             )
-            time.sleep(wait)
+            if wait_for_termination(wait):
+                raise StargateError("Orchestrator is terminating.") from None
             continue
 
         transcript = proc.stdout or ""
-        print(
-            f"\n[{role}] exit {proc.returncode} in "
-            f"{time.monotonic() - started:.0f}s",
-            flush=True,
+        print_output(
+            f"\n[{role_label}] exit {proc.returncode} in "
+            f"{time.monotonic() - started:.0f}s"
         )
         record_usage(ctx, role, transcript)
         break

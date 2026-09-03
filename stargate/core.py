@@ -3,10 +3,12 @@ a subprocess runner that streams and stays killable, and git."""
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -70,20 +72,55 @@ KILL_GRACE_SECONDS = 10
 _ACTIVE_PROCESS_LOCK = threading.RLock()
 _ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 _TERMINATION_REQUESTED = threading.Event()
+_OUTPUT_LOCK = threading.RLock()
 
 
-def terminate_active_processes() -> None:
-    """Kill agent processes owned by any fan-out worker before unwinding."""
-    _TERMINATION_REQUESTED.set()
-    with _ACTIVE_PROCESS_LOCK:
-        processes = list(_ACTIVE_PROCESSES)
-    for proc in processes:
+def print_output(message: str, *, end: str = "\n") -> None:
+    """Write one complete status message without another worker splicing it."""
+    with _OUTPUT_LOCK:
+        sys.stdout.write(message + end)
+        sys.stdout.flush()
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """Kill a tracked command and descendants that kept its process group."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        # The Popen child remains the minimum cleanup guarantee if a platform
+        # cannot address the new session as a process group.
         with contextlib.suppress(OSError):
             proc.kill()
 
 
+def terminate_active_processes() -> None:
+    """Kill all tracked process groups before fan-out workers unwind."""
+    _TERMINATION_REQUESTED.set()
+    with _ACTIVE_PROCESS_LOCK:
+        processes = list(_ACTIVE_PROCESSES)
+    for proc in processes:
+        _kill_process_group(proc)
+
+    # Reap every direct child against one shared deadline. Waiting a full
+    # grace period for each concurrent worker would serialize shutdown.
+    deadline = time.monotonic() + KILL_GRACE_SECONDS
+    for proc in processes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.wait(timeout=remaining)
+
+
 def termination_requested() -> bool:
     return _TERMINATION_REQUESTED.is_set()
+
+
+def wait_for_termination(timeout: float) -> bool:
+    """Wait up to timeout seconds, returning early when shutdown starts."""
+    return _TERMINATION_REQUESTED.wait(timeout)
 
 
 def run_process(
@@ -96,27 +133,35 @@ def run_process(
     log_path: Path | None = None,
     env: dict[str, str] | None = None,
     timeout_is_error: bool = True,
+    output_label: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if termination_requested():
         raise StargateError("Orchestrator is terminating.")
-    print(f"\n$ {shlex.join(args)}", flush=True)
+    prefix = f"[{output_label}] " if output_label else ""
+    print_output(f"\n{prefix}$ {shlex.join(args)}")
     if log_path is not None:
         # Straight to disk, so a silent multi-minute agent can be tailed live
         # instead of surfacing only once the process exits.
         with log_path.open("w") as handle:
-            proc = subprocess.Popen(
-                args, cwd=str(cwd), text=True, stdout=handle,
-                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env,
-            )
-            with _ACTIVE_PROCESS_LOCK:
-                _ACTIVE_PROCESSES.add(proc)
-            if termination_requested():
-                with contextlib.suppress(OSError):
-                    proc.kill()
-            started = time.monotonic()
-            deadline = None if timeout is None else started + timeout
-            timed_out = False
+            proc: subprocess.Popen[str] | None = None
             try:
+                proc = subprocess.Popen(
+                    args,
+                    cwd=str(cwd),
+                    text=True,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    env=env,
+                    start_new_session=True,
+                )
+                with _ACTIVE_PROCESS_LOCK:
+                    _ACTIVE_PROCESSES.add(proc)
+                if termination_requested():
+                    _kill_process_group(proc)
+                started = time.monotonic()
+                deadline = None if timeout is None else started + timeout
+                timed_out = False
                 while True:
                     try:
                         proc.wait(timeout=HEARTBEAT_SECONDS)
@@ -124,7 +169,7 @@ def run_process(
                     except subprocess.TimeoutExpired:
                         pass
                     if deadline is not None and time.monotonic() > deadline:
-                        proc.kill()
+                        _kill_process_group(proc)
                         proc.wait()
                         if timeout_is_error:
                             raise StargateError(
@@ -137,21 +182,30 @@ def run_process(
                     # the trace itself stays out of the terminal.
                     size = log_path.stat().st_size if log_path.exists() else 0
                     elapsed = time.monotonic() - started
-                    print(
-                        f"  ... {elapsed:.0f}s elapsed, {size:,} bytes written",
-                        flush=True,
+                    print_output(
+                        f"{prefix}  ... {elapsed:.0f}s elapsed, "
+                        f"{size:,} bytes written"
                     )
             except BaseException:
                 # A signal reaches the orchestrator, not necessarily the agent.
                 # Leaving it alive would let it keep editing during a resume.
-                with contextlib.suppress(OSError):
-                    proc.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
-                    proc.wait(timeout=KILL_GRACE_SECONDS)
+                if proc is not None:
+                    _kill_process_group(proc)
+                    # The signal handler already reaps all active children
+                    # against one shared deadline. Keep standalone interrupt
+                    # cleanup bounded when no orchestrator signal was handled.
+                    if not termination_requested():
+                        with contextlib.suppress(
+                            subprocess.TimeoutExpired, OSError
+                        ):
+                            proc.wait(timeout=KILL_GRACE_SECONDS)
                 raise
             finally:
-                with _ACTIVE_PROCESS_LOCK:
-                    _ACTIVE_PROCESSES.discard(proc)
+                if proc is not None:
+                    with _ACTIVE_PROCESS_LOCK:
+                        _ACTIVE_PROCESSES.discard(proc)
+        if proc is None:  # pragma: no cover - Popen either returns or raises
+            raise StargateError(f"Could not start command: {shlex.join(args)}")
         output = log_path.read_text() if log_path.exists() else ""
         returncode = 124 if timed_out else proc.returncode
         if check and returncode != 0:
@@ -176,7 +230,7 @@ def run_process(
             f"Command timed out after {timeout}s: {shlex.join(args)}"
         ) from exc
     if capture and proc.stdout:
-        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n", flush=True)
+        print_output(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
     if check and proc.returncode != 0:
         raise StargateError(
             f"Command failed with exit code {proc.returncode}: {shlex.join(args)}"
