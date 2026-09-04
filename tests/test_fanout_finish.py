@@ -220,7 +220,7 @@ def test_failed_fanout_writes_task_failure_reasons_to_summary(root: Path) -> Non
     ) in summary
 
 
-def test_resume_rejects_missing_unreadable_non_object_and_modeless_state(
+def test_resume_rejects_missing_unreadable_non_object_and_invalid_mode_state(
     root: Path,
 ) -> None:
     repo = make_repo(root)
@@ -231,7 +231,9 @@ def test_resume_rejects_missing_unreadable_non_object_and_modeless_state(
         "missing": (None, "No run state at"),
         "unreadable": ("not json {{{\n", "unreadable state.json"),
         "non-object": ("[]\n", "state.json is not a JSON object"),
-        "mode-less": ("{}\n", "state.json has no valid mode"),
+        "null-mode": ('{"mode": null}\n', "state.json has no valid mode"),
+        "empty-mode": ('{"mode": ""}\n', "state.json has no valid mode"),
+        "invalid-mode": ('{"mode": "parallel"}\n', "state.json has no valid mode"),
     }
 
     for run_id, (contents, expected) in cases.items():
@@ -244,6 +246,27 @@ def test_resume_rejects_missing_unreadable_non_object_and_modeless_state(
         assert resumed.returncode == 1, output
         assert expected in resumed.stderr, output
         assert "Traceback" not in output, output
+
+
+def test_resume_treats_legacy_modeless_state_as_linear(root: Path) -> None:
+    repo = make_repo(root)
+    config = root / "legacy-resume.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+
+    first = run(repo, config, "legacy linear state")
+    assert first.returncode == 0, first.stdout + first.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    state = json.loads(state_path.read_text())
+    original_commit = state["commit"]
+    state.pop("mode")
+    state_path.write_text(json.dumps(state, indent=2) + "\n")
+
+    resumed = _resume(repo, config, state["run_id"])
+
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    restored = json.loads(state_path.read_text())
+    assert restored["mode"] == "linear"
+    assert restored["commit"] == original_commit
 
 
 def test_fanout_result_identifies_integration_only_fixer_edits(root: Path) -> None:
@@ -287,3 +310,42 @@ def test_fanout_result_identifies_integration_only_fixer_edits(root: Path) -> No
     assert "fixer edits were not copied back to task branches" in result.stdout
     assert "Review/fixer scope: integration worktree only" in summary
     assert "fixer edits are not copied back to task branches" in summary
+
+
+def test_a_rejected_resume_keeps_the_completed_summary(root: Path) -> None:
+    repo = make_repo(root)
+    graph = root / "tasks.json"
+    _single_task_graph(graph)
+    config = root / "approved.yaml"
+    write_fanout_config(config, graph, "echo unit > unit.txt")
+
+    result = run(repo, config, "keep the approved summary", "--fan-out")
+    assert result.returncode == 0, result.stdout + result.stderr
+    state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
+    run_id = state_path.parent.name
+    approved = (state_path.parent / "summary.md").read_text()
+    assert "APPROVED" in approved, approved
+
+    # Rejected on invocation, before any orchestration: the run's artifacts
+    # still describe the attempt that actually finished.
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "stargate",
+            "--config",
+            str(config),
+            "resume",
+            run_id,
+            "--redo",
+            "developer",
+        ],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+
+    assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+    assert "--redo is not supported for fan-out runs" in rejected.stderr
+    assert (state_path.parent / "summary.md").read_text() == approved

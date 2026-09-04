@@ -21,6 +21,7 @@ from .core import (
     RunContext,
     StargateError,
     git,
+    print_output,
     repo_root,
     run_process,
     split_plan_name,
@@ -42,6 +43,25 @@ from .run import (
 )
 
 TEST_TAIL_LINES = 200
+
+
+def _task_output_label(ctx: RunContext, phase: str) -> str | None:
+    if ctx.mode == "fanout-task":
+        return f"task {ctx.slug}/{phase}"
+    return None
+
+
+def _print_test_output(ctx: RunContext, output: str) -> None:
+    """Keep a parallel task's complete test transcript atomic and attributable."""
+    label = _task_output_label(ctx, "tests")
+    if label is None:
+        print_output(output, end="" if output.endswith("\n") else "\n")
+        return
+
+    prefix = f"[{label}] "
+    chunks = output.splitlines(keepends=True)
+    labelled = "".join(prefix + chunk for chunk in chunks) if chunks else f"[{label}]"
+    print_output(labelled, end="" if labelled.endswith("\n") else "\n")
 
 
 def plan_tests(ctx: RunContext) -> None:
@@ -99,8 +119,14 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
     """Run the configured suite. Returns (exit code, report shown to agents)."""
     settings = ctx.config.get("settings", {})
     command = ctx.test_command
+    output_label = _task_output_label(ctx, "tests")
+    output_prefix = f"[{output_label}] " if output_label else ""
     if not command:
-        print("\nNo automatic test_command configured; skipping orchestrator-level tests.")
+        print_output(
+            "\n"
+            f"{output_prefix}No automatic test_command configured; "
+            "skipping orchestrator-level tests."
+        )
         if ctx.detected:
             candidate = ctx.detected[0]
             return None, (
@@ -114,7 +140,7 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
         )
 
     kind = "detected" if ctx.test_source.startswith("detected:") else "configured"
-    print(f"\nRunning {kind} test command: {command}")
+    print_output(f"\n{output_prefix}Running {kind} test command: {command}")
     timeout = float(settings.get("test_timeout_seconds", 900)) or None
     before = untracked_entries(ctx.worktree)
     try:
@@ -126,6 +152,7 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
             timeout=timeout,
             log_path=artifact,
             timeout_is_error=False,
+            output_label=output_label,
         )
         output, code = proc.stdout or "", proc.returncode
         if code == 124:
@@ -139,7 +166,7 @@ def run_tests(ctx: RunContext, label: str) -> tuple[int | None, str]:
         ctx.test_artifacts |= untracked_entries(ctx.worktree) - before
         save_state(ctx, "running")
 
-    print(output, end="" if output.endswith("\n") else "\n")
+    _print_test_output(ctx, output)
     artifact.write_text(
         f"$ {command}\n\n{output}\n\nexit_code={code}\n"
     )
@@ -189,7 +216,7 @@ def finish(
     print("\n=== RESULT ===")
     print(f"Verdict:   {verdict}")
     print(f"Branch:    {ctx.branch}")
-    print(f"Commit:    {commit_summary(ctx, commit)}")
+    print(f"Commit:    {_result_commit_summary(ctx, commit)}")
     print(f"Worktree:  {ctx.worktree}")
     if ctx.mode == "fanout":
         print("Review/fix: integration worktree only")
@@ -209,6 +236,16 @@ def finish(
             )
         else:
             print("\nNothing was merged, pushed, or deleted automatically.")
+    elif ctx.mode == "fanout":
+        task_commits = _fanout_task_commit_count(ctx)
+        noun = "commit" if task_commits == 1 else "commits"
+        verb = "remains" if task_commits == 1 else "remain"
+        print(
+            "\nNo integration terminal commit was created; "
+            f"{task_commits} completed task {noun} {verb} on the task branches.\n"
+            "Nothing was merged into your original branch, pushed, or deleted "
+            "automatically."
+        )
     else:
         print("\nNothing was committed, merged, pushed, or deleted automatically.")
     print(
@@ -271,7 +308,7 @@ Run: {ctx.run_id}
 Base ref: {ctx.base_ref}
 Base commit: {ctx.base_commit}
 Branch: {ctx.branch}
-Commit: {commit_summary(ctx, commit)}
+Commit: {_result_commit_summary(ctx, commit)}
 Worktree: {ctx.worktree}
 {fanout_details}Verdict: {verdict}
 Test command: {ctx.test_command or "(none)"} ({ctx.test_source})
@@ -319,6 +356,29 @@ Tokens reported: {tokens}
     (ctx.artifacts / "summary.md").write_text(summary)
 
 
+def _fanout_task_commit_count(ctx: RunContext) -> int:
+    saved_records = ctx.fanout.get("tasks", {})
+    if not isinstance(saved_records, dict):
+        return 0
+    return sum(
+        isinstance(record, dict)
+        and isinstance(record.get("commit"), str)
+        and bool(record["commit"])
+        for record in saved_records.values()
+    )
+
+
+def _result_commit_summary(ctx: RunContext, enabled: bool) -> str:
+    if ctx.mode != "fanout" or enabled:
+        return commit_summary(ctx, enabled)
+    task_commits = _fanout_task_commit_count(ctx)
+    noun = "commit" if task_commits == 1 else "commits"
+    return (
+        "none (no integration terminal commit; "
+        f"{task_commits} task {noun} preserved)"
+    )
+
+
 def _summary_cell(value: object) -> str:
     """Keep persisted diagnostic text inside one Markdown table cell."""
     return str(value).replace("|", "\\|").replace("\r\n", "\n").replace(
@@ -351,7 +411,9 @@ def _resume_context(
         raise StargateError(
             f"Cannot resume {args.run_id}: state.json is not a JSON object."
         )
-    mode = state.get("mode")
+    # Runs written before mode was persisted were necessarily linear. Keep
+    # those histories resumable while still rejecting an explicit bad mode.
+    mode = state["mode"] if "mode" in state else "linear"
     if mode not in ("linear", "fanout"):
         raise StargateError(
             f"Cannot resume {args.run_id}: state.json has no valid mode "
@@ -367,46 +429,10 @@ def _resume_context(
         ) from exc
 
 
-def _recorded_run_ids(repo: Path) -> set[str]:
-    run_root = repo / ".stargate" / "runs"
-    if not run_root.is_dir():
-        return set()
-    try:
-        return {path.name for path in run_root.iterdir() if path.is_dir()}
-    except OSError:
-        return set()
-
-
-def _failed_fanout_context(
-    repo: Path,
-    args: argparse.Namespace,
-    config: dict[str, Any],
-    previous_runs: set[str],
-) -> RunContext | None:
-    if args.command == "resume":
-        run_ids = [args.run_id]
-    else:
-        run_ids = sorted(_recorded_run_ids(repo) - previous_runs)
-    contexts: list[RunContext] = []
-    for run_id in run_ids:
-        try:
-            candidate = load_run(repo, run_id, config, use_frozen=False)
-        except (StargateError, OSError, TypeError, ValueError, KeyError):
-            continue
-        if candidate.mode == "fanout" and candidate.task == getattr(args, "task", candidate.task):
-            contexts.append(candidate)
-    # Never guess between concurrent same-task runs in the same repository.
-    return contexts[0] if len(contexts) == 1 else None
-
-
-def _write_failed_fanout_summary(
-    repo: Path,
-    args: argparse.Namespace,
-    config: dict[str, Any],
-    previous_runs: set[str],
-) -> None:
-    ctx = _failed_fanout_context(repo, args, config, previous_runs)
+def _write_failed_fanout_summary(ctx: RunContext | None) -> None:
+    """Leave a failed fan-out run the summary artifact every other run gets."""
     if ctx is None:
+        # The failure preceded orchestration, so no run is ours to describe.
         return
     try:
         write_summary(ctx, ctx.task, "FAILED", None, True)
@@ -427,11 +453,15 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     if fanout:
         from .fanout import orchestrate_fanout
 
-        previous_runs = _recorded_run_ids(repo)
+        orchestrated: list[RunContext] = []
         try:
-            return orchestrate_fanout(args, script_dir, config, repo)
+            return orchestrate_fanout(
+                args, script_dir, config, repo, on_context=orchestrated.append
+            )
         except StargateError:
-            _write_failed_fanout_summary(repo, args, config, previous_runs)
+            _write_failed_fanout_summary(
+                orchestrated[-1] if orchestrated else None
+            )
             raise
 
     if resuming:

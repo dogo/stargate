@@ -10,7 +10,7 @@ from pathlib import Path
 
 import stargate.run as run_module
 from stargate.core import RunContext, StargateError
-from stargate.run import create_worktree, save_state, unique_branch
+from stargate.run import create_worktree, load_run, save_state, unique_branch
 from tests.harness import (
     clean,
     git_output,
@@ -177,6 +177,78 @@ def test_create_worktree_refuses_a_branch_taken_after_name_selection(
     assert git_output(repo, "rev-parse", branch) == git_output(repo, "rev-parse", "main")
 
 
+def test_create_worktree_refuses_an_unrecorded_fanout_task_branch(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    branch = "stargate/raced-task-alpha"
+    subprocess.run(["git", "branch", branch, "main"], cwd=repo, check=True)
+    worktree = root / "worktrees" / "raced-task-alpha"
+    ctx = _context(repo, worktree, branch, root / "artifacts" / "raced-task-alpha")
+    ctx.mode = "fanout-task"
+
+    error = _raises_stargate_error(lambda: create_worktree(ctx))
+
+    assert "refusing to adopt it" in error, error
+    assert not worktree.exists()
+
+
+def test_create_worktree_recovers_a_recorded_fanout_task_branch(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    branch = "stargate/resume-task-alpha"
+    worktree = root / "worktrees" / "resume-task-alpha"
+    ctx = _context(repo, worktree, branch, root / "artifacts" / "resume-task-alpha")
+    ctx.mode = "fanout-task"
+    create_worktree(ctx)
+    save_state(ctx, "failed", "interrupted task")
+    subprocess.run(
+        ["git", "worktree", "remove", str(worktree)],
+        cwd=repo,
+        check=True,
+    )
+
+    create_worktree(ctx)
+
+    assert worktree.exists()
+    assert git_output(worktree, "branch", "--show-current") == branch
+
+
+def test_create_worktree_recovers_a_recorded_fanout_integration_branch(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    branch = "stargate/resume-integration"
+    worktree = root / "worktrees" / "resume-integration"
+    ctx = _context(repo, worktree, branch, root / "artifacts" / "resume-integration")
+    create_worktree(ctx)
+    save_state(ctx, "failed", "budget stop before integration")
+    # What Git itself advises after reclaiming the directory by hand.
+    shutil.rmtree(worktree)
+    subprocess.run(["git", "worktree", "prune"], cwd=repo, check=True)
+
+    create_worktree(ctx)
+
+    assert worktree.exists()
+    assert git_output(worktree, "branch", "--show-current") == branch
+
+
+def test_create_worktree_refuses_an_unrecorded_fanout_integration_branch(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    branch = "stargate/raced-integration"
+    subprocess.run(["git", "branch", branch, "main"], cwd=repo, check=True)
+    worktree = root / "worktrees" / "raced-integration"
+    ctx = _context(repo, worktree, branch, root / "artifacts" / "raced-integration")
+
+    error = _raises_stargate_error(lambda: create_worktree(ctx))
+
+    assert "refusing to adopt it" in error, error
+    assert not worktree.exists()
+
+
 def test_create_worktree_keeps_linear_missing_worktree_recovery(root: Path) -> None:
     repo = make_repo(root)
     branch = "stargate/linear-recovery"
@@ -222,6 +294,21 @@ def test_save_state_replaces_atomically_when_the_final_replace_fails(
 
     assert state_path.read_bytes() == original
     assert not list(ctx.artifacts.glob(".state.json.*.tmp"))
+
+
+def test_load_run_rejects_an_explicit_invalid_mode(
+    root: Path,
+) -> None:
+    repo = make_repo(root)
+    run_id = "invalid-mode"
+    artifacts = repo / ".stargate" / "runs" / run_id
+    artifacts.mkdir(parents=True)
+    (artifacts / "state.json").write_text('{"mode": "parallel"}\n')
+
+    error = _raises_stargate_error(lambda: load_run(repo, run_id, {}, False))
+
+    assert "state.json has no valid mode" in error, error
+    assert "expected 'linear' or 'fanout'" in error, error
 
 
 def test_list_marks_a_linear_budget_stop_resumable(root: Path) -> None:
@@ -335,7 +422,7 @@ def test_clean_fanout_preflights_a_locked_integration_worktree(root: Path) -> No
     )
 
 
-def test_clean_all_preflights_every_run_before_removing_any(root: Path) -> None:
+def test_clean_all_skips_an_unsafe_run_and_cleans_the_rest(root: Path) -> None:
     repo, run_id, branch, integration, tasks, artifacts = _fanout_run(root)
     safe_artifacts, safe_worktree, safe_branch = recorded_run(repo, "safe")
     subprocess.run(
@@ -348,14 +435,19 @@ def test_clean_all_preflights_every_run_before_removing_any(root: Path) -> None:
 
     assert proc.returncode == 1, proc.stdout + proc.stderr
     assert "is dirty" in proc.stderr, proc.stderr
+    assert (
+        "Skipped 1 of 2 runs that failed safety checks" in proc.stderr
+    ), proc.stderr
+    # The unsafe fan-out run keeps every one of its targets: atomicity holds
+    # inside a run, not across unrelated ones.
     assert artifacts.exists() and integration.exists()
     assert recorded_branch_exists(repo, branch)
-    assert safe_artifacts.exists() and safe_worktree.exists()
-    assert recorded_branch_exists(repo, safe_branch)
     assert all(
         path.exists() and recorded_branch_exists(repo, task_branch)
         for task_branch, path in tasks.values()
     )
+    assert not safe_artifacts.exists() and not safe_worktree.exists()
+    assert not recorded_branch_exists(repo, safe_branch)
 
 
 def test_clean_fanout_rejects_a_task_target_borrowed_from_another_branch(

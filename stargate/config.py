@@ -162,9 +162,13 @@ def parse_usage(transcript: str, pattern: str | None) -> int:
     """
     if not pattern:
         return 0
-    match = re.search(pattern, transcript)
-    if not match or not match.groups():
+    # The last match, never the first: an agent that reads or writes test
+    # fixtures echoes strings shaped like the usage footer into its own
+    # transcript, and the CLI prints the real total once, at the end.
+    matches = list(re.finditer(pattern, transcript))
+    if not matches or not matches[-1].groups():
         return 0
+    match = matches[-1]
     try:
         return int(match.group(1).replace(",", "").replace(".", "").replace("_", ""))
     except ValueError:

@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 class StargateError(RuntimeError):
@@ -75,15 +75,25 @@ _TERMINATION_REQUESTED = threading.Event()
 _OUTPUT_LOCK = threading.RLock()
 
 
-def print_output(message: str, *, end: str = "\n") -> None:
+def print_output(
+    message: str,
+    *,
+    end: str = "\n",
+    file: TextIO | None = None,
+) -> None:
     """Write one complete status message without another worker splicing it."""
+    stream = sys.stdout if file is None else file
     with _OUTPUT_LOCK:
-        sys.stdout.write(message + end)
-        sys.stdout.flush()
+        stream.write(message + end)
+        stream.flush()
 
 
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:
     """Kill a tracked command and descendants that kept its process group."""
+    if proc.poll() is not None:
+        # Already reaped, so its PID is free for the kernel to reissue, and
+        # killpg would signal a whole unrelated group under that number.
+        return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:

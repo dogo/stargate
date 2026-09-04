@@ -49,3 +49,28 @@ def test_runner_reports_named_failures(root: Path) -> None:
     assert "not ok  test_intentional_failure" in stdout.getvalue()
     assert "--- test_intentional_failure ---" in stderr.getvalue()
     assert "1 failed, 0 passed" in stderr.getvalue()
+
+
+def test_runner_does_not_count_an_import_failure_as_a_passing_test(root: Path) -> None:
+    import test_stargate
+
+    def passes(_root: Path) -> None:
+        pass
+
+    def discover_with_import_failure():
+        return [("test_that_ran", passes)], [("tests.test_broken", "import failed")]
+
+    original_discovery = test_stargate._discover_tests
+    test_stargate._discover_tests = discover_with_import_failure
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = test_stargate._run_tests()
+    finally:
+        test_stargate._discover_tests = original_discovery
+
+    assert exit_code == 1
+    assert "ok  test_that_ran" in stdout.getvalue()
+    assert "--- tests.test_broken ---" in stderr.getvalue()
+    assert "1 failed, 1 passed" in stderr.getvalue()

@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any
 from .agent import invoke_agent
 from .commit import commit_run
 from .config import commit_enabled, prompt_dirs, render_prompt
-from .core import RunContext, StargateError, git_quiet, short_name
+from .core import RunContext, StargateError, git_quiet, print_output, short_name
 from .run import (
     budget_spent,
     complete_stage,
@@ -158,14 +159,12 @@ def parse_task_graph(
         acceptance = item.get("acceptance", [])
         if (
             not isinstance(acceptance, list)
-            or ("acceptance" in item and not acceptance)
             or not all(
                 isinstance(value, str) and value.strip() for value in acceptance
             )
         ):
             raise StargateError(
-                f"{task_where}.acceptance, when present, must be a non-empty "
-                "list of non-empty strings."
+                f"{task_where}.acceptance must be a list of non-empty strings."
             )
         tasks.append(
             FanoutTask(
@@ -319,7 +318,7 @@ def _merge(worktree: Path, branch: str, purpose: str) -> None:
     # retain that state between scheduler invocations, so make an old merge
     # recoverable before attempting the next one.
     if _merge_residue(worktree):
-        print(f"Recovering an interrupted merge in {worktree}.", flush=True)
+        print_output(f"Recovering an interrupted merge in {worktree}.")
         _reset_worktree(worktree, "HEAD", clean_untracked=False)
 
     tracked = git_quiet(
@@ -339,7 +338,9 @@ def _merge(worktree: Path, branch: str, purpose: str) -> None:
         stderr=subprocess.STDOUT,
     )
     if proc.stdout:
-        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+        print_output(
+            proc.stdout, end="" if proc.stdout.endswith("\n") else "\n"
+        )
     if proc.returncode == 0:
         return
     abort = subprocess.run(
@@ -501,15 +502,22 @@ def _prepare_task(ctx: RunContext, record: dict[str, Any]) -> RunContext:
     existed = task_ctx.worktree.exists() or bool(
         _ref_commit(ctx.repo, task_ctx.branch)
     )
-    create_worktree(task_ctx)
+    create_worktree(
+        task_ctx,
+        recover_recorded_fanout_branch=bool(record.get("branch_created")),
+    )
+    if not record.get("branch_created"):
+        # Persist ownership only after Git creates the branch successfully. A
+        # competing process that takes the planned name must still be refused.
+        record["branch_created"] = True
+        save_state(ctx, "running")
     _assert_branch(task_ctx.worktree, task_ctx.branch, "Task")
 
     if existed:
-        print(
+        print_output(
             f"Clean retry for task {record['id']}: resetting {task_ctx.worktree} "
             f"to {preparation_base[:12]} and discarding the unfinished "
-            "attempt's edits.",
-            flush=True,
+            "attempt's edits."
         )
         _reset_worktree(task_ctx.worktree, preparation_base, clean_untracked=True)
 
@@ -584,7 +592,6 @@ def _execute_task(
     prompts: list[Path],
     graph: str,
 ) -> dict[str, Any]:
-    starting_tokens = task_ctx.tokens_used
     task_ctx.stage = "developer"
     save_state(task_ctx, "running")
     before = worktree_fingerprint(task_ctx)
@@ -595,7 +602,7 @@ def _execute_task(
         base_ref=task_ctx.base_commit,
         plan=graph,
     )
-    print(f"\n=== TASK {task.id}: DEVELOPER ===", flush=True)
+    print_output(f"\n=== TASK {task.id}: DEVELOPER ===")
     invoke_agent(
         task_ctx,
         "developer",
@@ -624,7 +631,6 @@ def _execute_task(
         "commit": task_ctx.commit,
         "test_exit": test_exit,
         "tokens_used": task_ctx.tokens_used,
-        "token_delta": task_ctx.tokens_used - starting_tokens,
         "test_artifacts": sorted(task_ctx.test_artifacts),
     }
     (task_ctx.artifacts / "result.json").write_text(
@@ -687,6 +693,7 @@ def _recover_task(ctx: RunContext, record: dict[str, Any]) -> bool:
     try:
         tokens_used = max(
             0,
+            int(record.get("tokens_used", 0)),
             int(state.get("tokens_used", 0)),
             int(result.get("tokens_used", 0)),
         )
@@ -709,10 +716,9 @@ def _recover_task(ctx: RunContext, record: dict[str, Any]) -> bool:
         ),
         error=None,
     )
-    print(
+    print_output(
         f"Recovered completed task {record['id']} at {commit[:12]} from its "
-        "task branch.",
-        flush=True,
+        "task branch."
     )
     return True
 
@@ -759,7 +765,7 @@ def _run_scheduler(
                 next_phase = f"fan-out task {pending[0]}" if pending else "integration"
                 if budget_spent(ctx, next_phase):
                     budget_reached = True
-                    print(
+                    print_output(
                         "The cap is enforced between task agents. Up to "
                         f"{max_parallel} concurrently started task agent(s) may "
                         "finish above it; no more task agents will be scheduled.",
@@ -792,10 +798,9 @@ def _run_scheduler(
                         _execute_task, ctx, task_ctx, by_id[task.id], prompts, graph
                     )
                     running[future] = (task.id, task_ctx)
-                    print(
+                    print_output(
                         f"Scheduled {task.id} on {record['branch']} "
-                        f"({len(running)}/{max_parallel} slots)",
-                        flush=True,
+                        f"({len(running)}/{max_parallel} slots)"
                     )
             if not running:
                 break
@@ -819,7 +824,9 @@ def _run_scheduler(
                         0,
                         task_ctx.tokens_used - previous_tokens,
                     )
-                    print(f"\nTask {task_id} failed: {exc}", file=sys.stderr)
+                    print_output(
+                        f"\nTask {task_id} failed: {exc}", file=sys.stderr
+                    )
                 else:
                     previous_tokens = int(record.get("tokens_used", 0))
                     record.update(
@@ -834,10 +841,9 @@ def _run_scheduler(
                     ctx.tokens_used += max(
                         0, int(result["tokens_used"]) - previous_tokens
                     )
-                    print(
+                    print_output(
                         f"\nTask {task_id} complete at "
-                        f"{result['commit'][:12]}",
-                        flush=True,
+                        f"{result['commit'][:12]}"
                     )
                 save_state(ctx, "running")
     except BaseException as exc:
@@ -1038,8 +1044,14 @@ def orchestrate_fanout(
     script_dir: Path,
     config: dict[str, Any],
     repo: Path,
+    on_context: Callable[[RunContext], None] | None = None,
 ) -> int:
-    """Run or resume the opt-in DAG workflow."""
+    """Run or resume the opt-in DAG workflow.
+
+    `on_context` receives the run being orchestrated once it is loaded or
+    created and validated, so a caller handling a failure can act on that exact
+    run instead of re-deriving it from the runs directory.
+    """
     resuming = args.command == "resume"
     commit_error = (
         "Fan-out requires commits to move work between task branches; "
@@ -1083,6 +1095,12 @@ def orchestrate_fanout(
     print(f"Worktree: {ctx.worktree}   (integration)")
     print(f"Artifacts:{ctx.artifacts}")
 
+    # Announced only past invocation and config validation: an error raised
+    # before any orchestration happened must leave an existing run's artifacts
+    # exactly as its last completed attempt wrote them.
+    if on_context is not None:
+        on_context(ctx)
+
     try:
         plan_tests(ctx)
         tasks, graph = _load_or_create_graph(ctx, prompts, max_tasks)
@@ -1092,7 +1110,10 @@ def orchestrate_fanout(
         if scheduler_exit is not None:
             # `finish` gives this resumable terminal path the same summary and
             # RESULT block as every other budget stop. The integration worktree
-            # may not exist yet, so create only its untouched base branch.
+            # may not exist yet, so create only its untouched base branch. Do
+            # not put a terminal commit on that branch: a later resume must
+            # integrate task work directly on the frozen base, without a
+            # historical BUDGET_EXCEEDED marker beneath it.
             create_worktree(ctx)
             _assert_branch(ctx.worktree, ctx.branch, "Integration")
             exit_code = finish(
@@ -1100,7 +1121,7 @@ def orchestrate_fanout(
                 ctx.task,
                 "BUDGET_EXCEEDED",
                 None,
-                commit=True,
+                commit=False,
             )
             print(
                 f"\nResume with a larger token budget: stargate resume {ctx.run_id}",

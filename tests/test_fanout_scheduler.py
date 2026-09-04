@@ -148,6 +148,27 @@ def test_failed_task_retry_discards_partial_edits_at_the_frozen_base(
     assert git_output(retried.worktree, "status", "--porcelain") == ""
 
 
+def test_pending_task_recreates_its_removed_recorded_worktree(root: Path) -> None:
+    repo = make_repo(root)
+    tasks = _tasks(("alpha", ()))
+    ctx = _context(root, repo, tasks)
+    record = ctx.fanout["tasks"]["alpha"]
+
+    first = fanout._prepare_task(ctx, record)
+    assert record["branch_created"] is True
+    subprocess.run(
+        ["git", "worktree", "remove", str(first.worktree)],
+        cwd=repo,
+        check=True,
+    )
+
+    recovered = fanout._prepare_task(ctx, record)
+
+    assert recovered.worktree.exists()
+    assert git_output(recovered.worktree, "branch", "--show-current") == record["branch"]
+    assert git_output(recovered.worktree, "rev-parse", "HEAD") == record["base_commit"]
+
+
 def test_scheduler_persists_tasks_as_the_live_parallel_stage(root: Path) -> None:
     repo = make_repo(root)
     tasks = _tasks(("alpha", ()))
@@ -224,6 +245,11 @@ def test_committed_task_is_recovered_without_a_second_commit_or_token_charge(
         repo, "rev-list", "--count", f"{ctx.base_commit}..{record['branch']}"
     ) == "1"
 
+    # A prior failed attempt may already have charged more usage than the
+    # committed attempt persisted before the crash. Recovery must never lower
+    # the task record or charge that older usage a second time.
+    record["tokens_used"] = 17
+    ctx.tokens_used = 17
     with patch(
         "stargate.fanout._execute_task",
         side_effect=AssertionError("completed task unexpectedly re-ran"),
@@ -232,8 +258,8 @@ def test_committed_task_is_recovered_without_a_second_commit_or_token_charge(
         assert fanout._run_scheduler(ctx, tasks, [], "{}", 1) is None
 
     assert record["commit"] == terminal_commit
-    assert record["tokens_used"] == 11
-    assert ctx.tokens_used == 11
+    assert record["tokens_used"] == 17
+    assert ctx.tokens_used == 17
     assert git_output(
         repo, "rev-list", "--count", f"{ctx.base_commit}..{record['branch']}"
     ) == "1"
@@ -362,15 +388,31 @@ def test_parallel_budget_stop_is_bounded_reported_and_resumable(root: Path) -> N
     assert "Up to 2 concurrently started task agent(s)" in first.stderr
     assert "=== RESULT ===" in first.stdout
     assert "Verdict:   BUDGET_EXCEEDED" in first.stdout
+    assert (
+        "Commit:    none (no integration terminal commit; 2 task commits preserved)"
+        in first.stdout
+    )
+    assert (
+        "No integration terminal commit was created; 2 completed task commits "
+        "remain on the task branches."
+        in first.stdout
+    )
+    assert "Nothing was committed" not in first.stdout
     state_path = next((repo / ".stargate" / "runs").glob("*/state.json"))
     state = json.loads(state_path.read_text())
     assert state["status"] == "budget_exceeded"
     assert state["stage"] == "tasks"
     assert state["tokens_used"] == 12
     assert (state_path.parent / "summary.md").exists()
-    assert "Verdict: BUDGET_EXCEEDED" in (
-        state_path.parent / "summary.md"
-    ).read_text()
+    summary = (state_path.parent / "summary.md").read_text()
+    assert "Verdict: BUDGET_EXCEEDED" in summary
+    assert (
+        "Commit: none (no integration terminal commit; 2 task commits preserved)"
+        in summary
+    )
+    assert "Commit: disabled" not in summary
+    assert git_output(repo, "rev-parse", state["branch"]) == state["base_commit"]
+    assert "terminal_commit" not in state["fanout"]
 
     data["settings"]["max_task_tokens"] = 100
     config.write_text(yaml.safe_dump(data))
@@ -385,6 +427,13 @@ def test_parallel_budget_stop_is_bounded_reported_and_resumable(root: Path) -> N
         record["status"] == "complete"
         for record in state["fanout"]["tasks"].values()
     )
+    history = git_output(
+        repo,
+        "log",
+        "--format=%B",
+        f"{state['base_commit']}..{state['branch']}",
+    )
+    assert "BUDGET_EXCEEDED" not in history
 
 
 def test_interrupt_settles_running_records_for_a_clean_resume(root: Path) -> None:
@@ -463,7 +512,7 @@ def test_invalid_fanout_commit_modes_leave_no_run_artifacts(root: Path) -> None:
     write_fanout_config(config, graph, "echo alpha > alpha.txt")
 
     no_commit = run(repo, config, "invalid fanout", "--fan-out", "--no-commit")
-    assert no_commit.returncode == 1
+    assert no_commit.returncode == 2
     assert "commit" in no_commit.stderr.lower()
     assert not (repo / ".stargate").exists()
 

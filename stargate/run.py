@@ -293,6 +293,16 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
     if not state_path.exists():
         raise StargateError(f"No run state at {state_path}")
     state = json.loads(state_path.read_text())
+    if not isinstance(state, dict):
+        raise StargateError(f"Cannot load {run_id}: state.json is not a JSON object.")
+    # Runs created before mode was persisted predate fan-out and are linear.
+    # An explicitly stored invalid value is still corruption, not a migration.
+    mode = state["mode"] if "mode" in state else "linear"
+    if mode not in ("linear", "fanout"):
+        raise StargateError(
+            f"Cannot load {run_id}: state.json has no valid mode "
+            "(expected 'linear' or 'fanout')."
+        )
     frozen = artifacts / "config.yaml"
     if use_frozen and frozen.exists():
         # Default to the run's own frozen config so resuming does not silently
@@ -316,7 +326,7 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         test_artifacts=set(state.get("test_artifacts", [])),
         commit=str(state.get("commit") or ""),
         commit_error=str(state.get("commit_error") or ""),
-        mode=str(state.get("mode") or "linear"),
+        mode=mode,
         fanout=dict(state.get("fanout") or {}),
         tag=(
             match.group(1)
@@ -474,7 +484,11 @@ def _registered_worktrees(
     return registrations, locked
 
 
-def create_worktree(ctx: RunContext) -> None:
+def create_worktree(
+    ctx: RunContext,
+    *,
+    recover_recorded_fanout_branch: bool = False,
+) -> None:
     worktree = ctx.worktree.resolve()
     registrations, _ = _registered_worktrees(ctx.repo)
     registered = worktree in registrations
@@ -510,10 +524,33 @@ def create_worktree(ctx: RunContext) -> None:
     if ctx.mode.startswith("fanout"):
         exists = branch_exists(ctx.repo, ctx.branch)
         if exists:
-            raise StargateError(
-                f"Branch {ctx.branch!r} already exists without the expected registered "
-                "worktree; refusing to adopt it."
+            state_path = ctx.artifacts / "state.json"
+            try:
+                recorded = json.loads(state_path.read_text())
+            except (OSError, ValueError):
+                recorded = None
+            recorded_worktree = (
+                recorded.get("worktree") if isinstance(recorded, dict) else None
             )
+            # The run's own state.json is the ownership record: a branch this
+            # run registered on this path stays adoptable after `git worktree
+            # prune` reclaims the directory, for the integration worktree as
+            # much as for a task's.
+            saved_run_matches = isinstance(recorded, dict) and (
+                recorded.get("mode") == ctx.mode
+                and recorded.get("run_id") == ctx.run_id
+                and recorded.get("branch") == ctx.branch
+                and isinstance(recorded_worktree, str)
+                and Path(recorded_worktree).resolve() == worktree
+            )
+            branch_is_recorded = saved_run_matches or (
+                ctx.mode == "fanout-task" and recover_recorded_fanout_branch
+            )
+            if not branch_is_recorded:
+                raise StargateError(
+                    f"Branch {ctx.branch!r} already exists without the expected registered "
+                    "worktree; refusing to adopt it."
+                )
     else:
         exists = (
             git(ctx.repo, "rev-parse", "--verify", ctx.branch, check=False).returncode == 0
@@ -689,18 +726,34 @@ def clean_runs(repo: Path, run_id: str | None, all_runs: bool) -> int:
     if not run_ids:
         print(f"No recorded runs in {root}")
         return 0
+    # Atomicity is per run: a run is never partially destroyed, but one run
+    # that fails its checks -- an in-progress run is the common case -- must
+    # not hold every unrelated finished run hostage.
     failures: list[tuple[str, str]] = []
+    cleanable: list[str] = []
     for candidate in run_ids:
         try:
             clean_run(repo, candidate, validate_only=True)
         except StargateError as exc:
             failures.append((candidate, str(exc)))
+        else:
+            cleanable.append(candidate)
+    for candidate in cleanable:
+        try:
+            clean_run(repo, candidate)
+        except StargateError as exc:
+            # Re-checked at removal time, so state that changed since the
+            # preflight is reported like any other skipped run.
+            failures.append((candidate, str(exc)))
     if failures:
-        for candidate, error in failures:
+        for candidate, error in sorted(failures):
             print(f"  {candidate}: {error}", file=sys.stderr)
-        raise StargateError(f"Could not clean {len(failures)} of {len(run_ids)} runs.")
-    for candidate in run_ids:
-        clean_run(repo, candidate)
+        print(
+            f"Skipped {len(failures)} of {len(run_ids)} runs that failed "
+            "safety checks; the remaining runs were cleaned.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

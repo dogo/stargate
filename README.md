@@ -50,7 +50,8 @@ token-budget stop. A fan-out run also commits each completed task and its final
 integration verdict. The verdict is part of the commit message. A run that
 crashes does not create a terminal commit; `resume` does so when the run
 eventually reaches a verdict. A fan-out token-budget stop before integration is
-the exception: it is resumable but has no terminal commit yet.
+the exception: it writes its RESULT and summary and remains resumable, but has
+no integration terminal commit yet.
 
 The orchestrator never merges into or otherwise changes the branch checked out
 in the user's original repository, and it never rebases, pushes, or deletes a
@@ -132,8 +133,8 @@ Everything under `settings:` in the layered effective config. All are optional.
 | `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
 | `commit` | `true` | Commit results on the run's own branch. Linear runs can set this to `false`, or pass `--no-commit`, to leave the worktree dirty. Fan-out requires `true` and rejects `--no-commit`. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
-| `max_fanout_tasks` | `8` | Maximum number of DAG nodes the fan-out architect may return. |
-| `max_parallel_tasks` | `2` | Maximum ready fan-out tasks run concurrently. Overridable for fan-out runs and resumes with `--max-parallel-tasks`; linear invocations reject that flag. |
+| `max_fanout_tasks` | `8` | Maximum number of DAG nodes the fan-out architect may return. Must be a YAML integer: a quoted `"8"` is rejected, not coerced. |
+| `max_parallel_tasks` | `2` | Maximum ready fan-out tasks run concurrently. Must be a YAML integer, like `max_fanout_tasks`. Overridable for fan-out runs and resumes with `--max-parallel-tasks`; linear invocations reject that flag. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
 | `agent_timeout_seconds` | `1800` | Kills a single agent invocation. `0` means no timeout. |
 | `agent_retries` | `0` | Retries after a failed agent invocation. `0` preserves the single-attempt behavior; `2` allows up to three attempts. |
@@ -154,7 +155,7 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 | `1` | An agent errored or timed out, configuration was invalid, or another operational error stopped the command. `resume` is offered when a run was already created. |
 | `2` | The CLI arguments were invalid, the reviewer still requested changes after the last allowed fixer pass, or the fixer changed nothing and the loop stopped early. |
 | `3` | Approved, but the explicit test command or an `auto`-detected command failed. |
-| `4` | `max_task_tokens` was reached; the run stopped between phases. A linear stop goes through the normal RESULT/summary/commit path. A fan-out stop before integration records resumable state and returns immediately, without a RESULT block, `summary.md`, or terminal commit. |
+| `4` | `max_task_tokens` was reached; the run stopped between phases. A linear stop goes through the normal RESULT/summary/commit path. A fan-out stop before integration also prints a RESULT block and writes `summary.md`, but records resumable task state without an integration terminal commit. |
 | `5` | The run reached a verdict, but Git could not create its commit. The work remains intact and staged where possible; the error prints a manual recovery command. |
 | `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
 | `130` | The run was interrupted with Ctrl-C/SIGINT. Its state is recorded as failed and `resume` is offered. |
@@ -283,8 +284,9 @@ stargate run --fan-out --max-parallel-tasks 3 \
 
 The architect returns a validated `tasks.json` instead of a prose plan. Each
 node has an ID and a self-contained task; `acceptance` and `depends_on` are
-optional lists. Stargate rejects duplicate or malformed IDs, unknown, duplicate
-or self-dependencies, cycles, malformed JSON, and graphs larger than
+optional lists, and an explicit empty list is equivalent to omitting either
+field. Stargate rejects duplicate or malformed IDs, unknown, duplicate or
+self-dependencies, cycles, malformed JSON, and graphs larger than
 `max_fanout_tasks` before a developer starts.
 
 Ready nodes run concurrently, each on its own branch and worktree. A dependent
@@ -417,8 +419,8 @@ my-project/.stargate/runs/<run-id>/
 ```
 
 Integration tests, reviews, fixes, the terminal commit message and `summary.md`
-remain at the run-artifact root. A fan-out budget stop before integration does
-not create `summary.md`; resume continues from the saved task state.
+remain at the run-artifact root. A fan-out budget stop before integration writes
+`summary.md`; resume continues from the saved task state.
 
 Each role prints its `.log` path before starting, so it can be followed with
 `tail -f`, and its exit code and duration when it ends. While an agent runs it
@@ -649,9 +651,10 @@ the merges already contain every file change.
 Red outcomes that reach the finish path are durable too. `CHANGES_REQUESTED`, a
 failed test command and a linear `BUDGET_EXCEEDED` are recorded in the subject
 and `Stargate-Verdict` trailer rather than being presented as success. A fan-out
-budget stop before integration, crashes, agent errors, invalid reviewer output
-and catchable signals do not reach that path, so they have no terminal commit
-until a successful `resume` reaches a verdict.
+budget stop before integration writes a RESULT and summary but deliberately
+does not put a terminal commit at the base of the integration branch. Crashes,
+agent errors, invalid reviewer output and catchable signals also have no
+terminal commit; a successful `resume` records the eventual integration verdict.
 
 The commit stages tracked edits and deletions plus new untracked implementation
 files. Gitignored files remain ignored. Stargate also snapshots untracked
@@ -744,12 +747,17 @@ creates, repairs or deletes run artifacts.
 
 ## Cleaning runs
 
-`stargate clean <run-id>` removes one run; `stargate clean --all` attempts every
-recorded run. A run is removed only when its branch is merged into the current
-`HEAD` and Git accepts the worktree as clean. There is no force option. After
-those checks, Stargate removes the linked worktree, its `stargate/*` branch and
-the run's `.stargate/runs/<run-id>/` artifacts. A missing worktree is pruned
-through Git before the remaining branch and artifacts are removed.
+`stargate clean <run-id>` removes one run. `stargate clean --all` preflights
+every recorded run and removes each run that passes; runs that fail a safety
+check are skipped, each reported with its reason, and the command exits `1`.
+Atomicity is per run: a single run is never partially removed, so a fan-out
+run keeps all of its worktrees, branches and artifacts if any one of its
+targets fails. A run is removed only when its branch
+is merged into the current `HEAD` and Git accepts the worktree as clean. There
+is no force option. After those checks, Stargate removes the linked worktree,
+its `stargate/*` branch and the run's `.stargate/runs/<run-id>/` artifacts. If a
+worktree is missing but still registered, Stargate removes only that stale Git
+registration before removing the remaining branch and artifacts.
 
 ## Resuming a failed run
 
@@ -833,11 +841,16 @@ developer:
 ```
 
 The totals are summed across phases and checked at each phase boundary. So a
-budget stops the *next* agent from starting, never the one already running — a
-single runaway invocation still overshoots. Hitting the cap ends the run with
-verdict `BUDGET_EXCEEDED` and exit code 4, leaving the branch and worktree
-intact and committing any work produced so far. No empty commit is made when
-the budget is reached before implementation changes exist.
+budget stops the *next* agent from starting, never one already running. Parallel
+fan-out work can overshoot by the agents that were already scheduled; the RESULT
+and `summary.md` report the run's true totals as `Tokens: X of Y`, so the
+overshoot is visible there as a total above the cap, and the scheduler explains
+it on stderr when it stops. Hitting the cap ends the
+run with verdict `BUDGET_EXCEEDED` and exit code 4, leaving its worktree state
+intact. A linear stop commits changes through its normal finish path. Completed
+fan-out tasks already have task commits, but a stop before integration does not
+create a terminal integration commit; `resume` continues from the saved task
+state.
 
 For a genuine in-flight cap, use a vendor flag in the command itself. Claude
 has one; Codex has no equivalent today:

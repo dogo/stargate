@@ -170,22 +170,23 @@ def test_empty_graph_name_is_rejected(root: Path) -> None:
         assert error == "Fan-out architect output needs a usable string 'name'."
 
 
-def test_acceptance_is_optional_but_must_be_non_empty_when_present(
-    root: Path,
-) -> None:
+def test_acceptance_is_optional_and_an_empty_list_matches_omission(root: Path) -> None:
     del root
-    optional = _task("optional")
-    optional.pop("acceptance")
-    name, tasks = fanout.parse_task_graph(_graph([optional]), 8)
-    assert tasks[0].acceptance == ()
+    omitted = _task("omitted")
+    omitted.pop("acceptance")
+    explicit = _task("explicit", acceptance=[])
+    name, tasks = fanout.parse_task_graph(_graph([omitted, explicit]), 8)
+    assert [task.acceptance for task in tasks] == [(), ()]
     normalized = fanout.normalized_graph(name, tasks)
-    assert "acceptance" not in normalized
+    assert all(
+        "acceptance" not in task for task in json.loads(normalized)["tasks"]
+    )
     assert fanout.parse_task_graph(normalized, 8) == (name, tasks)
 
-    for value in ([], [""], ["   "], "done", [1]):
+    for value in ([""], ["   "], "done", [1]):
         error = _parse_error(_graph([_task("alpha", acceptance=value)]))
         assert "Fan-out task 'alpha' at tasks[0].acceptance" in error
-        assert "non-empty list of non-empty strings" in error
+        assert "list of non-empty strings" in error
 
 
 def test_frozen_graph_detects_sequence_type_and_order_changes(root: Path) -> None:

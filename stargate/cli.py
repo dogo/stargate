@@ -49,7 +49,8 @@ def _saved_run_mode(repo: Path, run_id: str) -> str | None:
         return None
     if not isinstance(state, dict):
         return None
-    return "fanout" if state.get("mode") == "fanout" else "linear"
+    mode = state["mode"] if "mode" in state else "linear"
+    return mode if mode in ("linear", "fanout") else None
 
 
 def _validate_resume_arguments(
@@ -108,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     clean.add_argument("run_id", nargs="?", help="Run ID shown by 'stargate list'.")
     clean.add_argument(
         "--all", action="store_true", dest="all_runs",
-        help="Clean every recorded run that passes the safety checks.",
+        help="Clean every recorded run that passes the safety checks, skipping the rest.",
     )
 
     run = sub.add_parser("run", help="Plan, implement, review and fix a task.")

@@ -4,8 +4,9 @@ from __future__ import annotations
 import shlex
 import subprocess
 import sys
+from pathlib import Path
 
-from .core import RunContext, StargateError, git, git_quiet, run_process
+from .core import RunContext, StargateError, git_quiet, print_output, run_process
 
 COMMIT_SUBJECT_CHARS = 72
 
@@ -14,6 +15,33 @@ COMMIT_TIMEOUT_SECONDS = 600
 
 
 COMMIT_OUTPUT_LINES = 20
+
+
+def _commit_output_label(ctx: RunContext) -> str | None:
+    if ctx.mode == "fanout-task":
+        return f"task {ctx.slug}/commit"
+    return None
+
+
+def _labelled_output(label: str, output: str) -> str:
+    prefix = f"[{label}] "
+    chunks = output.splitlines(keepends=True)
+    return "".join(prefix + chunk for chunk in chunks) if chunks else f"[{label}]"
+
+
+def _print_commit_output(ctx: RunContext, output: str) -> None:
+    if not output:
+        return
+    label = _commit_output_label(ctx)
+    if label:
+        output = _labelled_output(label, output)
+    print_output(output, end="" if output.endswith("\n") else "\n")
+
+
+def _print_commit_diagnostic(ctx: RunContext, message: str) -> None:
+    label = _commit_output_label(ctx)
+    displayed = _labelled_output(label, message) if label else message
+    print_output(f"\n{displayed}", file=sys.stderr)
 
 
 def commit_message(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
@@ -61,7 +89,11 @@ themselves never run git. Plan, review and traces:
 def stage_run_changes(ctx: RunContext) -> bool:
     """Stage agent work while excluding untracked test-created entries."""
     excludes = [f":(exclude,literal){name}" for name in sorted(ctx.test_artifacts)]
-    git(ctx.worktree, "add", "-A", "--", ".", *excludes, capture=True)
+    run_process(
+        ["git", "add", "-A", "--", ".", *excludes],
+        ctx.worktree,
+        output_label=_commit_output_label(ctx),
+    )
     proc = subprocess.run(
         ["git", "diff", "--cached", "--quiet"],
         cwd=str(ctx.worktree),
@@ -92,7 +124,7 @@ def commit_failure(ctx: RunContext, reason: str, output: str = "") -> None:
             f"  {line}" for line in tail.splitlines()
         )
     ctx.commit_error = message
-    print(f"\n{message}", file=sys.stderr)
+    _print_commit_diagnostic(ctx, message)
 
 
 def commit_run(
@@ -131,6 +163,14 @@ def commit_run(
 
     message_path = ctx.artifacts / "commit-message.txt"
     message_path.write_text(commit_message(ctx, verdict, test_exit))
+    output_label = _commit_output_label(ctx)
+    output_log: Path | None = None
+    if output_label:
+        # A log-backed process is tracked by the signal-safe runner. Its
+        # transcript is then printed as one labelled block and removed; the
+        # durable commit message remains the only new task artifact.
+        output_log = ctx.artifacts / ".commit-output.log"
+        output_log.unlink(missing_ok=True)
     try:
         proc = run_process(
             [
@@ -143,10 +183,17 @@ def commit_run(
             ctx.worktree,
             check=False,
             timeout=COMMIT_TIMEOUT_SECONDS,
+            log_path=output_log,
+            output_label=output_label,
         )
     except StargateError as exc:
         commit_failure(ctx, str(exc))
         return "failed"
+    finally:
+        if output_log is not None:
+            output_log.unlink(missing_ok=True)
+    if output_label:
+        _print_commit_output(ctx, proc.stdout or "")
     if proc.returncode:
         commit_failure(ctx, f"git exit {proc.returncode}", proc.stdout or "")
         return "failed"
@@ -159,12 +206,12 @@ def commit_run(
         ctx.worktree, "status", "--porcelain", "--", ".", *excludes
     )
     if status:
-        print(
-            "\nWarning: the commit succeeded, but a repository hook modified "
+        warning = (
+            "Warning: the commit succeeded, but a repository hook modified "
             f"files afterward. Those changes remain uncommitted in {ctx.worktree}; "
-            "stargate will not create a second commit.",
-            file=sys.stderr,
+            "stargate will not create a second commit."
         )
+        _print_commit_diagnostic(ctx, warning)
     return "committed"
 
 
