@@ -59,6 +59,7 @@ class RunContext:
     commit_error: str = ""
     mode: str = "linear"
     fanout: dict[str, Any] = field(default_factory=dict)
+    review: dict[str, Any] = field(default_factory=dict)
 
 
 # How often a running agent prints that it is still alive.

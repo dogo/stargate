@@ -210,6 +210,18 @@ def finish(
         # would make a successful terminal result keep returning exit 5.
         ctx.commit_error = ""
         commit_outcome = "disabled"
+    if commit_outcome != "failed":
+        # The run actually finished, so its recorded review/fix cycle stops
+        # being a checkpoint. Resuming a finished run is a deliberate request
+        # for a fresh verdict -- that is how a corrected reviewer config takes
+        # effect. Only a run still blocked on its commit keeps the record.
+        ctx.review = {}
+    elif ctx.review:
+        # Committing stages the tree on its way out, and a staged path leaves
+        # the untracked half of the fingerprint. Rebase the record on what is
+        # on disk now, so a resume can still tell the reviewed tree from one
+        # edited since the verdict.
+        ctx.review = {**ctx.review, "fingerprint": worktree_fingerprint(ctx)}
     write_summary(ctx, task, verdict, test_exit, commit)
     save_state(ctx, verdict.lower())
 
@@ -602,6 +614,36 @@ def run_stages(
     )
 
 
+def _record_review(
+    ctx: RunContext, attempt: int, verdict: str, *, fixed: bool = False
+) -> None:
+    """Persist where the review/fix loop got to, so a resume re-enters it.
+
+    The fingerprint is the tree the reviewer actually judged. A resume trusts
+    the recorded verdict only while the worktree still hashes to it.
+    """
+    ctx.review = {
+        "attempt": attempt,
+        "verdict": verdict,
+        "fingerprint": worktree_fingerprint(ctx),
+        "fixed": fixed,
+    }
+    save_state(ctx, "running")
+
+
+def _recorded_review(ctx: RunContext, attempt: int) -> str | None:
+    """The reviewer's own words for a recorded pass, or None if unusable."""
+    try:
+        review = (ctx.artifacts / f"review-{attempt}.md").read_text().strip()
+    except OSError:
+        return None
+    last_line = review.splitlines()[-1].strip() if review else ""
+    if last_line != "VERDICT: CHANGES_REQUESTED":
+        # A truncated or hand-edited artifact cannot stand in for a reviewer.
+        return None
+    return review
+
+
 def review_and_finish(
     ctx: RunContext,
     args: argparse.Namespace,
@@ -622,37 +664,72 @@ def review_and_finish(
     max_loops = args.max_review_loops if args.max_review_loops is not None else configured_loops
     verdict = "CHANGES_REQUESTED"
 
-    # ponytail: resume always re-runs the review loop from the first attempt.
-    # Re-reviewing is idempotent and cheap next to re-implementing; per-attempt
-    # resume would need every fixer pass recorded separately.
+    # A resume must not buy a second opinion on a tree a reviewer already
+    # judged: that costs a full review and can return a different finding set
+    # than the one whose fixer was interrupted. The recorded cycle stands only
+    # while the worktree still hashes to what that reviewer saw.
+    recorded = ctx.review if isinstance(ctx.review, dict) else {}
+    recorded_attempt = int(recorded.get("attempt") or 0)
+    recorded_verdict = str(recorded.get("verdict") or "")
+    unchanged = bool(recorded_attempt) and str(
+        recorded.get("fingerprint") or ""
+    ) == worktree_fingerprint(ctx)
+
+    start = 0
+    pending: str | None = None
+    if recorded_attempt and bool(recorded.get("fixed")):
+        # That pass's fixer finished, so the tree moved on and the next review
+        # is owed. Continuing the count keeps max_review_loops a budget for the
+        # run rather than a fresh allowance for every resume of it.
+        start = recorded_attempt
+    elif unchanged and recorded_verdict == "APPROVED":
+        # Nothing left to decide. Going straight to finish is what lets a run
+        # whose commit failed -- a signing prompt that timed out, a rejecting
+        # hook -- retry that commit without paying for another review.
+        print(f"\n=== REVIEW {recorded_attempt} (skipped, already APPROVED) ===")
+        complete_stage(ctx, "review")
+        return finish(ctx, task, "APPROVED", test_exit, commit=commit)
+    elif unchanged and recorded_verdict == "CHANGES_REQUESTED":
+        pending = _recorded_review(ctx, recorded_attempt)
+        if pending is not None:
+            start = recorded_attempt - 1
+
     enter_stage(ctx, "review")
-    for attempt in range(max_loops + 1):
-        if budget_spent(ctx, f"review {attempt + 1}"):
-            return finish(
-                ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit
+    for attempt in range(start, max_loops + 1):
+        if pending is not None:
+            review, pending = pending, None
+            print(
+                f"\n=== REVIEW {attempt + 1} (skipped, reusing "
+                f"{ctx.artifacts / f'review-{attempt + 1}.md'}) ==="
             )
-        review_prompt = render_prompt(
-            prompts,
-            "reviewer",
-            task=task,
-            base_ref=ctx.base_ref,
-            plan=plan,
-            tests=test_report,
-        )
-        print(f"\n=== REVIEW {attempt + 1} ===")
-        review = invoke_agent(
-            ctx,
-            "reviewer",
-            review_prompt,
-            ctx.worktree,
-            ctx.artifacts / f"review-{attempt + 1}.md",
-        ).strip()
+        else:
+            if budget_spent(ctx, f"review {attempt + 1}"):
+                return finish(
+                    ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit
+                )
+            review_prompt = render_prompt(
+                prompts,
+                "reviewer",
+                task=task,
+                base_ref=ctx.base_ref,
+                plan=plan,
+                tests=test_report,
+            )
+            print(f"\n=== REVIEW {attempt + 1} ===")
+            review = invoke_agent(
+                ctx,
+                "reviewer",
+                review_prompt,
+                ctx.worktree,
+                ctx.artifacts / f"review-{attempt + 1}.md",
+            ).strip()
 
         # The verdict is the last line, not a substring anywhere in the prose:
         # "I cannot give VERDICT: APPROVED because..." must not read as approval.
         last_line = review.splitlines()[-1].strip() if review else ""
         if last_line == "VERDICT: APPROVED":
             verdict = "APPROVED"
+            _record_review(ctx, attempt + 1, "APPROVED")
             break
 
         if last_line != "VERDICT: CHANGES_REQUESTED":
@@ -661,6 +738,7 @@ def review_and_finish(
                 f"See {ctx.artifacts / f'review-{attempt + 1}.md'}"
             )
 
+        _record_review(ctx, attempt + 1, "CHANGES_REQUESTED")
         if attempt >= max_loops:
             verdict = "CHANGES_REQUESTED"
             break
@@ -697,6 +775,7 @@ def review_and_finish(
                 file=sys.stderr,
             )
             break
+        _record_review(ctx, attempt + 1, "CHANGES_REQUESTED", fixed=True)
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
     complete_stage(ctx, "review")

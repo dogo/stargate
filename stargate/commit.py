@@ -116,7 +116,11 @@ def commit_failure(ctx: RunContext, reason: str, output: str = "") -> None:
         f"in {ctx.worktree}; any successfully staged changes remain staged, "
         "and nothing was lost. A pre-commit hook or a commit signing "
         "configuration in this repository is the usual cause -- a hook that "
-        "rewrote files may leave those rewrites unstaged. Finish by hand with:\n"
+        "rewrote files may leave those rewrites unstaged. Fix the cause and "
+        "resume -- the recorded verdict is reused, so this retries the commit "
+        "without paying for another review:\n"
+        f"  stargate resume {ctx.run_id}\n"
+        "Or finish by hand with:\n"
         f"  cd {shlex.quote(str(ctx.worktree))} && git commit"
     )
     if tail:

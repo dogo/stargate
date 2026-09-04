@@ -253,6 +253,7 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "commit_error": ctx.commit_error or None,
         "mode": ctx.mode,
         "fanout": ctx.fanout or None,
+        "review": ctx.review or None,
         "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
         "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }, indent=2) + "\n"
@@ -328,6 +329,7 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         commit_error=str(state.get("commit_error") or ""),
         mode=mode,
         fanout=dict(state.get("fanout") or {}),
+        review=dict(state.get("review") or {}),
         tag=(
             match.group(1)
             if (match := re.search(
@@ -385,7 +387,13 @@ def read_run(path: Path) -> dict[str, Any]:
         updated=" ".join(str(state.get("updated_at") or "-").split()),
         # Tasks are often multi-paragraph input; one row should stay one row.
         task=(" ".join(str(state.get("task") or "").split())[:RUN_TASK_WIDTH] or "-"),
-        resumable=status.lower() in RESUMABLE_STATUSES,
+        # A run that reached a verdict but could not commit -- a signing
+        # prompt that timed out, a hook that rejected the tree -- is exactly
+        # the run a resume can finish, whatever terminal status it recorded.
+        resumable=(
+            status.lower() in RESUMABLE_STATUSES
+            or bool(state.get("commit_error"))
+        ),
         error="",
     )
     return row

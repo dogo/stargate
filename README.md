@@ -378,7 +378,7 @@ Run artifacts are stored under the target repo:
 
 ```text
 my-project/.stargate/runs/<run-id>/
-├── state.json         # stage, status, commit, exclusions -- what `resume` reads
+├── state.json         # stage, status, commit, review cycle -- what `resume` reads
 ├── config.yaml        # the fully merged effective config, frozen at run start
 ├── prompts/           # role and fan-out prompts, frozen at run start
 ├── plan.md
@@ -677,8 +677,9 @@ neither `--author`, `--no-gpg-sign` nor `--no-verify`.
 
 A failed hook, signing problem or missing Git identity returns exit code 5.
 The result remains staged where possible, `state.json` keeps the terminal
-verdict plus `commit_error`, and the terminal names the intact worktree and a
-manual `git commit` recovery command. A hook that succeeds but rewrites files
+verdict plus `commit_error`, and the terminal names both recoveries: `stargate
+resume <run-id>`, which reuses the recorded verdict and retries only the
+commit, and a manual `git commit` in the intact worktree. A hook that succeeds but rewrites files
 after staging leaves those rewrites uncommitted with a warning; Stargate never
 makes an automatic second commit to conceal that state.
 
@@ -800,8 +801,30 @@ architect leaves the developer marked complete, which means the new plan would
 not be implemented; stargate warns in that case, and you can pass both
 `--redo architect --redo developer`.
 
-The review loop always restarts from its first attempt: re-reviewing is
-idempotent and cheap next to re-implementing.
+### Resuming into the review/fix loop
+
+The review/fix cycle is recorded in `state.json` alongside a fingerprint of the
+worktree the reviewer judged, so a resume re-enters the loop where it stopped
+instead of buying a second opinion on the same tree:
+
+- A **fixer that died** — a vendor usage limit, a crash — resumes straight into
+  that fixer, reusing the `review-<n>.md` already on disk. The pass is
+  announced as `REVIEW <n> (skipped, reusing …)`.
+- A **run that reached its verdict but could not commit** — a signing prompt
+  that timed out, a hook that rejected the tree — resumes straight into the
+  commit, announced as `REVIEW <n> (skipped, already APPROVED)`. Such a run is
+  marked resumable by `stargate list` even though it recorded a terminal
+  verdict, and the commit error names `stargate resume <run-id>` as the cheap
+  recovery.
+- **Anything that changed the worktree** since the verdict — a hand edit, a
+  fixer that got partway through — invalidates the record, and the loop starts
+  over with a real review. A verdict never covers a tree its reviewer did not
+  see.
+
+`max_review_loops` is a budget for the run, not a fresh allowance per resume:
+a resumed loop continues the count rather than restarting it. Resuming a run
+that actually finished discards the record and reviews from scratch, which is
+what makes `--config` with a corrected reviewer take effect.
 
 ## Terminating a run
 
