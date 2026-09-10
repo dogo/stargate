@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -340,9 +341,6 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
     )
 
 
-RUN_TASK_WIDTH = 60
-
-
 RESUMABLE_STATUSES = ("running", "failed", "budget_exceeded")
 
 
@@ -385,8 +383,7 @@ def read_run(path: Path) -> dict[str, Any]:
         worktree=" ".join(worktree.split()) or "(unknown)",
         worktree_missing=missing,
         updated=" ".join(str(state.get("updated_at") or "-").split()),
-        # Tasks are often multi-paragraph input; one row should stay one row.
-        task=(" ".join(str(state.get("task") or "").split())[:RUN_TASK_WIDTH] or "-"),
+        task=(" ".join(str(state.get("task") or "").split()) or "-"),
         # A run that reached a verdict but could not commit -- a signing
         # prompt that timed out, a hook that rejected the tree -- is exactly
         # the run a resume can finish, whatever terminal status it recorded.
@@ -422,14 +419,21 @@ def list_runs(repo: Path) -> int:
         return 0
 
     rows = [read_run(path) for path in paths]
-    width = max(len(row["run_id"]) for row in rows)
+    width = max(20, shutil.get_terminal_size().columns)
     print(f"Runs in {repo} (newest first):\n")
-    print(f"  {'RUN ID':{width}}  {'STATUS':17} {'STAGE':10} {'UPDATED':19} TASK")
-    for row in rows:
+    for index, row in enumerate(rows):
+        if index:
+            print()
         marker = "*" if row["resumable"] else " "
+        print(f"{marker} {row['run_id']}  [{row['status']}]")
+        updated = row["updated"].replace("T", " ", 1)
+        print(f"    updated   {updated}  |  stage {row['stage']}")
         print(
-            f"{marker} {row['run_id']:{width}}  {row['status']:17} "
-            f"{row['stage']:10} {row['updated']:19} {row['task']}"
+            textwrap.fill(
+                row["task"], width=width,
+                initial_indent="    task      ", subsequent_indent="              ",
+                max_lines=3, placeholder=" ...",
+            )
         )
         print(f"    branch    {row['branch']}")
         missing = "  (MISSING)" if row["worktree_missing"] else ""

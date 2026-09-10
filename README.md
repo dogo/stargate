@@ -725,11 +725,15 @@ first, without requiring an active config:
 $ stargate list
 Runs in /home/me/project (newest first):
 
-  RUN ID                                      STATUS            STAGE      UPDATED             TASK
-* 20260831-101304-add-passkey-authentication  failed            developer  2026-08-31T10:19:42 Add passkey authentication
+* 20260831-101304-add-passkey-authentication  [failed]
+    updated   2026-08-31 10:19:42  |  stage developer
+    task      Add passkey authentication
     branch    stargate/add-passkey-authentication-20260831-101304
     worktree  /home/me/.stargate-worktrees/project/20260831-101304-add-passkey-authentication  (MISSING)
-  20260830-181500-update-docs                 approved          review     2026-08-30T18:22:11 Update docs
+
+  20260830-181500-update-docs  [approved]
+    updated   2026-08-30 18:22:11  |  stage review
+    task      Update docs
     branch    stargate/update-docs-20260830-181500
     worktree  /home/me/.stargate-worktrees/project/20260830-181500-update-docs
 
@@ -737,6 +741,9 @@ Runs in /home/me/project (newest first):
 ```
 
 The former `stargate runs` spelling remains an alias.
+Each run appears in a separate block. Task summaries wrap to the terminal width
+(80 columns when unavailable), with `...` after three lines if truncated.
+Branch names and worktree paths remain complete for copying.
 
 Failed runs and rows still reading `running` are marked with `*`. A `running`
 row normally means the run is still in flight, but it can also mean the process
