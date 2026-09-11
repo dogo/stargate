@@ -1,11 +1,39 @@
 # Stargate
 
-A deliberately small, local, vendor-agnostic orchestrator that lets AI coding
-agents collaborate on the same software task without concurrently editing the
-same checkout. Agents are command prefixes assigned to roles, so a workflow can
-mix vendors or run every role through the same CLI.
+**Your coding agents, working as a team. On one task. Without stepping on each
+other.**
 
-One possible mixed-agent flow:
+Stargate is a small, local orchestrator that gives four roles — architect,
+developer, reviewer, fixer — to whichever agent CLIs you already pay for, and
+runs them against your repository with Git as the isolation boundary. No
+framework, no SDK, no daemon, no cloud: one Python package, one runtime
+dependency (PyYAML), and a `pipx install`.
+
+```bash
+cd ~/dev/my-project
+stargate run "Add pagination to the users endpoint"
+```
+
+That plans in your real checkout (read-only), implements in a throwaway
+worktree, runs your tests, reviews the diff, fixes what the review flags, and
+leaves you a commit on its own branch. Your working tree never moves.
+
+### Why it exists
+
+One agent in one terminal is a single point of judgment: the author reviews its
+own work, and every retry costs the same context again. Adding terminals does
+not fix it — N agents on one checkout is a race, and the more of them you run,
+the more of your attention goes to refereeing instead of the work.
+
+Stargate splits the roles instead. The planner cannot write. The reviewer has
+never been the author. The developer works in an isolated worktree it cannot
+escape. And an agent is **a command prefix**, not an integration: anything you
+can run non-interactively and read the output of qualifies, configured as an
+argument list. So you can put the sharpest model on review and a cheaper one on
+typing, mix vendors, or run all four roles through one CLI — and adding a new
+one is a few lines of YAML, not a plugin.
+
+### The flow
 
 ```text
 you
@@ -38,24 +66,40 @@ Kiro / reviewer
           └──────────────► review again
 ```
 
+Got work that splits? [`--fan-out`](#fan-out) turns the plan into a validated
+DAG: ready nodes run concurrently, each on its own branch and worktree, a
+dependent node starts from its dependencies' **commits** so it sees their files,
+and the merged tree goes through review once as a whole.
+
+### What you can count on
+
+- **Nothing is ever lost.** Every terminal result with changes is committed on
+  the run's own branch — including a reviewer that still requests changes, a
+  failing test command, or a token-budget stop. The verdict goes in the commit
+  message. Fan-out also commits each completed task and the integration verdict.
+- **A crash is resumable, not wasted.** A crashed run creates no terminal
+  commit; `resume` reuses the frozen config, prompts, branches, worktrees and
+  completed commits, and commits when the run reaches a verdict. It even
+  re-enters a recorded review/fix cycle, so an interrupted fixer does not pay
+  for a fresh review. (A fan-out token-budget stop before integration writes its
+  RESULT and stays resumable, without an integration commit yet.)
+- **Your branch is untouchable.** The orchestrator never merges into, rebases,
+  pushes, or deletes the branch checked out in your repository, and never
+  removes a worktree mid-run. The agents themselves are forbidden to commit —
+  the orchestrator is the only thing that does.
+- **The budget is yours.** Token budget per task and per run, timeouts, retries
+  with backoff, and `--max-review-loops`. Exit codes tell you which wall you hit.
+
+### Agents
+
 **Claude Code**, **Codex CLI**, and **Kiro CLI** are validated integrations, not
 a closed list of supported agents. The packaged configuration uses Claude for
 the architect and reviewer and Codex for the developer and fixer; the
 [`examples/`](examples/) directory includes verified single-vendor
-configurations for all three CLIs and documents the differences between them.
-
-Every linear terminal result with changes is committed on the run's own branch,
-including a reviewer that still requests changes, a failing test command, or a
-token-budget stop. A fan-out run also commits each completed task and its final
-integration verdict. The verdict is part of the commit message. A run that
-crashes does not create a terminal commit; `resume` does so when the run
-eventually reaches a verdict. A fan-out token-budget stop before integration is
-the exception: it writes its RESULT and summary and remains resumable, but has
-no integration terminal commit yet.
-
-The orchestrator never merges into or otherwise changes the branch checked out
-in the user's original repository, and it never rebases, pushes, or deletes a
-worktree during a run. The agents themselves remain forbidden to commit.
+configurations for all three CLIs and documents the differences between them
+(who needs `{output}`, who reports usage, who needs a wrapper). Anything with a
+non-interactive command prefix works — `stargate doctor --probe` tells you
+whether yours does, in one real call per agent.
 
 ## Requirements
 
