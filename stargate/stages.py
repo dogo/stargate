@@ -335,6 +335,24 @@ Tokens reported: {tokens}
 
 {diff_stat or "(no tracked diff)"}
 """
+    if ctx.findings:
+        lines = [
+            "\n## findings\n",
+            "| severity | where | finding |",
+            "|---|---|---|",
+        ]
+        for entry in _by_severity(ctx.findings):
+            where = str(entry.get("file") or "-")
+            if entry.get("line") is not None:
+                where += f":{entry['line']}"
+            detail = str(entry.get("finding", ""))
+            if entry.get("why"):
+                detail += f" (why: {entry['why']})"
+            lines.append(
+                f"| {_summary_cell(entry.get('severity', '?'))} | "
+                f"{_summary_cell(where)} | {_summary_cell(detail)} |"
+            )
+        summary += "\n".join(lines) + "\n"
     if ctx.mode == "fanout":
         saved_records = ctx.fanout.get("tasks", {})
         records = saved_records if isinstance(saved_records, dict) else {}
@@ -388,6 +406,13 @@ def _result_commit_summary(ctx: RunContext, enabled: bool) -> str:
     return (
         "none (no integration terminal commit; "
         f"{task_commits} task {noun} preserved)"
+    )
+
+
+def _by_severity(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Highest severity first, reviewer order kept inside each severity."""
+    return sorted(
+        findings, key=lambda entry: SEVERITIES.index(entry.get("severity", "low"))
     )
 
 
@@ -614,6 +639,92 @@ def run_stages(
     )
 
 
+SEVERITIES = ("high", "medium", "low")
+
+VERDICTS = ("APPROVED", "CHANGES_REQUESTED")
+
+
+def parse_review(raw: str) -> tuple[str, list[dict[str, Any]]]:
+    """The reviewer's verdict and findings, from either contract.
+
+    A JSON object is the current contract; a response whose last line is
+    `VERDICT: ...` is the original one, still spoken by a frozen prompt from a
+    run created before this change and by any custom reviewer.md. The verdict
+    stands exactly as the reviewer gave it either way -- nothing here derives
+    it from the findings.
+    """
+    text = raw.strip()
+    data: Any = None
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+    if isinstance(data, dict):
+        return _parse_json_review(data)
+
+    # The verdict is the last line, not a substring anywhere in the prose:
+    # "I cannot give VERDICT: APPROVED because..." must not read as approval.
+    last_line = text.splitlines()[-1].strip() if text else ""
+    for verdict in VERDICTS:
+        if last_line == f"VERDICT: {verdict}":
+            return verdict, []
+    raise StargateError(
+        "Reviewer output is neither a JSON review object nor a response "
+        f"ending in exactly 'VERDICT: {VERDICTS[0]}' or "
+        f"'VERDICT: {VERDICTS[1]}'."
+    )
+
+
+def _parse_json_review(data: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    verdict = data.get("verdict")
+    if verdict not in VERDICTS:
+        raise StargateError(
+            "Reviewer JSON needs a 'verdict' of exactly "
+            f"{' or '.join(VERDICTS)}; got {verdict!r}."
+        )
+    raw_findings = data.get("findings", [])
+    if not isinstance(raw_findings, list):
+        raise StargateError("Reviewer JSON 'findings' must be a list.")
+
+    findings: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_findings):
+        where = f"findings[{index}]"
+        if not isinstance(item, dict):
+            raise StargateError(f"Reviewer JSON {where} must be an object.")
+        severity = item.get("severity")
+        if not isinstance(severity, str) or severity.lower() not in SEVERITIES:
+            raise StargateError(
+                f"Reviewer JSON {where}.severity must be one of "
+                f"{', '.join(SEVERITIES)}; got {severity!r}."
+            )
+        finding = item.get("finding")
+        if not isinstance(finding, str) or not finding.strip():
+            raise StargateError(
+                f"Reviewer JSON {where}.finding must be a non-empty string."
+            )
+        line = item.get("line")
+        if line is not None and not isinstance(line, int):
+            raise StargateError(
+                f"Reviewer JSON {where}.line must be an integer when present."
+            )
+        entry: dict[str, Any] = {
+            "severity": severity.lower(),
+            "finding": finding.strip(),
+        }
+        for key in ("file", "why"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                entry[key] = value.strip()
+        if line is not None:
+            entry["line"] = line
+        findings.append(entry)
+    # An incoherent pair -- CHANGES_REQUESTED with no findings, APPROVED with a
+    # high one -- is accepted on purpose. Judging it would be the severity
+    # policy this version deliberately leaves out.
+    return verdict, findings
+
+
 def _record_review(
     ctx: RunContext, attempt: int, verdict: str, *, fixed: bool = False
 ) -> None:
@@ -637,11 +748,12 @@ def _recorded_review(ctx: RunContext, attempt: int) -> str | None:
         review = (ctx.artifacts / f"review-{attempt}.md").read_text().strip()
     except OSError:
         return None
-    last_line = review.splitlines()[-1].strip() if review else ""
-    if last_line != "VERDICT: CHANGES_REQUESTED":
+    try:
+        verdict, _ = parse_review(review)
+    except StargateError:
         # A truncated or hand-edited artifact cannot stand in for a reviewer.
         return None
-    return review
+    return review if verdict == "CHANGES_REQUESTED" else None
 
 
 def review_and_finish(
@@ -724,19 +836,14 @@ def review_and_finish(
                 ctx.artifacts / f"review-{attempt + 1}.md",
             ).strip()
 
-        # The verdict is the last line, not a substring anywhere in the prose:
-        # "I cannot give VERDICT: APPROVED because..." must not read as approval.
-        last_line = review.splitlines()[-1].strip() if review else ""
-        if last_line == "VERDICT: APPROVED":
-            verdict = "APPROVED"
+        artifact = ctx.artifacts / f"review-{attempt + 1}.md"
+        try:
+            verdict, ctx.findings = parse_review(review)
+        except StargateError as exc:
+            raise StargateError(f"{exc} See {artifact}") from exc
+        if verdict == "APPROVED":
             _record_review(ctx, attempt + 1, "APPROVED")
             break
-
-        if last_line != "VERDICT: CHANGES_REQUESTED":
-            raise StargateError(
-                "Reviewer did not end its response with a recognized verdict. "
-                f"See {ctx.artifacts / f'review-{attempt + 1}.md'}"
-            )
 
         _record_review(ctx, attempt + 1, "CHANGES_REQUESTED")
         if attempt >= max_loops:

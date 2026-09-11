@@ -255,6 +255,7 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
         "mode": ctx.mode,
         "fanout": ctx.fanout or None,
         "review": ctx.review or None,
+        "findings": ctx.findings or None,
         "started_at": started or dt.datetime.now().isoformat(timespec="seconds"),
         "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
     }, indent=2) + "\n"
@@ -331,6 +332,7 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         mode=mode,
         fanout=dict(state.get("fanout") or {}),
         review=dict(state.get("review") or {}),
+        findings=list(state.get("findings") or []),
         tag=(
             match.group(1)
             if (match := re.search(

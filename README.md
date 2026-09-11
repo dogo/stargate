@@ -609,9 +609,61 @@ Two things the prompt templates have to respect:
   alone, so a prompt may contain JSON, CSS or an f-string example verbatim. The
   fan-out prompt additionally receives `{max_tasks}`.
   These are separate from the agent-command placeholders described below.
-- `reviewer.md` is a contract with the orchestrator: the model's last line has
-  to be exactly `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`. Anything
-  else aborts the run.
+- `reviewer.md` is a contract with the orchestrator, and either form satisfies
+  it: one JSON object as described in
+  [Structured review findings](#structured-review-findings), or a response whose
+  last line is exactly `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`.
+  Anything else aborts the run.
+
+## Structured review findings
+
+The packaged `reviewer.md` asks for one JSON object and nothing else:
+
+```json
+{
+  "verdict": "CHANGES_REQUESTED",
+  "findings": [
+    {
+      "severity": "high",
+      "file": "app/storage.py",
+      "line": 42,
+      "finding": "Saving truncates the existing file before validating the replacement.",
+      "why": "Invalid input permanently destroys previously saved user data."
+    }
+  ]
+}
+```
+
+`verdict` is required and must be exactly `APPROVED` or `CHANGES_REQUESTED`. **It is the
+reviewer's decision and the orchestrator acts on it as given**: nothing derives, overrides
+or second-guesses it from the severities. `findings` may be empty. Each entry needs a
+`severity` of `high`, `medium` or `low` and a non-empty `finding`; `file`, `line` and `why`
+are optional, and unknown keys are ignored. A `CHANGES_REQUESTED` with no findings, or an
+`APPROVED` carrying a `high` one, is accepted rather than treated as an error.
+
+Severity is reported, not enforced. It is classified by demonstrated impact — the packaged
+prompt carries the full rubric — and today it changes nothing about what the orchestrator
+does. It exists so the report is legible, and so a decision about deriving verdicts from
+severities can later be argued from real reviews instead of taste.
+
+The findings reach three places:
+
+- `{review}` in the fixer prompt receives the reviewer's response unchanged, JSON or prose.
+- `summary.md` gets a `## findings` table, highest severity first.
+- `state.json` records them under `findings`, separate from the `review` checkpoint that
+  `resume` uses. The checkpoint ends with the run; the findings stay, which is what lets the
+  summary of an approved resume that skips the review still show its table.
+
+Both hold the **most recent completed review** only. A later pass replaces them, because the
+report describes the tree that got the verdict. The per-pass `review-N.md` artifacts keep
+every pass that ran.
+
+Nothing about approval changed with this contract. A reviewer that answers in prose, ending
+in `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`, is still read exactly as before —
+which is what keeps a custom `prompts_dir` reviewer working, and what lets a run created
+before this existed still `resume` against its frozen prompt. What a new prompt can change is
+the model's own judgment, and malformed output is a new way for a run to stop: neither is a
+change to the orchestrator's rules.
 
 ## Final message vs. stdout
 
@@ -1066,8 +1118,13 @@ persistent run state, `list`, `resume`, catchable-signal handling, capability
 probes, empty-stage detection, and terminal commits on run branches. What is
 still open, roughly in order of how much it would change the tool:
 
-- **Structured review output** (JSON findings instead of a prose verdict).
 - **GitHub issue / PR as task input.**
+
+Structured review output shipped: see
+[Structured review findings](#structured-review-findings). Deriving the verdict from
+severities instead of taking the reviewer's own is a separate, unscheduled question, not
+unfinished work — no default for it preserves current behavior, in either direction, so it
+needs evidence from real reviews rather than a choice of default.
 
 ## License
 

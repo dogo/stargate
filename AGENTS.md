@@ -77,7 +77,7 @@ Four roles, mapped to agents under `workflow:`:
 |---|---|---|
 | `architect` | the user's **real** repository | no (read-only via a vendor flag) |
 | `developer` | the run's isolated worktree | yes |
-| `reviewer` | the run's isolated worktree | no; emits `VERDICT: APPROVED` / `CHANGES_REQUESTED` |
+| `reviewer` | the run's isolated worktree | no; emits JSON findings with an explicit `verdict` (prose `VERDICT:` still accepted) |
 | `fixer` | the run's isolated worktree | yes |
 
 Two execution modes:
@@ -97,12 +97,12 @@ leaves a commit on its own branch, including when the verdict is `CHANGES_REQUES
 the test command failed, or when the token budget stopped it; the verdict goes into the
 commit message.
 
-Full user documentation: [`README.md`](README.md) (1074 lines — it is the reference, do not
+Full user documentation: [`README.md`](README.md) (1131 lines — it is the reference, do not
 duplicate it here). Verified single-vendor configurations: [`examples/`](examples/).
 
 ## Repository state
 
-**Both modes are implemented and covered.** 158 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 167 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 

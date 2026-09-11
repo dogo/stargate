@@ -480,7 +480,8 @@ def test_missing_verdict_is_an_error(root: Path) -> None:
     write_config(cfg, 'echo "looks fine to me"', test_command="true")
     proc = run(repo, cfg)
     assert proc.returncode == 1, proc.stdout
-    assert "recognized verdict" in proc.stderr, proc.stderr
+    # The message names both accepted contracts, since either would have worked.
+    assert "neither a JSON review object" in proc.stderr, proc.stderr
 
 
 def test_custom_prompts_dir_overrides_one_file(root: Path) -> None:
