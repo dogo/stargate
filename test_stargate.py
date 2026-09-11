@@ -2287,7 +2287,9 @@ def _run_tests() -> int:
     for name, function in tests:
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                function(Path(tmp))
+                # Resolved: Git reports real paths, so a test comparing its
+                # output against `root` must not be handed /var on macOS.
+                function(Path(tmp).resolve())
         except KeyboardInterrupt:
             raise
         except (Exception, SystemExit):
