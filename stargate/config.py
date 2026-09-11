@@ -269,16 +269,24 @@ def find_prompt(dirs: list[Path], name: str) -> Path:
 
 
 def render_prompt(dirs: list[Path], name: str, **values: str) -> str:
-    """Substitute only the placeholders we define, by literal replacement.
+    """Substitute only the placeholders we define, in a single pass.
 
     Not str.format: a custom prompt is free to contain JSON, CSS or an f-string
     example, and every brace in it would otherwise have to be escaped or the
     run dies with KeyError before a single agent starts.
+
+    One pass rather than one replace per key, because the values are agent
+    output. Replacing in sequence rescans what the previous key just inserted,
+    so a review whose own text contains `{tests}` reached the fixer with the
+    test report spliced inside the reviewer's finding.
     """
     text = find_prompt(dirs, name).read_text()
-    for key, value in values.items():
-        text = text.replace("{" + key + "}", value)
-    return text
+    if not values:
+        return text
+    pattern = re.compile("|".join(re.escape("{" + key + "}") for key in values))
+    # A function replacement, so a value containing backslashes or \1 is
+    # inserted literally rather than read as a group reference.
+    return pattern.sub(lambda match: values[match.group(0)[1:-1]], text)
 
 
 def value_source(

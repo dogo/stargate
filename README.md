@@ -641,25 +641,37 @@ or second-guesses it from the severities. `findings` may be empty. Each entry ne
 are optional, and unknown keys are ignored. A `CHANGES_REQUESTED` with no findings, or an
 `APPROVED` carrying a `high` one, is accepted rather than treated as an error.
 
-Severity is reported, not enforced. It is classified by demonstrated impact — the packaged
-prompt carries the full rubric — and today it changes nothing about what the orchestrator
-does. It exists so the report is legible, and so a decision about deriving verdicts from
+Severity is reported, not enforced: it never decides approval and never selects what the
+fixer works on. It is classified by demonstrated impact — the packaged prompt carries the
+full rubric. It is not inert everywhere, though: it orders the summary table, and a value
+outside the three labels aborts the run as a malformed review. It exists so the report is legible, and so a decision about deriving verdicts from
 severities can later be argued from real reviews instead of taste.
 
 The findings reach three places:
 
-- `{review}` in the fixer prompt receives the reviewer's response unchanged, JSON or prose.
-- `summary.md` gets a `## findings` table, highest severity first.
+- `{review}` in the fixer prompt receives the reviewer's response with no findings
+  renderer applied, JSON or prose. Its content is never rewritten — a finding containing
+  the literal text `{tests}` reaches the fixer as the reviewer wrote it — though the outer
+  whitespace is trimmed.
+- `summary.md` gets a `## findings` table when the findings are non-empty, highest
+  severity first. The stored order is the reviewer's; only the table is re-sorted.
 - `state.json` records them under `findings`, separate from the `review` checkpoint that
-  `resume` uses. The checkpoint ends with the run; the findings stay, which is what lets the
-  summary of an approved resume that skips the review still show its table.
+  `resume` uses. An empty list is stored as `null`, like the neighbouring `fanout` and
+  `review` keys, so a consumer must not assume the value is iterable. The checkpoint ends
+  with the run — except when the commit failed, which keeps it so `resume` can retry only
+  the commit — while the findings stay. That is what lets the summary of an approved resume
+  that skips the review still show its table.
 
-Both hold the **most recent completed review** only. A later pass replaces them, because the
-report describes the tree that got the verdict. The per-pass `review-N.md` artifacts hold the
+Both hold the **most recent completed review** only, which is not always the tree the run
+ends on: a fixer edit followed by a token-budget stop finishes with the previous review's
+findings, and the summary does not label which pass they came from. A later review replaces
+them. The per-pass `review-N.md` artifacts hold the
 passes still available: resuming a finished run starts the numbering over and can overwrite
 `review-1.md`, so they are not an immutable history.
 
-Nothing about approval changed with this contract. A reviewer that answers in prose, ending
+Who decides approval did not change with this contract, though what the parser accepts
+did: bare JSON now succeeds where it used to abort, and a malformed payload is a new way to
+stop. A reviewer that answers in prose, ending
 in `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`, is still read exactly as before —
 which is what keeps a custom `prompts_dir` reviewer working, and what lets a run created
 before this existed still `resume` against its frozen prompt. What a new prompt can change is

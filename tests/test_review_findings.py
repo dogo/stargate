@@ -158,7 +158,11 @@ def test_the_fixer_receives_the_original_json_review(root: Path) -> None:
     severity policy this version deliberately leaves out.
     """
     repo = make_repo(root)
-    review = _review_file(root, "review.json", "CHANGES_REQUESTED", [HIGH])
+    booby_trapped = {
+        **HIGH,
+        "finding": "The prompt keeps {tests} and {plan} literal.",
+    }
+    review = _review_file(root, "review.json", "CHANGES_REQUESTED", [booby_trapped])
     prompt = root / "fixer-prompt.txt"
     config = _config(
         root / "cfg.yaml",
@@ -172,12 +176,47 @@ def test_the_fixer_receives_the_original_json_review(root: Path) -> None:
     # The reviewer never approves, so the loop ends at the last allowed pass.
     assert proc.returncode == 2, proc.stdout + proc.stderr
     seen = prompt.read_text()
-    assert '"verdict": "CHANGES_REQUESTED"' in seen, seen
-    assert '"severity": "high"' in seen, seen
-    assert HIGH["finding"] in seen, seen
+    # The whole response, byte for byte, not a few recognizable fragments: the
+    # fragment version of this assertion passed while the renderer was
+    # substituting the test report into the reviewer's own finding text.
+    assert review.read_text() in seen, seen
+    assert "The prompt keeps {tests} and {plan} literal." in seen, seen
     # A rendered replacement or an invented blocking label would show up here.
     assert "[high]" not in seen, seen
     assert "non-blocking" not in seen, seen
+
+
+def test_a_value_is_never_rescanned_for_another_placeholder(root: Path) -> None:
+    """Every role's prompt, not just the fixer's.
+
+    The values are agent output. Substituting key by key rescans what the
+    previous key inserted, so a plan or a review containing the literal text of
+    another placeholder came out rewritten.
+    """
+    from stargate.config import render_prompt
+
+    prompts = ROOT / "stargate" / "prompts"
+    review = (
+        '{"verdict": "CHANGES_REQUESTED", "findings": '
+        '[{"severity": "low", "finding": "Keep {tests} literal."}]}'
+    )
+    plan = "The plan mentions {review} and {tests} on purpose."
+
+    rendered = render_prompt(
+        [prompts],
+        "fixer",
+        task="t",
+        base_ref="main",
+        plan=plan,
+        review=review,
+        tests="PASSED",
+    )
+
+    assert review in rendered, rendered
+    assert plan in rendered, rendered
+    assert "Keep PASSED literal." not in rendered, rendered
+    # An unknown placeholder is still left exactly as the prompt wrote it.
+    assert render_prompt([prompts], "fixer", task="{nope}").count("{nope}") == 1
 
 
 def test_a_prose_reviewer_still_reaches_both_verdicts(root: Path) -> None:
@@ -235,6 +274,13 @@ def test_malformed_review_output_names_both_contracts(root: Path) -> None:
     missing = run(repo, config, "no verdict")
     assert missing.returncode == 1, missing.stdout + missing.stderr
     assert "needs a 'verdict'" in missing.stderr, missing.stderr
+
+    wrong_case = root / "wrong-case.json"
+    wrong_case.write_text(json.dumps({"verdict": "approved", "findings": []}))
+    config = _config(root / "wrong-case.yaml", agent(f"cat {wrong_case}"))
+    lowercased = run(repo, config, "lowercase verdict")
+    assert lowercased.returncode == 1, lowercased.stdout + lowercased.stderr
+    assert "needs a 'verdict'" in lowercased.stderr, lowercased.stderr
 
     mislabelled = root / "severity.json"
     mislabelled.write_text(
@@ -377,6 +423,140 @@ def test_a_legacy_run_resumes_from_its_frozen_prose_prompt(root: Path) -> None:
     assert '"findings"' not in asked, "resume must use the frozen prompt, not the packaged one"
     assert "## findings" not in _summary(repo), _summary(repo)
     assert json.loads(state_path.read_text()).get("findings") is None
+
+
+def test_the_parser_normalizes_what_it_keeps_and_ignores_the_rest(root: Path) -> None:
+    """Two permissive rules the contract states and nothing exercised.
+
+    A reviewer writing "HIGH" or adding a key of its own must not fail the run,
+    and what reaches the report must be the normalized form rather than
+    whatever the model happened to type.
+    """
+    repo = make_repo(root)
+    review = root / "review.json"
+    review.write_text(
+        json.dumps(
+            {
+                "verdict": "APPROVED",
+                "summary": "an unknown top-level key",
+                "findings": [
+                    {
+                        "severity": "HIGH",
+                        "finding": "Shouty severity.",
+                        "confidence": "an unknown entry key",
+                    }
+                ],
+            }
+        )
+    )
+    config = _config(root / "cfg.yaml", agent(f"cat {review}"))
+
+    proc = run(repo, config, "mixed case and extra keys")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _state(repo)["findings"] == [
+        {"severity": "high", "finding": "Shouty severity."}
+    ], _state(repo)["findings"]
+    assert "| high | - | Shouty severity. |" in _summary(repo), _summary(repo)
+
+
+def test_the_findings_table_orders_by_severity_and_survives_table_characters(
+    root: Path,
+) -> None:
+    """Order is a documented promise, and one finding per report never tested it.
+
+    The escaping matters for the same reason it does in the fan-out table: a
+    pipe or a newline in model output would otherwise split the row.
+    """
+    repo = make_repo(root)
+    review = _review_file(
+        root,
+        "review.json",
+        "APPROVED",
+        [
+            {"severity": "low", "finding": "third"},
+            {"severity": "high", "finding": "first | with a pipe"},
+            {"severity": "low", "finding": "fourth, after the other low"},
+            {"severity": "medium", "finding": "second\nwith a newline"},
+        ],
+    )
+    config = _config(root / "cfg.yaml", agent(f"cat {review}"))
+
+    proc = run(repo, config, "several findings")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    table = [
+        line for line in _summary(repo).splitlines() if line.startswith("| ")
+    ]
+    rows = [line for line in table if not line.startswith("| severity")]
+    order = [row.split("|")[1].strip() for row in rows]
+    assert order == ["high", "medium", "low", "low"], order
+    # Ties keep the reviewer's order; the stored list keeps its own.
+    assert "third" in rows[2] and "fourth" in rows[3], rows
+    assert [f["severity"] for f in _state(repo)["findings"]] == [
+        "low",
+        "high",
+        "low",
+        "medium",
+    ], _state(repo)["findings"]
+    # Escaped, so every row still has exactly three columns: an escaped pipe is
+    # still a pipe character, it just no longer delimits a cell.
+    assert all(row.replace("\\|", "").count("|") == 4 for row in rows), rows
+    assert "\\|" in rows[0], rows[0]
+    assert "<br>" in rows[1], rows[1]
+
+
+def test_corrupted_persisted_findings_are_reported_not_raised(root: Path) -> None:
+    """`findings` is restored from state.json without reparsing.
+
+    An approved resume skips the review loop, so the first thing to touch a
+    corrupted entry is the terminal report -- after the commit was attempted.
+    Raising there loses the run's result to a cosmetic field.
+    """
+    from stargate.stages import _by_severity
+
+    corrupted = [
+        {"severity": "HIGH", "finding": "an unnormalized label"},
+        "not an object at all",
+        {"finding": "no severity key"},
+        {"severity": "high", "finding": "well formed"},
+    ]
+
+    ordered = _by_severity(corrupted)
+
+    assert ordered[0] == {"severity": "high", "finding": "well formed"}, ordered
+    assert len(ordered) == len(corrupted), ordered
+
+
+def test_a_corrupt_pending_artifact_buys_a_fresh_review(root: Path) -> None:
+    """The checkpoint says a review happened; the artifact is what proves it.
+
+    Reusing a truncated or hand-edited file would let it stand in for a
+    reviewer that never said that.
+    """
+    repo = make_repo(root)
+    reviews = root / "reviews.txt"
+    review = _review_file(root, "review.json", "CHANGES_REQUESTED", [HIGH])
+    attempted = root / "fixer-attempted.txt"
+    config = _config(
+        root / "cfg.yaml",
+        _counting(reviews, f"cat {review}"),
+        fixer=f'[ -f {attempted} ] && {{ echo change >> impl.txt; echo done; }} '
+        f"|| {{ touch {attempted}; exit 1; }}",
+        loops=1,
+    )
+
+    interrupted = run(repo, config, "corrupt artifact")
+
+    assert interrupted.returncode == 1, interrupted.stdout + interrupted.stderr
+    assert _calls(reviews) == 1, _calls(reviews)
+    (_artifacts(repo) / "review-1.md").write_text('{"verdict": "CHANGES_RE')
+
+    resumed = _resume(repo, config, _run_id(repo))
+
+    assert resumed.returncode == 2, resumed.stdout + resumed.stderr
+    # One to replace the unusable artifact, one after the fixer's change.
+    assert _calls(reviews) == 3, _calls(reviews)
 
 
 def test_a_finished_run_reports_findings_without_an_active_checkpoint(

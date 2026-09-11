@@ -199,8 +199,9 @@ Fake reviewers are `/bin/sh -c` scripts that `cat` a JSON file, following the
    the test that pins V1's scope and fails the moment V2 leaks in early.
 8. `test_per_pass_artifacts_keep_findings_replaced_in_the_final_report` — review 1 requests
    changes for a low finding, the fixer changes the tree, and review 2 approves with no
-   findings. Final state contains `[]`, while `review-1.md` still contains the explicit
-   CHANGES_REQUESTED verdict and low finding needed for the V2 sample.
+   findings. Final state stores the emptied findings as `null` -- the convention the
+   neighbouring `fanout` and `review` keys already use -- while `review-1.md` still contains
+   the explicit CHANGES_REQUESTED verdict and low finding needed for the V2 sample.
 
 Plus a docs test in the style of `tests/test_fanout_cli_docs.py`: the README documents the
 contract and the packaged reviewer contains the rubric. The existing `test_review_cycle.py`

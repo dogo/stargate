@@ -97,12 +97,12 @@ leaves a commit on its own branch, including when the verdict is `CHANGES_REQUES
 the test command failed, or when the token budget stopped it; the verdict goes into the
 commit message.
 
-Full user documentation: [`README.md`](README.md) (1132 lines — it is the reference, do not
+Full user documentation: [`README.md`](README.md) (1144 lines — it is the reference, do not
 duplicate it here). Verified single-vendor configurations: [`examples/`](examples/).
 
 ## Repository state
 
-**Both modes are implemented and covered.** 168 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 173 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 

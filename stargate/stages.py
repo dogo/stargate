@@ -342,6 +342,11 @@ Tokens reported: {tokens}
             "|---|---|---|",
         ]
         for entry in _by_severity(ctx.findings):
+            if not isinstance(entry, dict):
+                # Only reachable from hand-edited or externally written state.
+                # Showing it beats raising while writing the terminal report.
+                lines.append(f"| ? | - | {_summary_cell(entry)} |")
+                continue
             where = str(entry.get("file") or "-")
             if entry.get("line") is not None:
                 where += f":{entry['line']}"
@@ -409,11 +414,23 @@ def _result_commit_summary(ctx: RunContext, enabled: bool) -> str:
     )
 
 
-def _by_severity(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Highest severity first, reviewer order kept inside each severity."""
-    return sorted(
-        findings, key=lambda entry: SEVERITIES.index(entry.get("severity", "low"))
-    )
+def _by_severity(findings: list[Any]) -> list[Any]:
+    """Highest severity first, reviewer order kept inside each severity.
+
+    Total by construction. Parsing guarantees the shape for anything this run
+    produced, but `findings` is restored straight from state.json, and a
+    corrupted or externally written entry must not raise here -- this runs
+    while writing the terminal report, after the commit has been attempted.
+    """
+    def rank(entry: Any) -> int:
+        severity = entry.get("severity") if isinstance(entry, dict) else None
+        return (
+            SEVERITIES.index(severity)
+            if severity in SEVERITIES
+            else len(SEVERITIES)
+        )
+
+    return sorted(findings, key=rank)
 
 
 def _summary_cell(value: object) -> str:
