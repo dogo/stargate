@@ -103,8 +103,8 @@ duplicate it here). Verified single-vendor configurations: [`examples/`](example
 ## Repository state
 
 **Both modes are implemented and covered.** 173 tests, all passing (`make test`, exit 0).
-Current work lives on `feat/structured-review-findings`, which is ahead of `main` and not
-merged; otherwise the only branches are the `stargate/*` ones the runs themselves left behind.
+Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
+ones the runs themselves left behind.
 
 What exists:
 
