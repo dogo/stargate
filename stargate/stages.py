@@ -704,7 +704,10 @@ def _parse_json_review(data: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]
                 f"Reviewer JSON {where}.finding must be a non-empty string."
             )
         line = item.get("line")
-        if line is not None and not isinstance(line, int):
+        # bool is a subclass of int: `"line": true` must not pass as a number.
+        if line is not None and (
+            isinstance(line, bool) or not isinstance(line, int)
+        ):
             raise StargateError(
                 f"Reviewer JSON {where}.line must be an integer when present."
             )

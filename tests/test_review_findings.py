@@ -249,6 +249,22 @@ def test_malformed_review_output_names_both_contracts(root: Path) -> None:
         bad_severity.stderr
     )
 
+    # bool is a subclass of int, so a naive isinstance check would take `true`
+    # as a line number and carry it into the report.
+    boolean_line = root / "line.json"
+    boolean_line.write_text(
+        json.dumps(
+            {
+                "verdict": "APPROVED",
+                "findings": [{"severity": "low", "finding": "x", "line": True}],
+            }
+        )
+    )
+    config = _config(root / "line.yaml", agent(f"cat {boolean_line}"))
+    bad_line = run(repo, config, "boolean line")
+    assert bad_line.returncode == 1, bad_line.stdout + bad_line.stderr
+    assert "findings[0].line must be an integer" in bad_line.stderr, bad_line.stderr
+
 
 def test_findings_survive_a_resume_without_a_second_review(root: Path) -> None:
     """The fingerprint guarantee has to cover the structured payload too.
@@ -305,6 +321,62 @@ def test_findings_survive_a_resume_without_a_second_review(root: Path) -> None:
     assert retried.returncode == 0, retried.stdout + retried.stderr
     assert _calls(approvals) == 1, "an approved resume must not pay for a second review"
     assert "| low | app.py:1 |" in _summary(approved), _summary(approved)
+
+
+def test_a_legacy_run_resumes_from_its_frozen_prose_prompt(root: Path) -> None:
+    """What a run created before this change actually looks like on resume.
+
+    Its prompts were frozen at run start, so `resume` asks a reviewer that
+    never heard of the JSON contract, and its state.json has no findings key at
+    all -- not a null one. Both have to work, and the recorded prose review has
+    to be reusable without paying for a second opinion.
+    """
+    repo = make_repo(root)
+    reviews = root / "reviews.txt"
+    frozen_prompt_seen = root / "frozen-prompt.txt"
+    attempted = root / "fixer-attempted.txt"
+    config = _config(
+        root / "legacy.yaml",
+        _counting(
+            reviews,
+            f'printf "%s" "$0" > {frozen_prompt_seen}; '
+            '[ "$call" = 1 ] && echo "VERDICT: CHANGES_REQUESTED" '
+            '|| echo "VERDICT: APPROVED"',
+        ),
+        fixer=f'[ -f {attempted} ] && {{ echo change >> impl.txt; echo done; }} '
+        f"|| {{ touch {attempted}; exit 1; }}",
+        loops=1,
+    )
+
+    interrupted = run(repo, config, "legacy run")
+
+    assert interrupted.returncode == 1, interrupted.stdout + interrupted.stderr
+    assert _calls(reviews) == 1, _calls(reviews)
+
+    artifacts = _artifacts(repo)
+    state_path = artifacts / "state.json"
+    state = json.loads(state_path.read_text())
+    # A run recorded before findings existed has no such key to read.
+    del state["findings"]
+    state_path.write_text(json.dumps(state, indent=2) + "\n")
+    frozen = artifacts / "prompts" / "reviewer.md"
+    frozen.write_text(
+        "LEGACY PROMPT MARKER\n\nTASK: {task}\nBASE: {base_ref}\n"
+        "PLAN: {plan}\nTESTS: {tests}\n\nEnd with exactly "
+        "VERDICT: APPROVED or VERDICT: CHANGES_REQUESTED.\n"
+    )
+
+    resumed = _resume(repo, config, artifacts.name)
+
+    assert resumed.returncode == 0, resumed.stdout + resumed.stderr
+    # Review 1 came back from its prose artifact; review 2 is the one the
+    # fixer's change earned.
+    assert _calls(reviews) == 2, _calls(reviews)
+    asked = frozen_prompt_seen.read_text()
+    assert "LEGACY PROMPT MARKER" in asked, asked
+    assert '"findings"' not in asked, "resume must use the frozen prompt, not the packaged one"
+    assert "## findings" not in _summary(repo), _summary(repo)
+    assert json.loads(state_path.read_text()).get("findings") is None
 
 
 def test_a_finished_run_reports_findings_without_an_active_checkpoint(

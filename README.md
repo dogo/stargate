@@ -655,8 +655,9 @@ The findings reach three places:
   summary of an approved resume that skips the review still show its table.
 
 Both hold the **most recent completed review** only. A later pass replaces them, because the
-report describes the tree that got the verdict. The per-pass `review-N.md` artifacts keep
-every pass that ran.
+report describes the tree that got the verdict. The per-pass `review-N.md` artifacts hold the
+passes still available: resuming a finished run starts the numbering over and can overwrite
+`review-1.md`, so they are not an immutable history.
 
 Nothing about approval changed with this contract. A reviewer that answers in prose, ending
 in `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`, is still read exactly as before —
