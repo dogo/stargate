@@ -759,6 +759,13 @@ A non-Stargate base ref, no matching run, unreadable state, or absent, `null` or
 findings silently adds nothing: no heading, empty section, warning or error. Fan-out runs
 do not inherit findings.
 
+**Inheritance therefore requires `commit: true`,** the same way fan-out does. A run whose
+commit was disabled or failed leaves a branch that still points at the base, so it does not
+carry the work its findings describe; inheriting from it would hand the architect a review
+of a tree the new run cannot see. Such a run is skipped like any other case inheritance
+cannot answer. With `commit: false`, `--base-ref stargate/<branch>` gives you neither the
+previous run's code nor its findings.
+
 ## Final message vs. stdout
 
 What an agent *prints* is not what it *answered*. `codex exec` streams the whole

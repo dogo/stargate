@@ -167,8 +167,10 @@ def test_the_newest_exact_branch_match_never_revives_older_findings(root: Path) 
     newer = runs / "20260911-different-task"
     older.mkdir(parents=True)
     newer.mkdir()
-    (older / "state.json").write_text(json.dumps({"branch": branch, "findings": [MEDIUM]}))
-    state = {"branch": branch, "findings": None}
+    (older / "state.json").write_text(
+        json.dumps({"branch": branch, "commit": "0" * 40, "findings": [MEDIUM]})
+    )
+    state = {"branch": branch, "commit": "1" * 40, "findings": None}
     (newer / "state.json").write_text(json.dumps(state))
     assert inherited_findings(root, branch) == ("", [])
 
@@ -191,6 +193,7 @@ def test_only_the_last_review_is_inherited_even_when_the_tree_moved_on(root: Pat
     (artifacts / "review-1.md").write_text("earlier finding that was resolved")
     (artifacts / "state.json").write_text(json.dumps({
         "branch": "stargate/previous",
+        "commit": "0" * 40,
         "status": "budget_exceeded",
         "review": {"attempt": 2, "fixed": True},
         "findings": [
@@ -218,3 +221,36 @@ def test_only_the_last_review_is_inherited_even_when_the_tree_moved_on(root: Pat
     assert "unknown severity" in section, section
     # file and line are independently optional; the line must survive alone.
     assert "- [high] -:7 -- a line with no file" in section, section
+
+
+def test_a_run_that_never_committed_has_nothing_to_inherit_from(root: Path) -> None:
+    """Found by trying to use the feature on a real chain.
+
+    With settings.commit false -- or after a commit that failed -- the run's
+    branch still exists but points at the base, so it does not carry the work
+    its findings describe. Inheriting them would hand the architect a review of
+    a tree this run cannot see, which is worse than inheriting nothing.
+    """
+    from stargate.run import inherited_findings
+
+    runs = root / ".stargate" / "runs"
+    (runs / "20260911-uncommitted").mkdir(parents=True)
+    state = {
+        "branch": "stargate/uncommitted-20260911",
+        "status": "approved",
+        "commit": None,
+        "findings": [MEDIUM],
+    }
+    path = runs / "20260911-uncommitted" / "state.json"
+    path.write_text(json.dumps(state))
+
+    assert inherited_findings(root, state["branch"]) == ("", [])
+
+    # The same run, once its branch actually received the commit.
+    state["commit"] = "0" * 40
+    path.write_text(json.dumps(state))
+
+    assert inherited_findings(root, state["branch"]) == (
+        "20260911-uncommitted",
+        [MEDIUM],
+    )

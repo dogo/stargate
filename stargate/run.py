@@ -403,7 +403,8 @@ def inherited_findings(repo: Path, base_ref: str) -> tuple[str, list[Any]]:
 
     Match the stored branch exactly: run ids and branches use different name
     orders, and an architect rename or collision makes inversion unreliable.
-    Missing or unreadable bookkeeping must never prevent a new run.
+    Missing or unreadable bookkeeping must never prevent a new run, and neither
+    does a run whose branch never received its commit.
     """
     if not base_ref.startswith("stargate/"):
         return "", []
@@ -423,6 +424,12 @@ def inherited_findings(repo: Path, base_ref: str) -> tuple[str, list[Any]]:
             continue
         if not isinstance(state, dict) or state.get("branch") != base_ref:
             continue
+        if not state.get("commit"):
+            # The run left no terminal commit -- settings.commit was false, or
+            # the commit failed -- so its branch does not carry the work those
+            # findings describe. Inheriting them would hand the architect a
+            # review of a tree this run cannot see.
+            return "", []
         findings = state.get("findings")
         if not isinstance(findings, list) or not findings:
             return "", []
