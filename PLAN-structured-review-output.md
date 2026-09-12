@@ -288,3 +288,33 @@ either direction of V2 changes approval behavior; strictness is not a compatibil
 Keeping V1's explicit-verdict rule is the option that preserves the current approval
 semantics. V2 needs an affirmative product decision backed by evidence, not just a choice
 of severity default.
+
+## First real-agent sample (2026-09-11)
+
+Harvested from the runs that implemented findings inheritance and this policy, before
+their artifacts were cleaned. Four reviews by `claude -p --model opus`, 13 findings. The
+run ids and pass numbers are kept so the reasoning is traceable to `git log`, even though
+the artifacts themselves are gone.
+
+| run | pass | reviewer verdict | severities |
+|---|---|---|---|
+| `20260911-210529-findings-inheritance` | review-1 | APPROVED | low, low |
+| `20260911-213254-severity-policy` | review-1 | CHANGES_REQUESTED | medium, low |
+| `20260911-213254-severity-policy` | review-2 | CHANGES_REQUESTED | medium, low, low, low, low |
+| `20260911-213254-severity-policy` | review-3 | APPROVED | low, low, low, low |
+
+**Question 1 — `CHANGES_REQUESTED` reviews with only `low` findings: none.** Both blocking
+reviews carried a `medium`. Both low-only reviews were approved by the reviewer on its own.
+
+So in this sample the reviewer unaided already did what a lenient `[high, medium]` policy
+would do, and that policy would have changed nothing. A strict `[high, medium, low]` policy
+would have *blocked* both approvals, buying two fixer cycles for cosmetic findings.
+
+**Question 2 does not arise:** the candidate set from question 1 is empty, so there is
+nothing to inspect for real defects filed as `low`.
+
+Four reviews from two runs by one model on one repository is far too small to decide a
+default, and every finding came from reviewing this project's own code, which is not a
+representative task mix. It is evidence that the question is worth asking rather than an
+answer. What it does support: nothing here argues for changing the default away from
+"the reviewer decides", and the strict direction looks actively worse.
