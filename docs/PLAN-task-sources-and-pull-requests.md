@@ -62,61 +62,72 @@ stargate run --from https://github.com/owner/repo/issues/42
 
 ## Decisions
 
-7. **A task source is a command, not an integration.** Same shape as agents: a command prefix
-   plus placeholders, never a client library.
-8. **Stargate never learns what GitHub is.** Nothing vendor-specific in the code means nothing
-   vendor-specific to maintain when a vendor changes.
-9. **Falling back from a CLI to an API is not a new mode, it is another command.** There is no
-   "API mode"; there is a list of commands tried in order, and `curl` is a command like any
-   other.
-10. **A list of commands, not `sh -c 'a || b'`.** The shell already does fallback with `||` and
-   would work today with no code at all — but `doctor.py:242-246` checks the **first element**
-   of each command against PATH, and with `sh -c` the binary is `/bin/sh`, always present. The
-   one-liner would hide the dependency from the one tool that exists to expose dependencies.
-   The list also gives a diagnosable error instead of an `sh` that exited 1.
-11. **Auth reuses what exists.** Entries already accept `env:` per entry, including
-   `{VAR: null}` to **remove** a variable. No new concept.
-12. **`jq` lives in the config.** Stargate does not extract fields from JSON. This is the line
-   where "vendor-agnostic" would be crossed without noticing.
-13. **The ref is a URL from a git interface** — GitHub, GitLab, Bitbucket, whatever — and
-   authentication belongs to whoever configures it. Public needs no credential, private does,
-   and stargate cannot tell the difference: to it, this is a command that prints text.
-14. **The source is chosen by matching the URL's host**, not by knowing the vendor. The config
-   declares which hosts each command serves. Better than a `--from gh:42` selector, which would
-   make the person repeat what the URL already says.
-15. **An unconfigured host is an error, not an attempt.** Stargate does no generic fetching of
-   its own: a web UI URL returns HTML, and extracting an issue from that would require knowing
-   the vendor's format — exactly what decision 6 refuses.
-16. **The only placeholder is `{url}`, plus `{host}` and `{path}` for convenience.** Stargate
-    substitutes what it can read off the URL without interpreting it, and nothing else.
+D1. **A task source is a command, not an integration.** Same shape as agents: a command prefix
+plus placeholders, never a client library.
 
-    This has a consequence worth stating, because otherwise an implementer will invent
-    something: a REST fallback usually needs a *different* URL than the web one — GitHub's is
-    `api.github.com/repos/OWNER/REPO/issues/N`, whose shape is not derivable from
-    `github.com/OWNER/REPO/issues/N` without knowing GitHub. Stargate will not do that surgery.
-    Whoever needs it puts it in a small wrapper script and lists the script as the command,
-    which keeps `doctor` able to see the real dependency (decision 4) instead of hiding it
-    behind `sh -c`.
-17. **Whoever points at a source owns what is in it.** No confirmation gate. The person asked
-    to read that URL; knowing what it says is their responsibility, and the text enters the
-    architect's prompt like any typed task. The README says so plainly, and `state.json` keeps
-    the fetched text, so auditability exists after the fact.
+D2. **Stargate never learns what GitHub is.** Nothing vendor-specific in the code means nothing
+vendor-specific to maintain when a vendor changes.
 
-    This assumes what the person read is what the command fetches. It can diverge — a comment
-    added after they looked, or a command configured to print more than the description. The
-    divergence has the same owner; it is not a reason for a gate.
-18. **Empty output is an error, and this is not about trust.** A command that exits 0 and
-    prints nothing is a broken fetch: auth that failed silently, a wrong ref, an issue with no
-    body. Without the check, the run would pay an architect to plan from nothing. Deliberately
-    separate from decision 10: input sanity, not input judgement.
-19. **This delivery is worth building, and the criterion is ergonomics plus provenance.**
-    `stargate run "$(gh issue view 42 ...)"` already works; what the feature adds is being
-    friendly, plus what `$( )` cannot do — recorded provenance, branch naming from the ref, and
-    a named error when the fetch fails before the architect is paid for.
-20. **Reading a PR as input is included, and the ambiguity dissolves.** A PR carries a diff as
-    well as a description, but **whoever writes the command decides what "the task" is**:
-    printing only the description, or description plus diff, is the config author's choice. Not
-    stargate's problem, and no separate design.
+D3. **Falling back from a CLI to an API is not a new mode, it is another command.** There is no
+"API mode"; there is a list of commands tried in order, and `curl` is a command like any other.
+
+D4. **A list of commands, not `sh -c 'a || b'`.** The shell already does fallback with `||` and
+would work today with no code at all — but `doctor.py:242-246` checks the **first element** of
+each command against PATH, and with `sh -c` the binary is `/bin/sh`, always present. The
+one-liner would hide the dependency from the one tool that exists to expose dependencies. The
+list also gives a diagnosable error instead of an `sh` that exited 1.
+
+D5. **Auth reuses what exists.** Entries already accept `env:` per entry, including
+`{VAR: null}` to **remove** a variable. No new concept.
+
+D6. **`jq` lives in the config.** Stargate does not extract fields from JSON. This is the line
+where "vendor-agnostic" would be crossed without noticing.
+
+D7. **The ref is a URL from a git interface** — GitHub, GitLab, Bitbucket, whatever — and
+authentication belongs to whoever configures it. Public needs no credential, private does, and
+stargate cannot tell the difference: to it, this is a command that prints text.
+
+D8. **The source is chosen by matching the URL's host**, not by knowing the vendor. The config
+declares which hosts each entry serves. Better than a `--from gh:42` selector, which would make
+the person repeat what the URL already says.
+
+D9. **An unconfigured host is an error, not an attempt.** Stargate does no generic fetching of
+its own: a web UI URL returns HTML, and extracting an issue from that would require knowing the
+vendor's format — exactly what D6 refuses.
+
+D10. **The only placeholder is `{url}`, plus `{host}` and `{path}` for convenience.** Stargate
+substitutes what it can read off the URL without interpreting it, and nothing else.
+
+This has a consequence worth stating, because otherwise an implementer will invent something: a
+REST fallback usually needs a *different* URL than the web one — GitHub's is
+`api.github.com/repos/OWNER/REPO/issues/N`, whose shape is not derivable from
+`github.com/OWNER/REPO/issues/N` without knowing GitHub. Stargate will not do that surgery.
+Whoever needs it puts it in a small wrapper script and lists the script as the command, which
+keeps `doctor` able to see the real dependency (D4) instead of hiding it behind `sh -c`.
+
+D11. **Whoever points at a source owns what is in it.** No confirmation gate. The person asked
+to read that URL; knowing what it says is their responsibility, and the text enters the
+architect's prompt like any typed task. The README says so plainly, and `state.json` keeps the
+fetched text, so auditability exists after the fact.
+
+This assumes what the person read is what the command fetches. It can diverge — a comment added
+after they looked, or a command configured to print more than the description. The divergence
+has the same owner; it is not a reason for a gate.
+
+D12. **Empty output is an error, and this is not about trust.** A command that exits 0 and
+prints nothing is a broken fetch: auth that failed silently, a wrong ref, an issue with no body.
+Without the check, the run would pay an architect to plan from nothing. Deliberately separate
+from D11: input sanity, not input judgement.
+
+D13. **This delivery is worth building, and the criterion is ergonomics plus provenance.**
+`stargate run "$(gh issue view 42 ...)"` already works; what the feature adds is being friendly,
+plus what `$( )` cannot do — recorded provenance, branch naming from the ref, and a named error
+when the fetch fails before the architect is paid for.
+
+D14. **Reading a PR as input is included, and the ambiguity dissolves.** A PR carries a diff as
+well as a description, but **whoever writes the command decides what "the task" is**: printing
+only the description, or description plus diff, is the config author's choice. Not stargate's
+problem, and no separate design.
 
 ---
 
@@ -126,53 +137,60 @@ stargate run --from https://github.com/owner/repo/issues/42
 stargate run --pr "..."          # or together with --from
 ```
 
-21. The run proceeds normally to its terminal result.
-22. **If the verdict is `APPROVED` and `--pr` was given:** stargate pushes the branch — refusing
+1. The run proceeds normally to its terminal result.
+2. **If the verdict is `APPROVED` and `--pr` was given:** stargate pushes the branch — refusing
    before it tries when there is no remote, when the branch already exists there, or when no
    upstream is configured — and then runs the configured command with `{branch}`, `{title}` and
    the body on stdin.
-23. **Any other verdict** (`CHANGES_REQUESTED`, budget exceeded, failing tests): nothing is
+3. **Any other verdict** (`CHANGES_REQUESTED`, budget exceeded, failing tests): nothing is
    published. It prints where the branch is and the exact command to open the PR by hand.
-24. `resume` requires `--pr` again.
+4. `resume` requires `--pr` again.
 
 ## Decisions
 
-25. **Publishing is never automatic. The boundary is crossed by a person's decision, never by
-    stargate's.** Not a UX preference: it is what keeps the invariant honest once rewritten.
-26. **The config says *how*; the flag says *whether*.** The `pull_request:` block is a fact
-    about the environment and authorizes nothing on its own; `--pr` is the decision about that
-    work, in that invocation. If the config's existence were enough, the decision would have
-    been made **once, earlier**, and every future run would publish — including one nobody was
-    thinking about. Standing config must not become standing authorization.
-27. **An unapproved verdict returns the decision.** Whoever typed `--pr` decided before knowing
-    the verdict. The verdict is information they did not have; handing the choice back is the
-    same principle, not an exception to it.
-28. **`resume` requires the flag again.** The intent to publish is not written to `state.json`
-    and does not survive a resume. A persisted "will publish" bit would be exactly the standing
-    authorization decision 15 refuses, and `resume` is where it would go unnoticed, because you
-    type only a run id.
-29. **The push belongs to stargate; the PR belongs to the command.** Stargate owns Git, knows
-    the branch name, and can **refuse before trying**. Putting the push inside a config
-    `sh -c` would bring back the `doctor` problem and move the refusal out of code and into a
-    string.
-30. **The PR title comes from the issue when there is one, otherwise the task's first line.**
-    The architect's `NAME:` is out: it is deliberately short — two to four words, for naming a
-    branch — and would make a poor title.
-31. **The PR body is where structured findings get a reader.** The first surface where the
-    findings are read by someone who did not open `summary.md`: verdict, findings table, the
-    test command and its exit, and the originating issue when there is one.
-32. **Commenting on the tracker is out of scope.** The PR body already delivers the findings to
-    whoever reads; a comment would add a second remote surface for the same content.
+D15. **Publishing is never automatic. The boundary is crossed by a person's decision, never by
+stargate's.** Not a UX preference: it is what keeps the invariant honest once rewritten.
+
+D16. **The config says *how*; the flag says *whether*.** The `pull_request:` block is a fact
+about the environment and authorizes nothing on its own; `--pr` is the decision about that work,
+in that invocation. If the config's existence were enough, the decision would have been made
+**once, earlier**, and every future run would publish — including one nobody was thinking about.
+Standing config must not become standing authorization.
+
+D17. **An unapproved verdict returns the decision.** Whoever typed `--pr` decided before knowing
+the verdict. The verdict is information they did not have; handing the choice back is the same
+principle, not an exception to it.
+
+D18. **`resume` requires the flag again.** The intent to publish is not written to `state.json`
+and does not survive a resume. A persisted "will publish" bit would be exactly the standing
+authorization D16 refuses, and `resume` is where it would go unnoticed, because you type only a
+run id.
+
+D19. **The push belongs to stargate; the PR belongs to the command.** Stargate owns Git, knows
+the branch name, and can **refuse before trying**. Putting the push inside a config `sh -c`
+would bring back the `doctor` problem and move the refusal out of code and into a string.
+
+D20. **The PR title comes from the issue when there is one, otherwise the task's first line.**
+The architect's `NAME:` is out: it is deliberately short — two to four words, for naming a
+branch — and would make a poor title.
+
+D21. **The PR body is where structured findings get a reader.** The first surface where the
+findings are read by someone who did not open `summary.md`: verdict, findings table, the test
+command and its exit, and the originating issue when there is one.
+
+D22. **Commenting on the tracker is out of scope.** The PR body already delivers the findings to
+whoever reads; a comment would add a second remote surface for the same content.
 
 ## The invariant
 
-33. `AGENTS.md` lists among the non-negotiable invariants that the orchestrator "only creates
-    **local** `stargate/*` branches and worktrees outside the repository", and that it never
-    pushes. Opening a PR requires a push, so the invariant will be **rewritten, not worked
-    around** — being worked around is how an invariant dies.
-34. **The wording matters more than it looks.** The rewritten invariant is not "stargate now
-    publishes" but: **stargate never publishes on its own — it publishes when a person says so,
-    in that invocation.** The difference between those two sentences is the whole feature.
+D23. `AGENTS.md` lists among the non-negotiable invariants that the orchestrator "only creates
+**local** `stargate/*` branches and worktrees outside the repository", and that it never pushes.
+Opening a PR requires a push, so the invariant will be **rewritten, not worked around** — being
+worked around is how an invariant dies.
+
+D24. **The wording matters more than it looks.** The rewritten invariant is not "stargate now
+publishes" but: **stargate never publishes on its own — it publishes when a person says so, in
+that invocation.** The difference between those two sentences is the whole feature.
 
 ## Not a shared precondition after all
 
