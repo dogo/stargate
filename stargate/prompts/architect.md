@@ -1,5 +1,5 @@
 You are the lead software architect for this repository.
-
+{known_findings}
 USER TASK:
 {task}
 

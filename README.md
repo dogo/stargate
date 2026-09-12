@@ -605,7 +605,9 @@ Two things the prompt templates have to respect:
 
 - Only known placeholders are substituted, by literal replacement: `{task}` and
   `{base_ref}` everywhere, plus `{plan}` (developer, reviewer, fixer),
-  `{tests}` (reviewer, fixer) and `{review}` (fixer). Every other brace is left
+  `{tests}` (reviewer, fixer), `{review}` (fixer) and `{known_findings}` (architect only).
+  An architect template that omits `{known_findings}` simply receives no inherited section,
+  including custom templates and older runs' frozen prompts. Every other brace is left
   alone, so a prompt may contain JSON, CSS or an f-string example verbatim. The
   fan-out prompt additionally receives `{max_tasks}`.
   These are separate from the agent-command placeholders described below.
@@ -654,7 +656,7 @@ The findings reach three places:
   the literal text `{tests}` reaches the fixer as the reviewer wrote it — though the outer
   whitespace is trimmed.
 - `summary.md` gets a `## findings` table when the findings are non-empty, highest
-  severity first. The stored order is the reviewer's; only the table is re-sorted.
+  severity first. The stored order remains the reviewer's.
 - `state.json` records them under `findings`, separate from the `review` checkpoint that
   `resume` uses. An empty list is stored as `null`, like the neighbouring `fanout` and
   `review` keys, so a consumer must not assume the value is iterable. The checkpoint ends
@@ -677,6 +679,28 @@ which is what keeps a custom `prompts_dir` reviewer working, and what lets a run
 before this existed still `resume` against its frozen prompt. What a new prompt can change is
 the model's own judgment, and malformed output is a new way for a run to stop: neither is a
 change to the orchestrator's rules.
+
+### Inheriting findings across runs
+
+For linear runs, `stargate run --base-ref stargate/<previous-branch> "next task"`
+automatically includes the previous run's findings in the architect prompt. This is the
+continuation command printed at the end of a committed run; no opt-in flag is needed.
+The resolved base ref must match a recorded `state.json` **branch** field exactly: Stargate
+scans `.stargate/runs/*/state.json`, without trying to reconstruct a run id from the branch
+name. The current branch also qualifies when `--base-ref` is omitted. A SHA, tag or
+`refs/heads/stargate/...` spelling does not qualify.
+
+Only the immediately previous run's **last completed review** travels, including findings
+from an `APPROVED` review. All findings pass through, unfiltered and without a size cap,
+so a large review can lengthen the prompt; earlier runs are not accumulated. The
+`## Known unresolved findings` section names the source run and warns that the findings
+describe the tree that review saw: an edit after that review may already have resolved one.
+The architect checks the current code and plans a fix or explains why a finding stays.
+Inheritance injects text only into the architect prompt and does not change verdict rules.
+
+A non-Stargate base ref, no matching run, unreadable state, or absent, `null` or empty
+findings silently adds nothing: no heading, empty section, warning or error. Fan-out runs
+do not inherit findings.
 
 ## Final message vs. stdout
 

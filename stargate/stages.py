@@ -32,6 +32,7 @@ from .run import (
     complete_stage,
     create_worktree,
     enter_stage,
+    inherited_findings,
     load_run,
     make_context,
     save_state,
@@ -433,6 +434,44 @@ def _by_severity(findings: list[Any]) -> list[Any]:
     return sorted(findings, key=rank)
 
 
+def _known_findings_section(ctx: RunContext) -> str:
+    """Include the previous review's context, or leave the prompt unchanged."""
+    run_id, findings = inherited_findings(ctx.repo, ctx.base_ref)
+    if not findings:
+        return ""
+    lines = [
+        "",
+        "## Known unresolved findings",
+        "",
+        f"These are the findings of the last completed review of run {run_id}, "
+        f"whose branch {ctx.base_ref} is this run's base ref.",
+        "",
+        "They describe the tree that review saw, not necessarily the tree you "
+        "are reading: an edit made after it -- a fixer pass that ran before the "
+        "run stopped -- may already have resolved one. Nothing here was "
+        "re-checked. Verify each against the current code, then plan the fix or "
+        "say why it stays.",
+        "",
+    ]
+    for entry in _by_severity(findings):
+        if not isinstance(entry, dict):
+            # Hand-edited state may contain junk; report it without failing.
+            lines.append("- [?] " + str(entry).replace("\n", " "))
+            continue
+        # `file` and `line` are independently optional, so a line without a
+        # file is valid data. Dropping it here would hide it, and the summary
+        # table already renders that pair as `-:42`.
+        where = str(entry.get("file") or "")
+        if entry.get("line") is not None:
+            where = f"{where or '-'}:{entry['line']}"
+        detail = str(entry.get("finding", ""))
+        if entry.get("why"):
+            detail += f" (why: {entry['why']})"
+        severity = str(entry.get("severity", "?"))
+        lines.append(f"- [{severity}] " + (f"{where} -- " if where else "") + detail)
+    return "\n".join(lines) + "\n"
+
+
 def _summary_cell(value: object) -> str:
     """Keep persisted diagnostic text inside one Markdown table cell."""
     return str(value).replace("|", "\\|").replace("\r\n", "\n").replace(
@@ -574,7 +613,11 @@ def run_stages(
         architect_ran = True
         enter_stage(ctx, "architect")
         architect_prompt = render_prompt(
-            prompts, "architect", task=ctx.task, base_ref=ctx.base_ref
+            prompts,
+            "architect",
+            task=ctx.task,
+            base_ref=ctx.base_ref,
+            known_findings=_known_findings_section(ctx),
         )
         print("\n=== ARCHITECT ===")
         raw_plan = invoke_agent(

@@ -398,6 +398,38 @@ def read_run(path: Path) -> dict[str, Any]:
     return row
 
 
+def inherited_findings(repo: Path, base_ref: str) -> tuple[str, list[Any]]:
+    """Find the base branch's recorded run and its last completed findings.
+
+    Match the stored branch exactly: run ids and branches use different name
+    orders, and an architect rename or collision makes inversion unreliable.
+    Missing or unreadable bookkeeping must never prevent a new run.
+    """
+    if not base_ref.startswith("stargate/"):
+        return "", []
+    root = repo / ".stargate" / "runs"
+    try:
+        paths = sorted(
+            (path for path in root.iterdir() if path.is_dir()),
+            key=lambda path: path.name,
+            reverse=True,
+        )
+    except OSError:
+        return "", []
+    for path in paths:
+        try:
+            state = json.loads((path / "state.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(state, dict) or state.get("branch") != base_ref:
+            continue
+        findings = state.get("findings")
+        if not isinstance(findings, list) or not findings:
+            return "", []
+        return str(state.get("run_id") or path.name), findings
+    return "", []
+
+
 def list_runs(repo: Path) -> int:
     root = repo / ".stargate" / "runs"
     # Listing a repository that has never run stargate must not create the
