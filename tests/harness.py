@@ -50,6 +50,7 @@ def write_config(
     test_command_detection: str | None = None,
     commit: bool | str | None = None,
     reviewer_args: tuple[str, ...] = (),
+    task_sources: list | None = None,
 ) -> None:
     import yaml
 
@@ -81,6 +82,8 @@ def write_config(
         cfg["settings"]["test_command_detection"] = test_command_detection
     if commit is not None:
         cfg["settings"]["commit"] = commit
+    if task_sources is not None:
+        cfg["task_sources"] = task_sources
     path.write_text(yaml.safe_dump(cfg))
 
 
@@ -121,7 +124,8 @@ def run(
     repo: Path, config: Path, task: str = "demo task", *run_args: str
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-m", "stargate", "--config", str(config), "run", *run_args, task],
+        [sys.executable, "-m", "stargate", "--config", str(config), "run", *run_args,
+         *([task] if task else [])],
         cwd=repo,
         text=True,
         capture_output=True,

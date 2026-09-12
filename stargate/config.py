@@ -335,6 +335,46 @@ def blocking_severities(config: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
+def task_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate sources before fetching; normalize hosts and command arguments."""
+    value = config.get("task_sources")
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise StargateError("task_sources must be a list of source mappings.")
+    sources = []
+    for index, entry in enumerate(value):
+        label = f"task_sources[{index}]"
+        if not isinstance(entry, dict):
+            raise StargateError(f"{label} must be a mapping.")
+        hosts = entry.get("hosts")
+        if not isinstance(hosts, list) or not hosts or any(
+            not isinstance(host, str) or not host.strip() for host in hosts
+        ):
+            raise StargateError(f"{label}.hosts must be a non-empty list of non-empty host names.")
+        commands = entry.get("commands")
+        if not isinstance(commands, list) or not commands:
+            raise StargateError(f"{label}.commands must be a non-empty list of commands.")
+        normalized = []
+        for command_index, command in enumerate(commands):
+            command_label = f"{label}.commands[{command_index}]"
+            if not isinstance(command, list) or not command:
+                raise StargateError(
+                    f"{command_label} must be a non-empty list of command arguments; "
+                    "commands takes a list of commands, not a flat argument list."
+                )
+            if any(not isinstance(part, (str, int, float)) for part in command):
+                raise StargateError(f"{command_label} arguments must be strings or numbers.")
+            argv = [str(part) for part in command]
+            if not argv[0].strip():
+                raise StargateError(f"{command_label}[0] must name an executable.")
+            normalized.append(argv)
+        if entry.get("env") is not None and not isinstance(entry["env"], dict):
+            raise StargateError(f"{label}.env must be a mapping of names to values.")
+        sources.append({**entry, "hosts": [host.lower() for host in hosts], "commands": normalized})
+    return sources
+
+
 def commit_enabled(config: dict[str, Any]) -> bool:
     value = config.get("settings", {}).get("commit", True)
     if not isinstance(value, bool):

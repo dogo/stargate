@@ -97,18 +97,18 @@ leaves a commit on its own branch, including when the verdict is `CHANGES_REQUES
 the test command failed, or when the token budget stopped it; the verdict goes into the
 commit message.
 
-Full user documentation: [`README.md`](README.md) (1234 lines — it is the reference, do not
+Full user documentation: [`README.md`](README.md) (1305 lines — it is the reference, do not
 duplicate it here). Verified single-vendor configurations: [`examples/`](examples/).
 
 ## Repository state
 
-**Both modes are implemented and covered.** 200 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 214 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 
 What exists:
 
-- `stargate/`: 10 modules, ~4,600 lines. The only runtime dependency is **PyYAML**; `ruff`
+- `stargate/`: 11 modules, ~5,000 lines. The only runtime dependency is **PyYAML**; `ruff`
   is the only dev dependency. No agent framework, no SDK.
 - The linear mode, complete: layered config, test-command detection, token budget, retries
   with backoff, timeouts, heartbeat, config/prompt snapshots, terminal commit,
@@ -184,12 +184,13 @@ full table is in the README.
 
 ## Architecture overview
 
-One package, ten modules, with no abstraction layer between them. Dependencies point
+One package, eleven modules, with no abstraction layer between them. Dependencies point
 downward; `core.py` imports nothing from the package.
 
 ```text
 cli.py          argparse, signals, dispatch. Validates flag combinations BEFORE
                 reserving any run artifact.
+  ├─ source.py       fetch task text through configured commands before reserving a run
   └─ stages.py       the linear workflow: orchestrate() → run_stages() → review_and_finish()
        ├─ fanout.py  the fan-out workflow: DAG, concurrent scheduler, integration
        ├─ agent.py   invoking ONE agent: retries, backoff, token accounting,

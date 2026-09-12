@@ -29,6 +29,7 @@ from .config import (
     expand_test_command,
     find_prompt,
     prompt_dirs,
+    task_sources,
     test_command_grant,
     token_cap,
     value_source,
@@ -236,6 +237,17 @@ def doctor(
     }
     ok = True
     binaries = {"git"}
+    try:
+        sources = task_sources(config)
+    except StargateError as exc:
+        # Returns instead of setting ok=False like blocking_severities does, and
+        # the difference is position: this runs before the probe block, so
+        # continuing would pay for real agent calls under a config `run` refuses.
+        print(f"\nERROR    {exc}")
+        return 1
+    for source in sources:
+        for command in source["commands"]:
+            binaries.add(command[0])
     for role in ROLES:
         binaries.add(commands[role][0])
 
@@ -361,6 +373,16 @@ def doctor(
             "repository,\n         not the worktree, so this can grant command "
             "execution there."
         )
+
+    print("\nTask sources:")
+    if not sources:
+        print("  (none configured; 'stargate run --from' needs one)")
+    for source in sources:
+        print(f"  {', '.join(source['hosts'])}")
+        for command in source["commands"]:
+            print(f"    $ {shlex.join(command)}")
+        if overrides := env_summary(source):
+            print(f"    └─ env: {overrides}")
 
     print("\nPrompts:")
     dirs = prompt_dirs(config, script_dir)

@@ -64,6 +64,8 @@ class RunContext:
     # loop, cleared once the run finishes. `findings` is a report: it has to
     # survive to the terminal state, so it cannot share that dict.
     findings: list[dict[str, Any]] = field(default_factory=list)
+    # Provenance survives every stage and resume independently of the task text.
+    task_source: str = ""
 
 
 # How often a running agent prints that it is still alive.

@@ -1085,7 +1085,10 @@ def orchestrate_fanout(
         print(f"\nResuming fan-out {ctx.run_id}: {ctx.task}")
     else:
         warn_if_dirty(repo)
-        ctx = make_context(repo, config, args.task, args.base_ref, args.name)
+        ctx = make_context(
+            repo, config, args.task, args.base_ref, args.name,
+            task_source=getattr(args, "from_url", None) or "",
+        )
         ctx.mode = "fanout"
         prompts = snapshot(ctx, prompt_dirs(config, script_dir))
         save_state(ctx, "running")

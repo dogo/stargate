@@ -19,6 +19,7 @@ from .config import (
 from .core import StargateError, Terminated, repo_root, terminate_active_processes
 from .doctor import doctor
 from .run import REDOABLE_STAGES, clean_runs, list_runs
+from .source import fetch_task
 from .stages import orchestrate
 
 
@@ -34,6 +35,10 @@ def _positive_int(value: str) -> int:
 
 def _validate_run_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Reject run-only flag combinations before reserving any run artifacts."""
+    if args.from_url is not None and args.task is not None:
+        parser.error("--from cannot be combined with a task argument")
+    if args.from_url is None and not args.task:
+        parser.error("a task description or --from URL is required")
     if args.fan_out and args.no_commit:
         parser.error("--no-commit cannot be combined with --fan-out")
     if not args.fan_out and args.max_parallel_tasks is not None:
@@ -113,7 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     run = sub.add_parser("run", help="Plan, implement, review and fix a task.")
-    run.add_argument("task", help="Feature/bug/task description.")
+    run.add_argument("task", nargs="?", help="Feature/bug/task description.")
+    run.add_argument(
+        "--from", dest="from_url", metavar="URL",
+        help="Read the task from the configured source for this URL's host. "
+        "Cannot be combined with a task argument; rejected before a run is created.",
+    )
     run.add_argument(
         "--fan-out",
         action="store_true",
@@ -246,6 +256,9 @@ def main() -> int:
                 raise StargateError(
                     "Fan-out requires settings.commit: true; no run was created."
                 )
+            if args.command == "run" and args.from_url is not None:
+                args.task = fetch_task(config, args.from_url, Path.cwd())
+                print(f"Task read from {args.from_url} ({len(args.task.splitlines())} lines)")
             return orchestrate(args, script_dir, config)
         parser.error("Unknown command")
         return 2

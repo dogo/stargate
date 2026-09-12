@@ -27,6 +27,7 @@ from .core import (
     short_name,
     slugify,
 )
+from .source import branch_hint
 
 
 def resolve_base_ref(repo: Path, requested: str | None) -> tuple[str, str]:
@@ -168,6 +169,8 @@ def make_context(
     task: str,
     base_ref: str | None,
     name: str | None = None,
+    *,
+    task_source: str = "",
 ) -> RunContext:
     now = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     named = short_name(name or "") if name is not None else ""
@@ -176,7 +179,7 @@ def make_context(
             "Warning: --name produced no usable slug; using the task text.",
             file=sys.stderr,
         )
-    slug = named or slugify(task)
+    slug = named or slugify(f"{branch_hint(task_source)} {task}")
     base, base_commit = resolve_base_ref(repo, base_ref)
     run_id, branch, artifacts = reserve_run(repo, now, slug)
     tag = branch.removeprefix(f"stargate/{slug}-")
@@ -203,6 +206,7 @@ def make_context(
         worktree=worktree,
         artifacts=artifacts,
         task=task,
+        task_source=task_source,
         tag=tag,
         named_by_user=bool(named),
     )
@@ -238,6 +242,7 @@ def save_state(ctx: RunContext, status: str, error: str | None = None) -> None:
     contents = json.dumps({
         "run_id": ctx.run_id,
         "task": ctx.task,
+        "task_source": ctx.task_source or None,
         "repo": str(ctx.repo),
         "base_ref": ctx.base_ref,
         "base_commit": ctx.base_commit,
@@ -323,6 +328,7 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
         worktree=Path(state["worktree"]),
         artifacts=artifacts,
         task=state["task"],
+        task_source=str(state.get("task_source") or ""),
         stage=state.get("stage", "init"),
         done=set(state.get("completed", [])),
         tokens_used=int(state.get("tokens_used", 0)),

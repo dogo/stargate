@@ -316,10 +316,11 @@ def write_summary(
             "Review/fixer scope: integration worktree only; fixer edits are "
             "not copied back to task branches.\n"
         )
+    source_line = f"Task source: {ctx.task_source}\n" if ctx.task_source else ""
     summary = f"""# stargate run
 
 Task: {task}
-Run: {ctx.run_id}
+{source_line}Run: {ctx.run_id}
 Base ref: {ctx.base_ref}
 Base commit: {ctx.base_commit}
 Branch: {ctx.branch}
@@ -578,7 +579,10 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     else:
         blocking_severities(config)
         warn_if_dirty(repo)
-        ctx = make_context(repo, config, args.task, args.base_ref, args.name)
+        ctx = make_context(
+            repo, config, args.task, args.base_ref, args.name,
+            task_source=getattr(args, "from_url", None) or "",
+        )
         prompts = snapshot(ctx, prompt_dirs(config, script_dir))
 
     commit = commit_enabled(ctx.config) and not args.no_commit

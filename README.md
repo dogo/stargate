@@ -157,6 +157,8 @@ for all other agents are inherited. Top-level scalar values use the
 most-specific value. A blank mapping section such as `settings:` does not erase
 inherited settings.
 
+The top-level `task_sources` list is replaced whole by the most-specific layer.
+
 `--config <path>` is the exception: that file is used exactly as given, with no
 project, user or packaged config layered under it. This is also the escape hatch
 for resuming with a repaired agent definition.
@@ -170,6 +172,9 @@ configuration from an unrelated repository.
 ## Settings reference
 
 Everything under `settings:` in the layered effective config. All are optional.
+
+`task_sources` is a separate top-level block, like `agents` and `workflow`;
+see [Read the task from a source](#read-the-task-from-a-source).
 
 | key | default | meaning |
 |---|---|---|
@@ -320,6 +325,68 @@ stargate run --name "passkey auth" "Add passkey authentication to account settin
 
 `--name` takes precedence over the architect's suggestion and uses at most five
 whole words (32 characters), never a word truncated in the middle.
+
+Use `--from URL` instead of the positional task to read it from a configured source.
+
+## Read the task from a source
+
+```bash
+stargate run --from https://tracker.example/team/project/items/42
+```
+
+Configure the commands that print the task as plain text. `task_sources` goes at
+the top level of your config:
+
+```yaml
+task_sources:
+  - hosts: [tracker.example, tracker.internal.example]
+    commands:
+      - [tracker-cli, show, "{url}", --text]
+      - [fetch-task, "{url}"]    # your fallback wrapper script
+    env:
+      SOURCE_PROFILE: work
+      SOURCE_TOKEN: null        # remove an inherited variable
+```
+
+These executable names are examples; supply your installed CLI or wrapper.
+Each entry contains a **list of commands**, each an argument list. Stargate
+matches the URL's hostname case-insensitively, ignoring the port, and uses the
+first matching entry. An unconfigured host is refused by name: Stargate never
+fetches a URL itself.
+
+Commands run in order from the invocation directory. The first command that
+exits 0 with non-empty output wins. Missing executables, nonzero exits, and a
+120-second timeout advance to the next command. **Empty or whitespace-only
+output is a failed fetch**, even with exit 0. If all commands fail, the error
+names every attempt with its own stderr; no run artifacts or agents are started.
+`stargate doctor` lists all hosts and commands and checks every command's first
+element against PATH. A missing fallback executable makes doctor exit 1 too.
+
+The only placeholders are `{url}` (the supplied URL), `{host}` (its hostname),
+and `{path}` (its path, excluding query and fragment). Substitution is literal
+within each argument; there is no shell or environment-variable expansion.
+Stargate never derives an API URL from a web URL. Put URL conversion, JSON
+extraction, or authentication logic in a wrapper and list its executable as a
+command so doctor can check it. `env:` works as on agent entries: values override
+the inherited environment, and `null` removes a variable. Existing CLI login or
+inherited tokens work too; doctor prints variable names, never their values.
+
+The fetched text is **untrusted input that the operator owns**. There is no
+confirmation gate: it enters the architect's prompt verbatim, like a typed task.
+The operator is responsible for what the command prints, including changes made
+at the source since they last read it. A source can describe an issue or a pull
+request; its command decides whether to include a description, a diff, or both.
+
+`--from` and a positional task are mutually exclusive; their conflict is rejected
+before any run is reserved. The initial branch uses the URL's last non-empty path
+segment, for example `stargate/42-<task-slug>-<timestamp>`. If the segment has no
+usable characters, ordinary task naming applies silently. `--name` still wins,
+and the architect can still suggest a branch name as usual. `--from` also works
+with `--fan-out`.
+
+The exact fetched task and its separate `task_source` URL are frozen in
+`state.json` for audit; `summary.md` records `Task source:` too. `resume` reuses
+the recorded text and never re-fetches, even if the source is now unreachable.
 
 ## Fan-out
 
@@ -1191,6 +1258,9 @@ becomes the thing that breaks.
 
 The important separation is:
 
+- Text fetched through `--from` is untrusted input that the operator owns. It
+  enters the architect's prompt without confirmation; `state.json` retains the
+  task and its separate source URL for audit.
 - Claude architect/reviewer runs with `--disallowedTools "Edit Write
   NotebookEdit"` in the default config. The packaged reviewer additionally may
   execute only the effective test command, and it runs in the isolated
@@ -1219,10 +1289,11 @@ boundary; prompts are guidance, not a security boundary.
 Shipped since this list was written: fan-out DAG execution, token accounting,
 timeouts, retries,
 persistent run state, `list`, `resume`, catchable-signal handling, capability
-probes, empty-stage detection, and terminal commits on run branches. What is
-still open, roughly in order of how much it would change the tool:
+probes, empty-stage detection, and terminal commits on run branches.
 
-- **GitHub issue / PR as task input.**
+Task input from configured sources shipped: see
+[Read the task from a source](#read-the-task-from-a-source). Opening pull requests
+remains a separate, unimplemented delivery.
 
 Structured review output shipped: see
 [Structured review findings](#structured-review-findings). Severity policy also shipped
