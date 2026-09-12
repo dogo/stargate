@@ -170,7 +170,12 @@ D19. **The push belongs to stargate; the PR belongs to the command.** Stargate o
 the branch name, and can **refuse before trying**. Putting the push inside a config `sh -c`
 would bring back the `doctor` problem and move the refusal out of code and into a string.
 
-D20. **The PR title comes from the issue when there is one, otherwise the task's first line.**
+D20. **The PR title is the task's first line, always.** An earlier wording said "the issue
+title when there is one, otherwise the task's first line", which cannot be implemented without
+crossing D6: stargate never parses a source's output, so it has no title field to read. With the
+recommended command shape (`.title + "\n\n" + .body`) the first line *is* the issue title, so
+the two wordings agree in practice and only this one is implementable without vendor knowledge.
+
 The architect's `NAME:` is out: it is deliberately short — two to four words, for naming a
 branch — and would make a poor title.
 
