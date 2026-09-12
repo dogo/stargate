@@ -12,6 +12,8 @@ from typing import Any
 from .agent import invoke_agent
 from .commit import commit_run, commit_summary, terminal_commit_at_head
 from .config import (
+    SEVERITIES,
+    blocking_severities,
     commit_enabled,
     prompt_dirs,
     render_prompt,
@@ -574,17 +576,21 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
                 )
         print(f"Completed: {', '.join(sorted(ctx.done)) or '(nothing)'}")
     else:
+        blocking_severities(config)
         warn_if_dirty(repo)
         ctx = make_context(repo, config, args.task, args.base_ref, args.name)
         prompts = snapshot(ctx, prompt_dirs(config, script_dir))
 
     commit = commit_enabled(ctx.config) and not args.no_commit
+    blocking = blocking_severities(ctx.config)
 
     print(f"\nRun ID:   {ctx.run_id}")
     print(f"Base:     {ctx.base_ref} @ {ctx.base_commit[:12]}")
     print(f"Branch:   {ctx.branch}")
     print(f"Worktree: {ctx.worktree}")
     print(f"Artifacts:{ctx.artifacts}")
+    if blocking:
+        print(f"Review:   blocking severities: {', '.join(blocking)}")
 
     try:
         plan_tests(ctx)
@@ -699,13 +705,23 @@ def run_stages(
     )
 
 
-SEVERITIES = ("high", "medium", "low")
-
 VERDICTS = ("APPROVED", "CHANGES_REQUESTED")
 
 
-def parse_review(raw: str) -> tuple[str, list[dict[str, Any]]]:
-    """The reviewer's verdict and findings, from either contract.
+def _policy_verdict(
+    verdict: str, findings: list[dict[str, Any]], contract: str,
+    blocking: tuple[str, ...],
+) -> str:
+    # Prose has no findings contract; empty JSON has no evidence for derivation.
+    if not blocking or contract != "json" or not findings:
+        return verdict
+    return "CHANGES_REQUESTED" if any(
+        entry["severity"] in blocking for entry in findings
+    ) else "APPROVED"
+
+
+def parse_review(raw: str) -> tuple[str, list[dict[str, Any]], str]:
+    """The reviewer's verdict, findings, and the contract that spoke.
 
     A JSON object is the current contract; a response whose last line is
     `VERDICT: ...` is the original one, still spoken by a frozen prompt from a
@@ -721,14 +737,14 @@ def parse_review(raw: str) -> tuple[str, list[dict[str, Any]]]:
         except json.JSONDecodeError:
             data = None
     if isinstance(data, dict):
-        return _parse_json_review(data)
+        return (*_parse_json_review(data), "json")
 
     # The verdict is the last line, not a substring anywhere in the prose:
     # "I cannot give VERDICT: APPROVED because..." must not read as approval.
     last_line = text.splitlines()[-1].strip() if text else ""
     for verdict in VERDICTS:
         if last_line == f"VERDICT: {verdict}":
-            return verdict, []
+            return verdict, [], "prose"
     raise StargateError(
         "Reviewer output is neither a JSON review object nor a response "
         f"ending in exactly 'VERDICT: {VERDICTS[0]}' or "
@@ -782,9 +798,7 @@ def _parse_json_review(data: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]
         if line is not None:
             entry["line"] = line
         findings.append(entry)
-    # An incoherent pair -- CHANGES_REQUESTED with no findings, APPROVED with a
-    # high one -- is accepted on purpose. Judging it would be the severity
-    # policy this version deliberately leaves out.
+    # Parsing preserves the explicit verdict. Opt-in policy is applied separately.
     return verdict, findings
 
 
@@ -802,21 +816,25 @@ def _record_review(
         "fingerprint": worktree_fingerprint(ctx),
         "fixed": fixed,
     }
+    if blocking := blocking_severities(ctx.config):
+        ctx.review["blocking_severities"] = list(blocking)
     save_state(ctx, "running")
 
 
-def _recorded_review(ctx: RunContext, attempt: int) -> str | None:
-    """The reviewer's own words for a recorded pass, or None if unusable."""
+def _recorded_review(
+    ctx: RunContext, attempt: int, blocking: tuple[str, ...]
+) -> tuple[str, str] | None:
+    """Re-evaluate a saved pass under the effective (possibly replaced) policy."""
     try:
         review = (ctx.artifacts / f"review-{attempt}.md").read_text().strip()
     except OSError:
         return None
     try:
-        verdict, _ = parse_review(review)
+        verdict, findings, contract = parse_review(review)
     except StargateError:
         # A truncated or hand-edited artifact cannot stand in for a reviewer.
         return None
-    return review if verdict == "CHANGES_REQUESTED" else None
+    return _policy_verdict(verdict, findings, contract, blocking), review
 
 
 def review_and_finish(
@@ -837,6 +855,7 @@ def review_and_finish(
         ctx.config.get("settings", {}).get("max_review_loops", 2)
     )
     max_loops = args.max_review_loops if args.max_review_loops is not None else configured_loops
+    blocking = blocking_severities(ctx.config)
     verdict = "CHANGES_REQUESTED"
 
     # A resume must not buy a second opinion on a tree a reviewer already
@@ -857,16 +876,27 @@ def review_and_finish(
         # is owed. Continuing the count keeps max_review_loops a budget for the
         # run rather than a fresh allowance for every resume of it.
         start = recorded_attempt
-    elif unchanged and recorded_verdict == "APPROVED":
-        # Nothing left to decide. Going straight to finish is what lets a run
-        # whose commit failed -- a signing prompt that timed out, a rejecting
-        # hook -- retry that commit without paying for another review.
-        print(f"\n=== REVIEW {recorded_attempt} (skipped, already APPROVED) ===")
-        complete_stage(ctx, "review")
-        return finish(ctx, task, "APPROVED", test_exit, commit=commit)
-    elif unchanged and recorded_verdict == "CHANGES_REQUESTED":
-        pending = _recorded_review(ctx, recorded_attempt)
-        if pending is not None:
+    elif unchanged and recorded_verdict in VERDICTS:
+        # A disabled policy can change a verdict only if this checkpoint used
+        # one. Without either policy, retain V1's artifact replay rules.
+        policy_applies = bool(blocking or recorded.get("blocking_severities"))
+        replayed = (
+            _recorded_review(ctx, recorded_attempt, blocking)
+            if policy_applies or recorded_verdict == "CHANGES_REQUESTED" else None
+        )
+        if recorded_verdict == "APPROVED" and (
+            not policy_applies or (replayed is not None and replayed[0] == "APPROVED")
+        ):
+            # V1 retries the commit without reopening the approved artifact.
+            # If a policy was involved, remember the effective policy for a
+            # later resume, including its removal.
+            if policy_applies:
+                _record_review(ctx, recorded_attempt, "APPROVED")
+            print(f"\n=== REVIEW {recorded_attempt} (skipped, already APPROVED) ===")
+            complete_stage(ctx, "review")
+            return finish(ctx, task, "APPROVED", test_exit, commit=commit)
+        if replayed is not None and (policy_applies or replayed[0] == "CHANGES_REQUESTED"):
+            pending = replayed[1]
             start = recorded_attempt - 1
 
     enter_stage(ctx, "review")
@@ -901,9 +931,15 @@ def review_and_finish(
 
         artifact = ctx.artifacts / f"review-{attempt + 1}.md"
         try:
-            verdict, ctx.findings = parse_review(review)
+            reviewed, ctx.findings, contract = parse_review(review)
         except StargateError as exc:
             raise StargateError(f"{exc} See {artifact}") from exc
+        verdict = _policy_verdict(reviewed, ctx.findings, contract, blocking)
+        if verdict != reviewed:
+            print(
+                f"[review {attempt + 1}] settings.blocking_severities "
+                f"({', '.join(blocking)}) derived {verdict}; the reviewer said {reviewed}."
+            )
         if verdict == "APPROVED":
             _record_review(ctx, attempt + 1, "APPROVED")
             break
@@ -922,6 +958,14 @@ def review_and_finish(
             review=review,
             tests=test_report,
         )
+        if blocking:
+            fixer_prompt += (
+                "\n\nORCHESTRATOR NOTE (separate from the review above):\n"
+                f"settings.blocking_severities is active: {', '.join(blocking)}. "
+                "JSON reviews with findings block only on these severities; other "
+                "findings are recorded but do not block. Prose and reviews without "
+                "findings keep the reviewer's explicit verdict.\n"
+            )
         if budget_spent(ctx, f"fixer {attempt + 1}"):
             return finish(
                 ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit

@@ -14,7 +14,7 @@ from typing import Any
 
 from .agent import invoke_agent
 from .commit import commit_run
-from .config import commit_enabled, prompt_dirs, render_prompt
+from .config import blocking_severities, commit_enabled, prompt_dirs, render_prompt
 from .core import RunContext, StargateError, git_quiet, print_output, short_name
 from .run import (
     budget_spent,
@@ -1066,6 +1066,7 @@ def orchestrate_fanout(
     if args.no_commit:
         raise StargateError(commit_error)
     if not resuming:
+        blocking_severities(config)
         if not commit_enabled(config):
             raise StargateError(commit_error)
         max_tasks, max_parallel = fanout_limits(
@@ -1074,6 +1075,7 @@ def orchestrate_fanout(
 
     if resuming:
         ctx = load_run(repo, args.run_id, config, use_frozen=args.config is None)
+        blocking_severities(ctx.config)
         if not commit_enabled(ctx.config):
             raise StargateError(commit_error)
         max_tasks, max_parallel = fanout_limits(

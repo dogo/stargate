@@ -592,11 +592,10 @@ def test_a_finished_run_reports_findings_without_an_active_checkpoint(
 
 
 def test_an_explicit_verdict_is_never_overridden(root: Path) -> None:
-    """Pins this version's scope.
+    """Pins the default now that severity policy is opt-in.
 
-    Deriving the verdict from severities is a separate, unscheduled decision:
-    no default for it is behaviour-neutral, in either direction. This test
-    fails the moment such a policy leaks in early.
+    No derived default is behaviour-neutral in either direction. Without an
+    explicit policy, the reviewer's verdict must remain authoritative.
     """
     repo = make_repo(root)
     low_only = _review_file(root, "low.json", "CHANGES_REQUESTED", [LOW])

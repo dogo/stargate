@@ -177,6 +177,7 @@ Everything under `settings:` in the layered effective config. All are optional.
 | `test_command_detection` | `report` | What to do when `test_command` is empty: `report` shows likely commands without running one, `auto` runs the highest-priority match, and `off` skips detection. |
 | `commit` | `true` | Commit results on the run's own branch. Linear runs can set this to `false`, or pass `--no-commit`, to leave the worktree dirty. Fan-out requires `true` and rejects `--no-commit`. |
 | `max_review_loops` | `2` | Fixer passes allowed after the first review. `0` reviews once and stops. Overridable per run with `--max-review-loops`. |
+| `blocking_severities` | `[]` | Opt-in severity policy. Empty or absent: the reviewer's explicit verdict decides. A YAML list of `high`, `medium`, `low` derives the verdict from JSON findings. A bare string or an unknown severity is rejected before any agent runs. See [Severity policy](#severity-policy-opt-in). |
 | `max_fanout_tasks` | `8` | Maximum number of DAG nodes the fan-out architect may return. Must be a YAML integer: a quoted `"8"` is rejected, not coerced. |
 | `max_parallel_tasks` | `2` | Maximum ready fan-out tasks run concurrently. Must be a YAML integer, like `max_fanout_tasks`. Overridable for fan-out runs and resumes with `--max-parallel-tasks`; linear invocations reject that flag. |
 | `max_task_tokens` | `0` | Stop between phases once agents have reported this many tokens. `0` means no limit. |
@@ -224,6 +225,10 @@ and agents, each role's resolved command, all five resolved prompt files
 with their evidence. It makes no external calls, so `FOUND` means only that the
 executable is on `PATH` — see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
+The effective-settings table reports values and provenance. Most settings are only
+validated by the command that uses them, but an invalid `blocking_severities` is reported
+here as an `ERROR` and exits `1`, with the offending value still shown in the table —
+finding out from `doctor` is the point of `doctor`.
 
 ## Probing agents
 
@@ -636,18 +641,17 @@ The packaged `reviewer.md` asks for one JSON object and nothing else:
 }
 ```
 
-`verdict` is required and must be exactly `APPROVED` or `CHANGES_REQUESTED`. **It is the
-reviewer's decision and the orchestrator acts on it as given**: nothing derives, overrides
-or second-guesses it from the severities. `findings` may be empty. Each entry needs a
+`verdict` is required and must be exactly `APPROVED` or `CHANGES_REQUESTED`. **By default,
+the orchestrator acts on the reviewer's decision as given.** Only an explicit
+`settings.blocking_severities` policy can override it. `findings` may be empty. Each entry needs a
 `severity` of `high`, `medium` or `low` and a non-empty `finding`; `file`, `line` and `why`
 are optional, and unknown keys are ignored. A `CHANGES_REQUESTED` with no findings, or an
 `APPROVED` carrying a `high` one, is accepted rather than treated as an error.
 
-Severity is reported, not enforced: it never decides approval and never selects what the
+Without a policy, severity is reported but does not decide approval or select what the
 fixer works on. It is classified by demonstrated impact — the packaged prompt carries the
-full rubric. It is not inert everywhere, though: it orders the summary table, and a value
-outside the three labels aborts the run as a malformed review. It exists so the report is legible, and so a decision about deriving verdicts from
-severities can later be argued from real reviews instead of taste.
+full rubric. It orders the summary table, and a value outside the three labels aborts the
+run as a malformed review.
 
 The findings reach three places:
 
@@ -671,7 +675,7 @@ them. The per-pass `review-N.md` artifacts hold the
 passes still available: resuming a finished run starts the numbering over and can overwrite
 `review-1.md`, so they are not an immutable history.
 
-Who decides approval did not change with this contract, though what the parser accepts
+Who decides approval did not change with the V1 contract, though what the parser accepts
 did: bare JSON now succeeds where it used to abort, and a malformed payload is a new way to
 stop. A reviewer that answers in prose, ending
 in `VERDICT: APPROVED` or `VERDICT: CHANGES_REQUESTED`, is still read exactly as before —
@@ -679,6 +683,59 @@ which is what keeps a custom `prompts_dir` reviewer working, and what lets a run
 before this existed still `resume` against its frozen prompt. What a new prompt can change is
 the model's own judgment, and malformed output is a new way for a run to stop: neither is a
 change to the orchestrator's rules.
+
+### Severity policy (opt-in)
+
+The default is unchanged: absent `settings.blocking_severities`, `[]`, or YAML `null`
+keeps the reviewer's explicit verdict. To opt in, configure a list:
+
+```yaml
+settings:
+  blocking_severities: [high, medium]
+```
+
+For a JSON review with findings, the orchestrator derives `CHANGES_REQUESTED` when **any
+finding has a severity in that list**, and `APPROVED` otherwise. The derived verdict
+controls the review/fix loop, summary, exit code and terminal commit message. Findings
+remain in the report even when they do not block. This applies to both linear runs and
+the combined integration review in fan-out; task scheduling is unchanged.
+
+- A review with **no findings** always keeps its explicit verdict, including
+  `CHANGES_REQUESTED`: there is no evidence to justify deriving an approval.
+- **Prose** always keeps its literal final `VERDICT:` line, regardless of policy.
+  It carries no structured findings to derive from.
+- The fixer still receives the reviewer's response unchanged, with no findings renderer.
+  When the policy is active, a separate orchestrator note accompanies the review in the
+  fixer prompt, naming the blocking severities and explaining these exceptions.
+
+The setting must be a YAML list: a bare `high`, an empty string, or an unknown name such
+as `critical` fails before any agent is called. Names are case-insensitive, surrounding
+whitespace is ignored, and duplicates are collapsed. `stargate doctor` shows the value
+and which config layer supplied it.
+
+A resume normally uses the run's frozen config. An explicit `--config` can tighten,
+loosen, or disable the policy. While the worktree fingerprint still matches, Stargate
+re-evaluates the saved `review-<n>.md` under that policy: saved findings can go straight
+to the fixer or become approved without paying for another review of the same tree.
+Re-evaluating an active or newly disabled policy needs a usable artifact; a missing or
+malformed one requires a fresh review. Be aware of what that re-reading implies: while a
+policy is active the artifact **outranks** the recorded verdict in both directions, so a
+hand-edited `review-<n>.md` claiming `APPROVED` with no findings can approve a run that
+recorded `CHANGES_REQUESTED`, with only the worktree fingerprint as a guard. Without a
+policy, V1's rule still holds — an artifact can confirm recorded changes but never create
+an approval. An active policy is recorded as
+`review.blocking_severities` in the checkpoint so later resumes can recognize its removal,
+including when it was enabled by an earlier resume. Runs that never used a policy keep
+V1's replay rules: an approval retries the commit without reading the artifact, and
+recorded changes reuse only an artifact that still requests changes.
+The existing review-loop budget still applies: if a saved pass falls outside a
+reduced budget, it is not replayed.
+
+**There is no behavior-neutral derived default.** A lenient list such as `[high, medium]`
+can approve a low-only `CHANGES_REQUESTED`; a strict list such as `[high, medium, low]`
+can block an `APPROVED` carrying findings. Activating either direction changes approval
+behavior. That is why the policy is off by default. The model still judges severity:
+**a misclassified severity can end a run before the fix.**
 
 ### Inheriting findings across runs
 
@@ -956,6 +1013,9 @@ instead of buying a second opinion on the same tree:
   marked resumable by `stargate list` even though it recorded a terminal
   verdict, and the commit error names `stargate resume <run-id>` as the cheap
   recovery.
+- A **policy changed by `--config`**, including disabling it, re-evaluates the saved
+  review against the effective policy. With an unchanged fingerprint, a recorded approval
+  can now go to the fixer and recorded changes can now approve, without another review.
 - **Anything that changed the worktree** since the verdict — a hand edit, a
   fixer that got partway through — invalidates the record, and the loop starts
   over with a real review. A verdict never covers a tree its reviewer did not
@@ -1158,10 +1218,9 @@ still open, roughly in order of how much it would change the tool:
 - **GitHub issue / PR as task input.**
 
 Structured review output shipped: see
-[Structured review findings](#structured-review-findings). Deriving the verdict from
-severities instead of taking the reviewer's own is a separate, unscheduled question, not
-unfinished work — no default for it preserves current behavior, in either direction, so it
-needs evidence from real reviews rather than a choice of default.
+[Structured review findings](#structured-review-findings). Severity policy also shipped
+as an [opt-in setting](#severity-policy-opt-in), off by default: no derived default
+preserves current approval behavior in both directions.
 
 ## License
 

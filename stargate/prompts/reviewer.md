@@ -52,8 +52,9 @@ after it, no code fence:
 
 Rules:
 - `verdict` is required and must be exactly "APPROVED" or "CHANGES_REQUESTED". It is
-  your decision: the orchestrator acts on it as given and does not derive it from the
-  severities below.
+  your decision, and by default the orchestrator acts on it as given. An operator can
+  opt into deriving the verdict from severities (`settings.blocking_severities`), so
+  classify severity honestly by the rubric below either way.
 - `findings` is a list, and may be empty. Order it by severity, most severe first.
 - Every finding needs a `severity` of "high", "medium" or "low", and a non-empty
   `finding` stating what is wrong. Add `file`, `line` and `why` whenever you can.

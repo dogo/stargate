@@ -310,6 +310,31 @@ def value_source(
 # or merged. The documented behaviour it changes is narrow -- `git status` in
 # the worktree goes clean, while `git diff <base>` still shows every change.
 # `commit: false` restores the old behaviour exactly.
+SEVERITIES = ("high", "medium", "low")
+
+
+def blocking_severities(config: dict[str, Any]) -> tuple[str, ...]:
+    """Validate the opt-in policy; only an empty policy preserves reviewer authority."""
+    value = config.get("settings", {}).get("blocking_severities")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise StargateError(
+            "settings.blocking_severities must be a list of severity names "
+            f"({', '.join(SEVERITIES)}), e.g. [high, medium]; got {value!r}."
+        )
+    names = []
+    for item in value:
+        name = item.strip().lower() if isinstance(item, str) else item
+        if name not in SEVERITIES:
+            raise StargateError(
+                "settings.blocking_severities contains an unknown severity "
+                f"{item!r}; valid names are {', '.join(SEVERITIES)}."
+            )
+        names.append(name)
+    return tuple(dict.fromkeys(names))
+
+
 def commit_enabled(config: dict[str, Any]) -> bool:
     value = config.get("settings", {}).get("commit", True)
     if not isinstance(value, bool):

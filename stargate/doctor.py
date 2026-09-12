@@ -23,6 +23,7 @@ from .config import (
     agent_command,
     agent_entry,
     agent_env,
+    blocking_severities,
     commit_enabled,
     env_summary,
     expand_test_command,
@@ -261,9 +262,18 @@ def doctor(
             f"{script_dir / 'agents.yaml'}."
         )
 
+    try:
+        blocking_severities(config)
+    except StargateError as exc:
+        # Reporting a value that `run` will refuse would make doctor the wrong
+        # place to find out, which is the one thing it exists for.
+        print(f"\nERROR    {exc}")
+        ok = False
+
     print("\nEffective settings:")
     for key, default in (
         ("max_review_loops", 2),
+        ("blocking_severities", []),
         ("max_fanout_tasks", 8),
         ("max_parallel_tasks", 2),
         ("test_command", ""),
