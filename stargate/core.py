@@ -183,12 +183,21 @@ def run_process(
                 deadline = None if timeout is None else started + timeout
                 timed_out = False
                 while True:
+                    # Clamped to what is left of the deadline, not a fixed
+                    # heartbeat: waiting the full interval means a timeout
+                    # shorter than one heartbeat is not enforced until one has
+                    # passed, and a process that exits inside that window
+                    # breaks out before the deadline is ever consulted.
+                    remaining = (
+                        HEARTBEAT_SECONDS if deadline is None
+                        else max(0.0, min(HEARTBEAT_SECONDS, deadline - time.monotonic()))
+                    )
                     try:
-                        proc.wait(timeout=HEARTBEAT_SECONDS)
+                        proc.wait(timeout=remaining)
                         break
                     except subprocess.TimeoutExpired:
                         pass
-                    if deadline is not None and time.monotonic() > deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         _kill_process_group(proc)
                         proc.wait()
                         if timeout_is_error:
