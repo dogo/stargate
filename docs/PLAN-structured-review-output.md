@@ -38,7 +38,8 @@ Two things this plan deliberately does **not** claim:
   `medium` from `low` well. V1 produces structured observations; evaluating the policy also
   requires human review of selected findings and their context.
 
-This is the first open item in the README's `## Useful next additions`.
+This was the first open item in the README's `## Useful next additions`, a section removed
+once every item on it had shipped.
 
 ## The V1 contract
 

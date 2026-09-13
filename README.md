@@ -1385,22 +1385,6 @@ The important separation is:
 The agents' own CLI sandbox and permission settings remain the real enforcement
 boundary; prompts are guidance, not a security boundary.
 
-## Useful next additions
-
-Shipped since this list was written: fan-out DAG execution, token accounting,
-timeouts, retries,
-persistent run state, `list`, `resume`, catchable-signal handling, capability
-probes, empty-stage detection, and terminal commits on run branches.
-
-Task input from configured sources shipped: see
-[Read the task from a source](#read-the-task-from-a-source). Opt-in publication also
-shipped: see [Open a pull request](#open-a-pull-request).
-
-Structured review output shipped: see
-[Structured review findings](#structured-review-findings). Severity policy also shipped
-as an [opt-in setting](#severity-policy-opt-in), off by default: no derived default
-preserves current approval behavior in both directions.
-
 ## License
 
 MIT. See [LICENSE](LICENSE).
