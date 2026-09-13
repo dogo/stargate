@@ -130,7 +130,10 @@ What exists:
 
 What does **not** exist (do not assume; check before referencing):
 
-- **No CI.** There is no `.github/`; the suite only runs locally.
+- **Almost no CI.** The single workflow is `.github/workflows/release.yml`, triggered by a
+  version tag: it checks the tag against `pyproject.toml`, runs the suite, then publishes to
+  PyPI by trusted publishing (no token). Nothing runs on push or pull request, so day to day
+  the suite is still local only.
 - **Not on PyPI yet.** The distribution is named `stargate-cli` there (`stargate` belongs to
   DataStax); the command and the import package stay `stargate`. Installation is
   `pipx install .` or from Git.
