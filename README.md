@@ -116,18 +116,20 @@ can instead start from one of the verified configurations in
 ## Install (global)
 
 ```bash
-pipx install .                # or: uv tool install .
+pipx install stargate-cli     # or: uv tool install stargate-cli
 ```
 
+From this checkout, or straight from Git:
+
 ```bash
+pipx install .
 pipx install git+https://github.com/dogo/stargate.git
 ```
 
-Not published yet, so install from the repo or a copy of this directory. The
-distribution is named **`stargate-cli`** because `stargate` on PyPI belongs to
-DataStax; the command you run and the package you import are still `stargate`,
-and only `pipx uninstall` / `uv tool uninstall` need the longer name.
-Both prompts and the default
+The distribution is named **`stargate-cli`** because `stargate` on PyPI belongs to
+DataStax. Nothing else takes the longer name: the command you run is `stargate`,
+the package you import is `stargate`, and `pipx uninstall` / `uv tool uninstall`
+are the only places it reappears. Both prompts and the default
 config ship inside the package, so once installed the source directory can be
 deleted or moved. `make install` / `make install-uv` are the same commands;
 `make uninstall` removes it.

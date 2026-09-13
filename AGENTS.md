@@ -127,17 +127,17 @@ What exists:
 - `examples/`: Claude Code, Codex CLI and Kiro CLI, each verified with `--probe`, with the
   differences between them documented (who needs `{output}`, who reports usage, who needs a
   wrapper).
+- CI, in two workflows. `.github/workflows/ci.yml` runs ruff and the suite on every push to
+  `main` and every pull request, on Python 3.10 and 3.13. `.github/workflows/release.yml`
+  triggers on a version tag: it checks the tag against `pyproject.toml`, builds, and publishes
+  by trusted publishing (no token anywhere). Releasing does not re-run the tests -- CI already
+  did, on the commit being tagged.
+- **On PyPI as `stargate-cli`** since 1.0.0 (`stargate` belongs to DataStax). Only that name
+  is long: the command, the import package and `pipx install .` are unchanged, and `pipx
+  uninstall` is the one place the distribution name shows up.
 
 What does **not** exist (do not assume; check before referencing):
 
-- **CI, in two workflows.** `.github/workflows/ci.yml` runs ruff and the suite on every push
-  to `main` and every pull request, on Python 3.10 and 3.13.
-  `.github/workflows/release.yml` is triggered by a version tag: it checks the tag against
-  `pyproject.toml`, builds, and publishes to PyPI by trusted publishing (no token). Releasing
-  does not re-run the tests -- CI already did, on the commit being tagged.
-- **Not on PyPI yet.** The distribution is named `stargate-cli` there (`stargate` belongs to
-  DataStax); the command and the import package stay `stargate`. Installation is
-  `pipx install .` or from Git.
 - **No pytest.** The suite is its own runner in `test_stargate.py`; `pyproject.toml` has no
   `[tool.pytest]`, and pytest collection would break in this repository.
 - **No coverage, no type checker, no pre-commit.** `make lint` is ruff and nothing else.
