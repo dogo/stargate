@@ -219,6 +219,36 @@ def test_a_value_is_never_rescanned_for_another_placeholder(root: Path) -> None:
     assert render_prompt([prompts], "fixer", task="{nope}").count("{nope}") == 1
 
 
+def test_a_note_after_a_complete_json_review_does_not_discard_it(root: Path) -> None:
+    """Found in a real run, not imagined.
+
+    A reviewer finished the object and then appended a note about what it could
+    not verify in its sandbox. Rejecting that threw away a paid APPROVED review
+    and failed the run. The object must still start the response -- this is not
+    "find the JSON somewhere in the prose".
+    """
+    from stargate.core import StargateError
+    from stargate.stages import parse_review
+
+    review = _review_file(root, "review.json", "APPROVED", [LOW])
+    trailing = f"{review.read_text()}\n\nNote: I could not run the suite in this sandbox.\n"
+
+    verdict, findings, contract = parse_review(trailing)
+
+    assert (verdict, contract) == ("APPROVED", "json"), (verdict, contract)
+    assert findings[0]["severity"] == "low", findings
+
+    for rejected in (
+        f"Here is my review:\n{review.read_text()}",   # prose first is still prose
+        '{"verdict": "APPROVED", "findings": [',        # truncated is still truncated
+    ):
+        try:
+            parse_review(rejected)
+        except StargateError:
+            continue
+        raise AssertionError(f"should not have parsed: {rejected[:40]}")
+
+
 def test_a_prose_reviewer_still_reaches_both_verdicts(root: Path) -> None:
     """The prose contract is what keeps runs created before this change alive.
 

@@ -102,7 +102,7 @@ duplicate it here). Verified single-vendor configurations: [`examples/`](example
 
 ## Repository state
 
-**Both modes are implemented and covered.** 214 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 215 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 

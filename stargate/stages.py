@@ -737,7 +737,12 @@ def parse_review(raw: str) -> tuple[str, list[dict[str, Any]], str]:
     data: Any = None
     if text.startswith("{"):
         try:
-            data = json.loads(text)
+            # raw_decode, not loads: a real reviewer completed the object and
+            # then appended a note about what it could not verify, and throwing
+            # away a finished, paid review over trailing prose costs a rerun.
+            # Still not "find JSON in prose" -- the object must start the
+            # response, and anything after it is discarded.
+            data, _ = json.JSONDecoder().raw_decode(text)
         except json.JSONDecodeError:
             data = None
     if isinstance(data, dict):
