@@ -321,7 +321,7 @@ answer. What it does support: nothing here argues for changing the default away 
 
 ---
 
-## V3, unscheduled: the contract has nowhere to say "I could not verify this"
+## V3, shipped: the contract had nowhere to say "I could not verify this"
 
 Observed across three real reviews on 2026-09-12, by `claude -p --model opus`, while the
 reviewer's sandbox denied it permission to run `make test`:
@@ -349,17 +349,30 @@ is not a defect in the code, it would be inherited as debt by a later run under 
 inheritance, and it would be counted as a finding by any severity policy. Prose outside the
 object breaks the contract outright.
 
-Questions a design would have to answer, none of them settled:
+**Decided and shipped** in `8a9dfba` (PR #1, 2026-09-13): the prompt names the place, the
+parser does not change.
 
-- Does the field belong at the top level (one statement about the whole review) or per finding
-  (this specific claim is unverified)? The three samples are all whole-review statements.
-- Does it affect anything, or is it report-only like `severity` is today? A reviewer that could
-  not run the tests has arguably not met the packaged prompt's own bar, and a run might want to
-  know that before publishing — which is the same "does data become policy" argument V2 has,
-  and should not be answered by the same stroke.
-- Is the real fix in the prompt rather than the schema? The instruction currently implies the
-  reviewer should run the suite; softening it to "say so in this field if you could not" would
-  change the improvisation into a contract without changing the parser.
+- **Top level, not per finding.** All three samples are statements about the whole review.
+- **Report-only.** A reviewer that could not run the tests has arguably not met the packaged
+  prompt's own bar, but making that block is the same "does data become policy" question V2
+  carries, and it must not be answered by the same stroke.
+- **The prompt, not the schema.** `_parse_json_review` reads `verdict` and `findings` and
+  ignores every other top-level key, so naming `unverified` in `reviewer.md` cost no Python:
+  no parser branch, no `RunContext` field, no `state.json` key, no summary row, no setting.
+  The caveat lives in the `review-N.md` artifact, which is where a review is read, and
+  reaches the fixer inside the original response.
+
+Deliberately left out: `unverified` does **not** reach `summary.md` or `state.json`. Carrying
+it there is an addition, not a rewrite — worth doing when someone reads the summary and misses
+a caveat, which is also the point at which a reader is known to exist.
+
+First observation, from the run that made the change. Its reviewer ran under the **frozen old
+prompt**, which does not mention the key; it read the diff introducing it and used it,
+reporting that the sandbox denied it a `python -c` check while the configured test command
+itself had run and passed. Verdict `APPROVED`, `findings: []` — the caveat stayed out of the
+findings and inside the object. One sample, and one where the field was unusually salient
+because it was the subject of the diff; it is not evidence that an unprimed reviewer reaches
+for it.
 
 Evidence note: the artifacts for the first two rows were on disk when this was written; the
 third was overwritten when the run was resumed and the review re-bought, so its only durable
