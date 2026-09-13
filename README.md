@@ -85,8 +85,9 @@ and the merged tree goes through review once as a whole.
   RESULT and stays resumable, without an integration commit yet.)
 - **Your branch is untouchable.** The orchestrator never merges into, rebases,
   pushes, or deletes the branch checked out in your repository, and never
-  removes a worktree mid-run. The agents themselves are forbidden to commit —
-  the orchestrator is the only thing that does.
+  removes a worktree mid-run. Publishing requires `--pr` in that invocation and
+  only pushes the run's own branch. The agents are forbidden to commit or push;
+  the orchestrator performs those actions.
 - **The budget is yours.** Token budget per task and per run, timeouts, retries
   with backoff, and `--max-review-loops`. Exit codes tell you which wall you hit.
 
@@ -207,6 +208,7 @@ Per-agent keys live on the agent entry, not here: `command`, `probe`,
 | `3` | Approved, but the explicit test command or an `auto`-detected command failed. |
 | `4` | `max_task_tokens` was reached; the run stopped between phases. A linear stop goes through the normal RESULT/summary/commit path. A fan-out stop before integration also prints a RESULT block and writes `summary.md`, but records resumable task state without an integration terminal commit. |
 | `5` | The run reached a verdict, but Git could not create its commit. The work remains intact and staged where possible; the error prints a manual recovery command. |
+| `6` | The run reached an APPROVED result, but publishing was refused or failed. The verdict, commit and summary are intact; the message prints the manual command. |
 | `129` | The run received SIGHUP. Its state is recorded as failed and `resume` is offered. |
 | `130` | The run was interrupted with Ctrl-C/SIGINT. Its state is recorded as failed and `resume` is offered. |
 | `143` | The run received SIGTERM. Its state is recorded as failed and `resume` is offered. |
@@ -388,6 +390,97 @@ The exact fetched task and its separate `task_source` URL are frozen in
 `state.json` for audit; `summary.md` records `Task source:` too. `resume` reuses
 the recorded text and never re-fetches, even if the source is now unreachable.
 
+## Open a pull request
+
+```bash
+stargate run --pr "Add the requested feature"
+stargate run --pr --from https://tracker.example/team/project/items/42
+stargate resume <run-id> --pr
+```
+
+The top-level `pull_request:` block says **how** to publish. Only `--pr` says
+**whether** to publish, for that invocation:
+
+```yaml
+pull_request:
+  command: [review-cli, create, --head, "{branch}", --title, "{title}", --body-file, "-"]
+  env:
+    REVIEW_PROFILE: work
+    REVIEW_TOKEN: null          # remove an inherited variable
+```
+
+`review-cli` is an example: supply your installed CLI or wrapper. The command
+must be a non-empty argument list containing `{branch}`. `{title}` is the task's
+first non-empty line with whitespace collapsed, whether typed or fetched, falling
+back to `stargate run` if none exists. Stargate never parses source text for title
+fields and never uses the architect's branch name as the title.
+Placeholders are substituted once within each argument, without shell expansion.
+Embedding `{title}` in a `/bin/sh -c` script turns task text into shell code,
+including text supplied by whoever filed a `--from` tracker item. Pass placeholders
+as positional arguments and quote their expansions inside the script:
+
+```yaml
+pull_request:
+  command:
+    - /bin/sh
+    - -c
+    - 'exec review-cli create --head "$1" --title "$2" --body-file -'
+    - _
+    - "{branch}"
+    - "{title}"
+```
+
+The command runs in the original repository with the PR body on **stdin**.
+`env:` overrides or removes inherited variables just as it does for agents.
+`doctor` validates the block and checks the command's executable without running it.
+
+**Stargate pushes; the configured command only opens the PR.** Stargate chooses
+`origin`, otherwise the sole remote; multiple remotes without `origin` are
+refused. It requires one push destination and checks that destination (including
+`pushurl`) before pushing. No remote, an unqueryable remote, or a branch already
+there causes a refusal **before attempting a push**. The push creates only the
+run's `stargate/*` branch, with an empty-ref lease that also prevents overwriting
+one created after the check. It never force-updates an existing branch, pushes
+other branches or tags, or changes remote configuration. Git credential prompts
+are disabled and publication commands have a 300-second timeout.
+
+The echoed command shows the remote's name rather than its URL, so a credential
+embedded in that URL does not appear in the terminal. Git's own output is written
+to `pull-request-remote.log` and `pull-request-push.log` verbatim, though, so a
+URL that carries a token can still reach those files if Git repeats it in an
+error. Use a credential helper rather than a token in the remote URL — a URL with
+a credential is also visible to anything that can read the process list, which no
+amount of redaction here changes.
+
+**Only `APPROVED` with no failing test command and a successful commit can
+publish.** `CHANGES_REQUESTED`, `BUDGET_EXCEEDED`, failed tests, or a failed commit
+publish nothing. Stargate prints the branch and worktree location plus the exact
+manual push and PR commands, leaving that decision to the operator. Their normal
+exit codes are unchanged. An approved run whose publication fails exits `6`; its
+verdict, commit and summary remain intact. If the push succeeded but the PR command
+failed, the branch stays on the remote and the message gives the command to retry.
+
+With `--pr`, `.stargate/runs/<run-id>/pull-request.md` holds the body: verdict,
+findings table, test command and exit code (or why tests did not run), task text,
+and the source URL when present. It is also the input file for the printed manual
+command. A run without `--pr` creates no publication artifacts and publishes
+nothing, even when the block is configured. This works with `--fan-out` too;
+only the reviewed integration branch is published.
+
+**Resume requires `--pr` again.** Publish intent is never written to `state.json`.
+Resuming a finished run with `stargate resume <run-id> --pr` re-runs the review at
+token cost and may replace the recorded verdict in `state.json` and `summary.md`.
+If the fresh result is unapproved, nothing is published.
+
+A resumed run uses its frozen config unless `--config` overrides it, and validates
+that actual config before any agent runs. `--pr` without `pull_request.command`,
+with `settings.commit: false`, or with `--no-commit` is rejected before new run
+artifacts or agent calls. Malformed publication blocks are also rejected early.
+
+There is no setting that publishes automatically, by design: **standing config
+must not become standing authorization.** Stargate never publishes on its own —
+it publishes when a person says so, in that invocation.
+
 ## Fan-out
 
 Use `--fan-out` when one request contains work that can be split across
@@ -414,7 +507,8 @@ combined tree.
 
 Fan-out requires `commit: true`: commits are the protocol that moves work
 between isolated worktrees, even though nothing is merged into the user's
-original branch or pushed. `--no-commit` is rejected before a new run is
+original branch. Publishing the integration branch requires `--pr` in that
+invocation. `--no-commit` is rejected before a new run is
 created. `resume` restores fan-out mode from `state.json`; it reuses the frozen
 config and prompts, `tasks.json`, task branches/worktrees and every completed
 task commit, plus the integration branch/worktree if they were already created.
@@ -1275,8 +1369,10 @@ The important separation is:
 - At a terminal result, the orchestrator creates a local commit on the run's
   own branch using the repository's identity, signing configuration and hooks.
 - A fan-out run merges task branches only into its own integration branch. The
-  orchestrator never merges into the user's original branch, rebases, pushes,
-  deletes worktrees during a run, modifies remotes, or touches the
+  orchestrator never pushes anything unless `--pr` is given in that invocation,
+  and then only the run's own `stargate/*` branch, never force-updating or
+  overwriting an existing remote branch. It never merges into the user's original
+  branch, rebases, deletes worktrees during a run, modifies remotes, or touches the
   branch/index/worktree in the user's original checkout.
 - The final branch/worktree and its traceable commit are left for human
   inspection.
@@ -1292,8 +1388,8 @@ persistent run state, `list`, `resume`, catchable-signal handling, capability
 probes, empty-stage detection, and terminal commits on run branches.
 
 Task input from configured sources shipped: see
-[Read the task from a source](#read-the-task-from-a-source). Opening pull requests
-remains a separate, unimplemented delivery.
+[Read the task from a source](#read-the-task-from-a-source). Opt-in publication also
+shipped: see [Open a pull request](#open-a-pull-request).
 
 Structured review output shipped: see
 [Structured review findings](#structured-review-findings). Severity policy also shipped

@@ -18,6 +18,7 @@ from .config import (
     prompt_dirs,
     render_prompt,
     token_cap,
+    validate_publication_request,
 )
 from .core import (
     RunContext,
@@ -29,6 +30,13 @@ from .core import (
     split_plan_name,
 )
 from .detect import detection_mode, selected_test_command
+from .publish import (
+    PUBLISH_FAILED,
+    open_pull_request,
+    publication_command,
+    push_branch,
+    select_remote,
+)
 from .run import (
     budget_spent,
     complete_stage,
@@ -187,6 +195,7 @@ def finish(
     test_exit: int | None,
     *,
     commit: bool,
+    publish: bool = False,
 ) -> int:
     if commit:
         needs_terminal_commit = False
@@ -228,6 +237,10 @@ def finish(
     write_summary(ctx, task, verdict, test_exit, commit)
     save_state(ctx, verdict.lower())
 
+    pushed, published, publish_exit = (
+        _publish(ctx, verdict, test_exit, commit_outcome) if publish else ("", "", None)
+    )
+
     print("\n=== RESULT ===")
     print(f"Verdict:   {verdict}")
     print(f"Branch:    {ctx.branch}")
@@ -236,31 +249,47 @@ def finish(
     if ctx.mode == "fanout":
         print("Review/fix: integration worktree only")
     print(f"Artifacts: {ctx.artifacts}")
+    if published.strip():
+        print(f"Pull request: {published.strip()}")
     if ctx.tokens_used:
         cap = token_cap(ctx.config)
         print(f"Tokens:    {ctx.tokens_used:,}" + (f" of {cap:,}" if cap else " (no cap)"))
-    if ctx.commit:
-        if ctx.mode == "fanout":
+    if ctx.mode == "fanout":
+        if ctx.commit:
             print(
                 "\nFinal review and fixer passes ran only on the Stargate "
                 "integration branch; fixer edits were not copied back to task "
                 "branches.\nTask branches were merged only into the Stargate "
-                "integration branch.\nNothing was merged into your original "
-                "branch, pushed, "
-                "or deleted automatically."
+                "integration branch.\n",
+                end="",
             )
         else:
-            print("\nNothing was merged, pushed, or deleted automatically.")
-    elif ctx.mode == "fanout":
-        task_commits = _fanout_task_commit_count(ctx)
-        noun = "commit" if task_commits == 1 else "commits"
-        verb = "remains" if task_commits == 1 else "remain"
+            task_commits = _fanout_task_commit_count(ctx)
+            noun = "commit" if task_commits == 1 else "commits"
+            verb = "remains" if task_commits == 1 else "remain"
+            print(
+                "\nNo integration terminal commit was created; "
+                f"{task_commits} completed task {noun} {verb} on the task branches.\n",
+                end="",
+            )
+    elif publish and not ctx.commit:
+        print("\nNothing was committed.")
+    if pushed:
         print(
-            "\nNo integration terminal commit was created; "
-            f"{task_commits} completed task {noun} {verb} on the task branches.\n"
+            f"\nThe run's branch was pushed to {pushed}; nothing was merged into "
+            "your original branch or deleted automatically."
+        )
+    elif publish:
+        # A failed or interrupted push may have reached the remote before its
+        # acknowledgement was lost; do not claim that nothing was pushed.
+        print("\nNothing was merged into your original branch or deleted automatically.")
+    elif ctx.mode == "fanout":
+        print(
             "Nothing was merged into your original branch, pushed, or deleted "
             "automatically."
         )
+    elif ctx.commit:
+        print("\nNothing was merged, pushed, or deleted automatically.")
     else:
         print("\nNothing was committed, merged, pushed, or deleted automatically.")
     print(
@@ -277,6 +306,8 @@ def finish(
             f"{shlex.quote(ctx.branch)} \"<next task>\""
         )
 
+    if publish_exit is not None:
+        return publish_exit
     if commit_outcome == "failed":
         return 5
     if verdict == "BUDGET_EXCEEDED":
@@ -286,6 +317,97 @@ def finish(
     if test_exit not in (None, 0):
         return 3
     return 0
+
+
+def pull_request_body(ctx: RunContext, verdict: str, test_exit: int | None) -> str:
+    if ctx.test_command:
+        result = f"exit {test_exit}" if test_exit is not None else "not run"
+        tests = f"{ctx.test_command} ({result})"
+    else:
+        tests = "not run (report-only detection)" if "report-only" in ctx.test_source else (
+            "not configured"
+        )
+    source = f"- **Task source:** {ctx.task_source}\n" if ctx.task_source else ""
+    findings = "\n".join(findings_table(ctx.findings)) if ctx.findings else (
+        "The reviewer reported no findings."
+    )
+    # A bullet per field: single newlines would render as one run-on
+    # paragraph, and the body is the surface the findings are read on.
+    return f"""- **Verdict:** {verdict}
+- **Run:** {ctx.run_id}
+- **Branch:** {ctx.branch}
+- **Base:** {ctx.base_ref} @ {ctx.base_commit[:12]}
+- **Commit:** {ctx.commit or 'none'}
+{source}- **Tests:** {tests}
+
+## task
+{ctx.task}
+
+## findings
+{findings}
+
+Produced by stargate agents; publication requested by the operator.
+Traces: .stargate/runs/{ctx.run_id}/
+"""
+
+
+def _publish(
+    ctx: RunContext, verdict: str, test_exit: int | None, commit_outcome: str,
+) -> tuple[str, str, int | None]:
+    """Publication failure must leave the terminal verdict and commit intact."""
+    print("\n=== PULL REQUEST ===")
+    # D20: use task text, never the architect's NAME or parsed source fields.
+    first_line = next((line for line in ctx.task.splitlines() if line.strip()), "")
+    title = " ".join(first_line.split()) or "stargate run"
+    cmd: list[str] = []
+    body_path = ctx.artifacts / "pull-request.md"
+    remote, pushed = "<remote>", ""
+    reason = (
+        verdict if verdict != "APPROVED" else
+        f"the test command failed (exit {test_exit})" if test_exit not in (None, 0) else
+        "the commit failed" if commit_outcome == "failed" else
+        "nothing was committed" if not ctx.commit else ""
+    )
+    publish_exit = None
+    try:
+        body = pull_request_body(ctx, verdict, test_exit)
+        body_path.write_text(body)
+        cmd = publication_command(ctx.config, ctx.branch, title)
+        if reason:
+            print(
+                f"Not published: {reason}. "
+                "Publishing requires an APPROVED result and passing tests."
+            )
+            try:
+                remote = select_remote(ctx.repo)
+            except StargateError:
+                pass  # The manual instructions can leave remote selection to the operator.
+        else:
+            remote = select_remote(ctx.repo)
+            push_branch(ctx.repo, remote, ctx.branch, ctx.artifacts)
+            pushed = remote
+            output = open_pull_request(ctx.config, ctx.repo, cmd, body)
+            return pushed, output.strip() or "Opened successfully.", None
+    except (StargateError, OSError, ValueError, KeyboardInterrupt) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if pushed:
+            print(
+                f"The branch is already on {pushed}; it has not been rolled back.", file=sys.stderr,
+            )
+        publish_exit = (
+            128 + int(getattr(exc, "signum", 2)) if isinstance(exc, KeyboardInterrupt)
+            else PUBLISH_FAILED if not reason else None
+        )
+    print(f"The work is on branch {ctx.branch} in {ctx.worktree}.")
+    if not cmd:
+        print(f"No PR command could be prepared; see the error above. PR body path: {body_path}")
+        return pushed, "", publish_exit
+    print("To publish it yourself:")
+    print(f"  cd {shlex.quote(str(ctx.repo))}")
+    if not pushed:
+        print(f"  git push {shlex.quote(remote)} {shlex.quote(ctx.branch)}")
+    print(f"  {shlex.join(cmd)} < {shlex.quote(str(body_path))}")
+    return pushed, "", publish_exit
 
 
 def write_summary(
@@ -340,28 +462,7 @@ Tokens reported: {tokens}
 {diff_stat or "(no tracked diff)"}
 """
     if ctx.findings:
-        lines = [
-            "\n## findings\n",
-            "| severity | where | finding |",
-            "|---|---|---|",
-        ]
-        for entry in _by_severity(ctx.findings):
-            if not isinstance(entry, dict):
-                # Only reachable from hand-edited or externally written state.
-                # Showing it beats raising while writing the terminal report.
-                lines.append(f"| ? | - | {_summary_cell(entry)} |")
-                continue
-            where = str(entry.get("file") or "-")
-            if entry.get("line") is not None:
-                where += f":{entry['line']}"
-            detail = str(entry.get("finding", ""))
-            if entry.get("why"):
-                detail += f" (why: {entry['why']})"
-            lines.append(
-                f"| {_summary_cell(entry.get('severity', '?'))} | "
-                f"{_summary_cell(where)} | {_summary_cell(detail)} |"
-            )
-        summary += "\n".join(lines) + "\n"
+        summary += "\n## findings\n\n" + "\n".join(findings_table(ctx.findings)) + "\n"
     if ctx.mode == "fanout":
         saved_records = ctx.fanout.get("tasks", {})
         records = saved_records if isinstance(saved_records, dict) else {}
@@ -393,6 +494,27 @@ Tokens reported: {tokens}
             )
         summary += "\n".join(lines) + "\n"
     (ctx.artifacts / "summary.md").write_text(summary)
+
+
+def findings_table(findings: list[Any]) -> list[str]:
+    lines = ["| severity | where | finding |", "|---|---|---|"]
+    for entry in _by_severity(findings):
+        if not isinstance(entry, dict):
+            # Only reachable from hand-edited or externally written state.
+            # Showing it beats raising while writing the terminal report.
+            lines.append(f"| ? | - | {_summary_cell(entry)} |")
+            continue
+        where = str(entry.get("file") or "-")
+        if entry.get("line") is not None:
+            where += f":{entry['line']}"
+        detail = str(entry.get("finding", ""))
+        if entry.get("why"):
+            detail += f" (why: {entry['why']})"
+        lines.append(
+            f"| {_summary_cell(entry.get('severity', '?'))} | "
+            f"{_summary_cell(where)} | {_summary_cell(detail)} |"
+        )
+    return lines
 
 
 def _fanout_task_commit_count(ctx: RunContext) -> int:
@@ -546,6 +668,8 @@ def orchestrate(args: argparse.Namespace, script_dir: Path, config: dict[str, An
     if resuming:
         ctx = _resume_context(repo, args, config)
         fanout = ctx.mode == "fanout"
+    effective_config = ctx.config if ctx is not None else config
+    validate_publication_request(effective_config, requested=getattr(args, "pr", False))
     if fanout:
         from .fanout import orchestrate_fanout
 
@@ -612,6 +736,7 @@ def run_stages(
     *,
     commit: bool,
 ) -> int:
+    publish = getattr(args, "pr", False)
     plan_path = ctx.artifacts / "plan.md"
     architect_ran = False
 
@@ -660,7 +785,7 @@ def run_stages(
     complete_stage(ctx, "worktree")
 
     if budget_spent(ctx, "the developer"):
-        return finish(ctx, ctx.task, "BUDGET_EXCEEDED", None, commit=commit)
+        return finish(ctx, ctx.task, "BUDGET_EXCEEDED", None, commit=commit, publish=publish)
 
     # 3. Developer implements.
     if "developer" in ctx.done:
@@ -859,6 +984,7 @@ def review_and_finish(
 ) -> int:
     """Run the shared review/fix tail for a linear or integrated worktree."""
 
+    publish = getattr(args, "pr", False)
     # 4. Review/fix loop.
     configured_loops = int(
         ctx.config.get("settings", {}).get("max_review_loops", 2)
@@ -903,7 +1029,7 @@ def review_and_finish(
                 _record_review(ctx, recorded_attempt, "APPROVED")
             print(f"\n=== REVIEW {recorded_attempt} (skipped, already APPROVED) ===")
             complete_stage(ctx, "review")
-            return finish(ctx, task, "APPROVED", test_exit, commit=commit)
+            return finish(ctx, task, "APPROVED", test_exit, commit=commit, publish=publish)
         if replayed is not None and (policy_applies or replayed[0] == "CHANGES_REQUESTED"):
             pending = replayed[1]
             start = recorded_attempt - 1
@@ -919,7 +1045,7 @@ def review_and_finish(
         else:
             if budget_spent(ctx, f"review {attempt + 1}"):
                 return finish(
-                    ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit
+                    ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit, publish=publish
                 )
             review_prompt = render_prompt(
                 prompts,
@@ -977,7 +1103,7 @@ def review_and_finish(
             )
         if budget_spent(ctx, f"fixer {attempt + 1}"):
             return finish(
-                ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit
+                ctx, task, "BUDGET_EXCEEDED", test_exit, commit=commit, publish=publish
             )
 
         before = worktree_fingerprint(ctx)
@@ -1002,4 +1128,4 @@ def review_and_finish(
         test_exit, test_report = run_tests(ctx, f"fix-{attempt + 1}")
 
     complete_stage(ctx, "review")
-    return finish(ctx, task, verdict, test_exit, commit=commit)
+    return finish(ctx, task, verdict, test_exit, commit=commit, publish=publish)

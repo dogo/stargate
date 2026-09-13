@@ -51,6 +51,7 @@ def write_config(
     commit: bool | str | None = None,
     reviewer_args: tuple[str, ...] = (),
     task_sources: list | None = None,
+    pull_request: dict | None = None,
 ) -> None:
     import yaml
 
@@ -84,6 +85,8 @@ def write_config(
         cfg["settings"]["commit"] = commit
     if task_sources is not None:
         cfg["task_sources"] = task_sources
+    if pull_request is not None:
+        cfg["pull_request"] = pull_request
     path.write_text(yaml.safe_dump(cfg))
 
 

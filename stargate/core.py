@@ -151,11 +151,14 @@ def run_process(
     env: dict[str, str] | None = None,
     timeout_is_error: bool = True,
     output_label: str | None = None,
+    display_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if termination_requested():
         raise StargateError("Orchestrator is terminating.")
     prefix = f"[{output_label}] " if output_label else ""
-    print_output(f"\n{prefix}$ {shlex.join(args)}")
+    # Callers may hide credentials in diagnostics without changing execution.
+    command = shlex.join(args if display_args is None else display_args)
+    print_output(f"\n{prefix}$ {command}")
     if log_path is not None:
         # Straight to disk, so a silent multi-minute agent can be tailed live
         # instead of surfacing only once the process exits.
@@ -191,7 +194,7 @@ def run_process(
                         if timeout_is_error:
                             raise StargateError(
                                 f"Command timed out after {timeout}s "
-                                f"(partial trace in {log_path}): {shlex.join(args)}"
+                                f"(partial trace in {log_path}): {command}"
                             )
                         timed_out = True
                         break
@@ -222,13 +225,13 @@ def run_process(
                     with _ACTIVE_PROCESS_LOCK:
                         _ACTIVE_PROCESSES.discard(proc)
         if proc is None:  # pragma: no cover - Popen either returns or raises
-            raise StargateError(f"Could not start command: {shlex.join(args)}")
+            raise StargateError(f"Could not start command: {command}")
         output = log_path.read_text() if log_path.exists() else ""
         returncode = 124 if timed_out else proc.returncode
         if check and returncode != 0:
             raise StargateError(
                 f"Command failed with exit code {returncode} "
-                f"(trace in {log_path}): {shlex.join(args)}"
+                f"(trace in {log_path}): {command}"
             )
         return subprocess.CompletedProcess(args, returncode, output, None)
     try:
@@ -244,13 +247,13 @@ def run_process(
         )
     except subprocess.TimeoutExpired as exc:
         raise StargateError(
-            f"Command timed out after {timeout}s: {shlex.join(args)}"
+            f"Command timed out after {timeout}s: {command}"
         ) from exc
     if capture and proc.stdout:
         print_output(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
     if check and proc.returncode != 0:
         raise StargateError(
-            f"Command failed with exit code {proc.returncode}: {shlex.join(args)}"
+            f"Command failed with exit code {proc.returncode}: {command}"
         )
     return proc
 

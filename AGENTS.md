@@ -90,25 +90,30 @@ Two execution modes:
   through the reviewer/fixer loop as one combined tree. Requires `settings.commit: true`.
 
 **The invariants that are not up for negotiation.** The orchestrator never merges, rebases,
-pushes to or deletes the branch the user has checked out; it only creates local `stargate/*`
-branches and worktrees outside the repository. The **agents** remain forbidden to commit —
-the orchestrator is what commits. Every run with changes that reaches a terminal result
+pushes to or deletes the branch the user has checked out; it creates local `stargate/*`
+branches and worktrees outside the repository. **stargate never publishes on its own — it publishes when a person says so, in that invocation.**
+`--pr` on that one command line pushes the run's own `stargate/*` branch and runs the
+configured `pull_request.command`, and only when the verdict is `APPROVED` and tests have
+not failed. The `pull_request:` block says *how* to publish and authorizes nothing; no setting
+makes publishing automatic, and `resume` requires `--pr` again. The **agents** remain forbidden
+to commit or push — the orchestrator is what commits, and what pushes when asked.
+Every run with changes that reaches a terminal result
 leaves a commit on its own branch, including when the verdict is `CHANGES_REQUESTED`, when
 the test command failed, or when the token budget stopped it; the verdict goes into the
 commit message.
 
-Full user documentation: [`README.md`](README.md) (1305 lines — it is the reference, do not
+Full user documentation: [`README.md`](README.md) (1401 lines — it is the reference, do not
 duplicate it here). Verified single-vendor configurations: [`examples/`](examples/).
 
 ## Repository state
 
-**Both modes are implemented and covered.** 215 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 237 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 
 What exists:
 
-- `stargate/`: 11 modules, ~5,000 lines. The only runtime dependency is **PyYAML**; `ruff`
+- `stargate/`: 12 modules, ~5,000 lines. The only runtime dependency is **PyYAML**; `ruff`
   is the only dev dependency. No agent framework, no SDK.
 - The linear mode, complete: layered config, test-command detection, token budget, retries
   with backoff, timeouts, heartbeat, config/prompt snapshots, terminal commit,
@@ -179,12 +184,12 @@ stargate clean <run-id>         # or --all
 
 Exit codes worth knowing when debugging a run: `0` approved, `2` the reviewer still requests
 changes or the arguments were invalid, `3` approved but the test command failed, `4` token
-budget, `5` a verdict was reached but Git could not commit, `130`/`143`/`129` signals. The
-full table is in the README.
+budget, `5` a verdict was reached but Git could not commit, `6` publication was refused or failed,
+`130`/`143`/`129` signals. The full table is in the README.
 
 ## Architecture overview
 
-One package, eleven modules, with no abstraction layer between them. Dependencies point
+One package, twelve modules, with no abstraction layer between them. Dependencies point
 downward; `core.py` imports nothing from the package.
 
 ```text
@@ -195,6 +200,7 @@ cli.py          argparse, signals, dispatch. Validates flag combinations BEFORE
        ├─ fanout.py  the fan-out workflow: DAG, concurrent scheduler, integration
        ├─ agent.py   invoking ONE agent: retries, backoff, token accounting,
        │             failure fingerprint (tells a repeated failure from a new one)
+       ├─ publish.py  opt-in push and configured pull-request command, after the terminal result
        ├─ commit.py  the terminal commit on the run's branch, and why it failed
        ├─ run.py     the run lifecycle: base ref, reserved id/branch, worktree,
        │             state.json, list/clean, worktree_fingerprint()

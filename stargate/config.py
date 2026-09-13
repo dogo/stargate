@@ -306,8 +306,8 @@ def value_source(
 # destroys it, because the artifacts hold traces and prose, not code. A flag
 # nobody knows exists does not fix that. Unlike a detected test command, this
 # executes nothing the user has not already sanctioned: the commit lands on a
-# branch stargate created, in a worktree stargate created, and is never pushed
-# or merged. The documented behaviour it changes is narrow -- `git status` in
+# branch stargate created, in a worktree stargate created, and is only pushed
+# with --pr in that invocation, never merged. The change is narrow -- `git status` in
 # the worktree goes clean, while `git diff <base>` still shows every change.
 # `commit: false` restores the old behaviour exactly.
 SEVERITIES = ("high", "medium", "low")
@@ -373,6 +373,46 @@ def task_sources(config: dict[str, Any]) -> list[dict[str, Any]]:
             raise StargateError(f"{label}.env must be a mapping of names to values.")
         sources.append({**entry, "hosts": [host.lower() for host in hosts], "commands": normalized})
     return sources
+
+
+def pull_request_command(config: dict[str, Any]) -> list[str] | None:
+    """Validate how to publish; configuration never authorizes publication."""
+    block = config.get("pull_request")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise StargateError("pull_request must be a mapping with a 'command'.")
+    command = block.get("command")
+    if not isinstance(command, list) or not command:
+        raise StargateError("pull_request.command must be a non-empty list of command arguments.")
+    if any(not isinstance(part, (str, int, float)) for part in command):
+        raise StargateError("pull_request.command arguments must be strings or numbers.")
+    argv = [str(part) for part in command]
+    if not argv[0].strip():
+        raise StargateError("pull_request.command[0] must name an executable.")
+    if not any("{branch}" in part for part in argv):
+        raise StargateError(
+            "pull_request.command must pass {branch} to the command; without it the pull "
+            "request would be opened from whatever branch is checked out."
+        )
+    if block.get("env") is not None and not isinstance(block["env"], dict):
+        raise StargateError("pull_request.env must be a mapping of names to values.")
+    return argv
+
+
+def validate_publication_request(config: dict[str, Any], *, requested: bool) -> None:
+    command = pull_request_command(config)
+    if requested:
+        if command is None:
+            raise StargateError(
+                "--pr needs a pull_request.command in your config; the config says how "
+                "to publish, the flag says whether. No agent was started."
+            )
+        if not commit_enabled(config):
+            raise StargateError(
+                "--pr requires settings.commit: true; without a commit there is "
+                "nothing to publish. No agent was started."
+            )
 
 
 def commit_enabled(config: dict[str, Any]) -> bool:

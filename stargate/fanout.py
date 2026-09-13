@@ -1127,6 +1127,7 @@ def orchestrate_fanout(
                 "BUDGET_EXCEEDED",
                 None,
                 commit=False,
+                publish=getattr(args, "pr", False),
             )
             print(
                 f"\nResume with a larger token budget: stargate resume {ctx.run_id}",

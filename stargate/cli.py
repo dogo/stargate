@@ -15,6 +15,7 @@ from .config import (
     init_prompts,
     load_config,
     resolve_config,
+    validate_publication_request,
 )
 from .core import StargateError, Terminated, repo_root, terminate_active_processes
 from .doctor import doctor
@@ -41,6 +42,8 @@ def _validate_run_arguments(parser: argparse.ArgumentParser, args: argparse.Name
         parser.error("a task description or --from URL is required")
     if args.fan_out and args.no_commit:
         parser.error("--no-commit cannot be combined with --fan-out")
+    if args.pr and args.no_commit:
+        parser.error("--pr cannot be combined with --no-commit")
     if not args.fan_out and args.max_parallel_tasks is not None:
         parser.error("--max-parallel-tasks requires --fan-out")
 
@@ -64,6 +67,8 @@ def _validate_resume_arguments(
     repo: Path,
 ) -> None:
     """Reject mode-specific resume flags when saved state identifies the mode."""
+    if args.pr and args.no_commit:
+        parser.error("--pr cannot be combined with --no-commit")
     mode = _saved_run_mode(repo, args.run_id)
     if mode == "fanout":
         if args.redo:
@@ -173,6 +178,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     for parser_ in (run, resume):
         parser_.add_argument(
+            "--pr", action="store_true",
+            help="After an APPROVED result, push the run's branch and open a pull "
+            "request with pull_request.command. Never implied by configuration; "
+            "resume requires it again. Resuming a finished run re-runs review at "
+            "token cost and may replace the recorded verdict.",
+        )
+        parser_.add_argument(
             "--max-review-loops",
             type=int,
             default=None,
@@ -256,9 +268,11 @@ def main() -> int:
                 raise StargateError(
                     "Fan-out requires settings.commit: true; no run was created."
                 )
-            if args.command == "run" and args.from_url is not None:
-                args.task = fetch_task(config, args.from_url, Path.cwd())
-                print(f"Task read from {args.from_url} ({len(args.task.splitlines())} lines)")
+            if args.command == "run":
+                validate_publication_request(config, requested=args.pr)
+                if args.from_url is not None:
+                    args.task = fetch_task(config, args.from_url, Path.cwd())
+                    print(f"Task read from {args.from_url} ({len(args.task.splitlines())} lines)")
             return orchestrate(args, script_dir, config)
         parser.error("Unknown command")
         return 2

@@ -29,6 +29,7 @@ from .config import (
     expand_test_command,
     find_prompt,
     prompt_dirs,
+    pull_request_command,
     task_sources,
     test_command_grant,
     token_cap,
@@ -239,12 +240,15 @@ def doctor(
     binaries = {"git"}
     try:
         sources = task_sources(config)
+        pr_command = pull_request_command(config)
     except StargateError as exc:
         # Returns instead of setting ok=False like blocking_severities does, and
         # the difference is position: this runs before the probe block, so
         # continuing would pay for real agent calls under a config `run` refuses.
         print(f"\nERROR    {exc}")
         return 1
+    if pr_command:
+        binaries.add(pr_command[0])
     for source in sources:
         for command in source["commands"]:
             binaries.add(command[0])
@@ -383,6 +387,13 @@ def doctor(
             print(f"    $ {shlex.join(command)}")
         if overrides := env_summary(source):
             print(f"    └─ env: {overrides}")
+
+    if pr_command:
+        print("\nPull request:")
+        print(f"  {shlex.join(pr_command)}")
+        if overrides := env_summary(config["pull_request"]):
+            print(f"    └─ env: {overrides}")
+        print("  Published only when you pass --pr; configuration alone never publishes.")
 
     print("\nPrompts:")
     dirs = prompt_dirs(config, script_dir)
