@@ -318,3 +318,49 @@ default, and every finding came from reviewing this project's own code, which is
 representative task mix. It is evidence that the question is worth asking rather than an
 answer. What it does support: nothing here argues for changing the default away from
 "the reviewer decides", and the strict direction looks actively worse.
+
+---
+
+## V3, unscheduled: the contract has nowhere to say "I could not verify this"
+
+Observed across three real reviews on 2026-09-12, by `claude -p --model opus`, while the
+reviewer's sandbox denied it permission to run `make test`:
+
+| run | pass | shape the caveat took |
+|---|---|---|
+| `20260912-110044-task-sources` | review-1 | a `low` finding: "I could not independently execute `make test` or `make lint` in this worktree" |
+| `20260912-190007-pull-requests` | review-1 | a `low` finding: "I could not verify the pasted test result" |
+| `20260912-190007-pull-requests` | review-2 | **prose appended after the closing brace**, which broke the contract |
+
+The third one cost real money: the object was complete and the verdict was `APPROVED`, but
+`json.loads` refused the trailing sentence, the parser fell through to the prose contract, the
+last line was not a `VERDICT:` line, and the run died. The paid review was discarded and had to
+be bought again. Commit `208223b` made the parser tolerate a complete object with trailing
+text, which stops the bleeding without addressing the cause.
+
+**The cause is that the schema has no field for what the reviewer could not check.** The
+packaged prompt tells it the test results "are a report, not evidence" and asks it to run the
+command itself when its tools allow — so a reviewer that *cannot* has been given an
+instruction it must report failing to follow, and no sanctioned place to report it. It
+improvises: twice inside `findings`, once outside the object.
+
+Neither improvisation is harmless. A caveat filed as a `low` finding pollutes the report — it
+is not a defect in the code, it would be inherited as debt by a later run under findings
+inheritance, and it would be counted as a finding by any severity policy. Prose outside the
+object breaks the contract outright.
+
+Questions a design would have to answer, none of them settled:
+
+- Does the field belong at the top level (one statement about the whole review) or per finding
+  (this specific claim is unverified)? The three samples are all whole-review statements.
+- Does it affect anything, or is it report-only like `severity` is today? A reviewer that could
+  not run the tests has arguably not met the packaged prompt's own bar, and a run might want to
+  know that before publishing — which is the same "does data become policy" argument V2 has,
+  and should not be answered by the same stroke.
+- Is the real fix in the prompt rather than the schema? The instruction currently implies the
+  reviewer should run the suite; softening it to "say so in this field if you could not" would
+  change the improvisation into a contract without changing the parser.
+
+Evidence note: the artifacts for the first two rows were on disk when this was written; the
+third was overwritten when the run was resumed and the review re-bought, so its only durable
+record is `208223b`'s commit message and this table.
