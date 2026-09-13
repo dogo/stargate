@@ -253,6 +253,11 @@ Details that bite, when changing things:
   of a globally exported `ANTHROPIC_API_KEY` without unsetting it for the others.
 - A Claude agent command **must not end in a variadic option** (`--disallowedTools` would
   swallow the prompt appended last). The packaged configs end in `--model` for this reason.
+- **The three `commit` requirements are not one requirement.** Fan-out and `--pr` read the
+  *setting* (`commit_enabled`) and refuse to start; findings inheritance reads a *previous
+  run's recorded commit* (`run.py`, `inherited_findings`) and silently inherits nothing. "This
+  run must commit" and "that run did commit" are different propositions, so unifying the three
+  into one named check would be wrong — it was proposed once and withdrawn for this reason.
 
 ## Testing patterns
 
