@@ -18,5 +18,5 @@ install-uv:
 	uv tool install --force .
 
 uninstall:
-	-pipx uninstall stargate
-	-uv tool uninstall stargate
+	-pipx uninstall stargate-cli
+	-uv tool uninstall stargate-cli

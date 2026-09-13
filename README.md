@@ -123,8 +123,11 @@ pipx install .                # or: uv tool install .
 pipx install git+https://github.com/dogo/stargate.git
 ```
 
-Not on PyPI (the name is taken by DataStax), so install from the repo or a copy
-of this directory. Both prompts and the default
+Not published yet, so install from the repo or a copy of this directory. The
+distribution is named **`stargate-cli`** because `stargate` on PyPI belongs to
+DataStax; the command you run and the package you import are still `stargate`,
+and only `pipx uninstall` / `uv tool uninstall` need the longer name.
+Both prompts and the default
 config ship inside the package, so once installed the source directory can be
 deleted or moved. `make install` / `make install-uv` are the same commands;
 `make uninstall` removes it.

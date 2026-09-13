@@ -3,8 +3,10 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stargate"
-version = "0.1.0"
+# PyPI distribution name only: "stargate" is taken by DataStax. The command
+# and the import package are still `stargate`.
+name = "stargate-cli"
+version = "1.0.0"
 description = "Tiny local orchestrator that lets heterogeneous coding-agent CLIs collaborate on one task."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +15,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "dogo", email = "diautilio@gmail.com" }]
 keywords = ["agents", "claude-code", "codex", "orchestrator", "git-worktree"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Console",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",

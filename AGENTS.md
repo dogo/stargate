@@ -131,8 +131,9 @@ What exists:
 What does **not** exist (do not assume; check before referencing):
 
 - **No CI.** There is no `.github/`; the suite only runs locally.
-- **Not on PyPI** (the name belongs to DataStax). Installation is `pipx install .` or from
-  Git.
+- **Not on PyPI yet.** The distribution is named `stargate-cli` there (`stargate` belongs to
+  DataStax); the command and the import package stay `stargate`. Installation is
+  `pipx install .` or from Git.
 - **No pytest.** The suite is its own runner in `test_stargate.py`; `pyproject.toml` has no
   `[tool.pytest]`, and pytest collection would break in this repository.
 - **No coverage, no type checker, no pre-commit.** `make lint` is ruff and nothing else.
