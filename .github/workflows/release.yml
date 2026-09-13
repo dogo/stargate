@@ -30,13 +30,6 @@ jobs:
             exit 1
           fi
 
-      # The tag is the only trigger and nothing else runs the suite in this
-      # repository, so a release that skipped it would publish unverified code.
-      - name: Test suite
-        run: |
-          python -m pip install -e .
-          python test_stargate.py
-
       - name: Build sdist and wheel
         run: python -m build
 

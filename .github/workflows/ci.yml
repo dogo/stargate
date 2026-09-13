@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+
+      - name: Ruff
+        run: ruff check .
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in pyproject and the current release. Every test
+        # shells out to git and to `python -m stargate`, so the suite takes
+        # minutes; the versions in between are not worth the wall clock.
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      # test_stargate.py is both the runner and part of the suite; there is no
+      # pytest here, and collection by pytest would break.
+      - name: Suite
+        run: python test_stargate.py
