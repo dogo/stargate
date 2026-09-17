@@ -107,14 +107,16 @@ duplicate it here). Verified single-vendor configurations: [`examples/`](example
 
 ## Repository state
 
-**Both modes are implemented and covered.** 245 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 257 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 
 What exists:
 
-- `stargate/`: 12 modules, ~5,000 lines. The only runtime dependency is **PyYAML**; `ruff`
+- `stargate/`: 13 modules, ~5,000 lines. The only runtime dependency is **PyYAML**; `ruff`
   is the only dev dependency. No agent framework, no SDK.
+- `init-config` selects an installed verified CLI per role on a terminal; non-TTY setup
+  copies the packaged default. `--force` preserves a backup before replacing user config.
 - The linear mode, complete: layered config, test-command detection, token budget, retries
   with backoff, timeouts, heartbeat, config/prompt snapshots, terminal commit,
   `list`/`clean`/`resume`.
@@ -194,12 +196,13 @@ budget, `5` a verdict was reached but Git could not commit, `6` publication was 
 
 ## Architecture overview
 
-One package, twelve modules, with no abstraction layer between them. Dependencies point
+One package, thirteen modules, with no abstraction layer between them. Dependencies point
 downward; `core.py` imports nothing from the package.
 
 ```text
 cli.py          argparse, signals, dispatch. Validates flag combinations BEFORE
                 reserving any run artifact.
+  ├─ wizard.py       init-config role selection from packaged verified vendors, free PATH checks
   ├─ source.py       fetch task text through configured commands before reserving a run
   └─ stages.py       the linear workflow: orchestrate() → run_stages() → review_and_finish()
        ├─ fanout.py  the fan-out workflow: DAG, concurrent scheduler, integration

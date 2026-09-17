@@ -57,17 +57,6 @@ def init_prompts(script_dir: Path) -> int:
     return 0
 
 
-def init_config(script_dir: Path) -> int:
-    target = user_config()
-    if target.exists():
-        print(f"Already exists, not overwriting: {target}")
-        return 1
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text((script_dir / "agents.yaml").read_text())
-    print(f"Wrote {target}\nEdit it to set test_command, models, timeouts.")
-    return 0
-
-
 def layer_config(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Merge sections by key while replacing each structured entry whole."""
     merged = dict(base)

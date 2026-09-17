@@ -11,7 +11,6 @@ from typing import Any
 from .config import (
     PROJECT_CONFIG,
     commit_enabled,
-    init_config,
     init_prompts,
     load_config,
     resolve_config,
@@ -22,6 +21,7 @@ from .doctor import doctor
 from .run import REDOABLE_STAGES, clean_runs, list_runs
 from .source import fetch_task
 from .stages import orchestrate
+from .wizard import init_config
 
 
 def _positive_int(value: str) -> int:
@@ -100,9 +100,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe", action="store_true",
         help="Make one real, potentially billable call to each unique agent.",
     )
-    sub.add_parser(
+    init = sub.add_parser(
         "init-config",
-        help="Copy the packaged agents.yaml to ~/.config/stargate/agents.yaml.",
+        help="Write the user config, asking which installed agent CLI drives each role.",
+    )
+    init.add_argument(
+        "--force", action="store_true",
+        help="Replace an existing config, keeping a timestamped backup.",
     )
     sub.add_parser(
         "init-prompts",
@@ -232,7 +236,7 @@ def main() -> int:
         _validate_run_arguments(parser, args)
 
     if args.command == "init-config":
-        return init_config(script_dir)
+        return init_config(script_dir, force=args.force)
     if args.command == "init-prompts":
         return init_prompts(script_dir)
 

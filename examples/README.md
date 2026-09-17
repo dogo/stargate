@@ -5,6 +5,12 @@ one vendor, plus notes on what that CLI does that stargate has to be told
 about. The packaged `stargate/agents.yaml` is the mixed Claude + Codex default;
 these are the single-vendor versions and the evidence behind them.
 
+The same reader/writer blocks ship in `stargate/vendors.yaml` for the interactive
+`stargate init-config` wizard, because `examples/` is not packaged. Tests prevent
+the copies from drifting: edit both files together. The wizard copies agent
+blocks, not example-level settings; its Claude reviewer additionally retains
+the packaged default's scoped test-command grant.
+
 Every config here was verified with `doctor --probe`, which exercises real
 reads and writes rather than checking that a binary exists:
 
