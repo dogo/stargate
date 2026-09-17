@@ -35,3 +35,24 @@ def test_configured_cli_is_not_offered_as_an_alternative(root: Path) -> None:
     with patch.dict(os.environ, {"PATH": fake_bin(root, "codex", "gemini")}):
         found = available_agent_clis({"git", "codex"})
     assert [name for name, _, _ in found] == ["gemini"], found
+
+
+def test_a_cli_configured_by_absolute_path_is_not_offered_as_an_alternative(
+    root: Path,
+) -> None:
+    # An agent command is an argument list, and its first element may be a
+    # path. Comparing it whole against the executable name reported the very
+    # CLI the config drives as something the user could switch to.
+    bindir = fake_bin(root, "gemini")
+    with patch.dict(os.environ, {"PATH": bindir}):
+        found = available_agent_clis({"git", f"{bindir}/gemini"})
+    assert found == [], found
+
+
+def test_an_installed_kiro_cli_is_named_by_the_executable_vendors_ship(root: Path) -> None:
+    # examples/kiro is verified against the `kiro-cli` executable; keying the
+    # table on `kiro` meant the one vendor the repository ships a wrapper for
+    # was the one discovery never found.
+    with patch.dict(os.environ, {"PATH": fake_bin(root, "kiro-cli")}):
+        found = available_agent_clis({"git"})
+    assert [name for name, _, _ in found] == ["kiro-cli"], found

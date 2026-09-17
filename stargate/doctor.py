@@ -53,7 +53,7 @@ PROBE_CAPABILITIES = ("read", "write")
 KNOWN_AGENT_CLIS = {
     "claude": "Claude Code (examples/claude)",
     "codex": "OpenAI Codex CLI (examples/codex)",
-    "kiro": "Kiro CLI (examples/kiro)",
+    "kiro-cli": "Kiro CLI (examples/kiro)",
     "amp": "Sourcegraph Amp",
     "copilot": "GitHub Copilot CLI",
     "crush": "Charm Crush",
@@ -67,10 +67,16 @@ KNOWN_AGENT_CLIS = {
 
 
 def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
-    """Known agent CLIs on PATH that this config does not use: (name, path, what)."""
+    """Known agent CLIs on PATH that this config does not use: (name, path, what).
+
+    A command prefix may name its executable by path (`/usr/local/bin/gemini`),
+    so the comparison is on basenames: reporting a configured agent as an
+    unused alternative reads as advice to change what already works.
+    """
+    in_use = {Path(binary).name for binary in configured}
     found = []
     for name, description in sorted(KNOWN_AGENT_CLIS.items()):
-        if name in configured:
+        if name in in_use:
             continue
         if path := shutil.which(name):
             found.append((name, path, description))
