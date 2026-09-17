@@ -136,13 +136,15 @@ def run(
     )
 
 
-def doctor(repo: Path, config: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def doctor(
+    repo: Path, config: Path, *args: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "stargate", "--config", str(config), "doctor", *args],
         cwd=repo,
         text=True,
         capture_output=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        env={**os.environ, "PYTHONPATH": str(ROOT), **(env or {})},
     )
 
 

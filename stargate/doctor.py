@@ -44,6 +44,62 @@ PROBE_TIMEOUT_DEFAULT = 120
 PROBE_CAPABILITIES = ("read", "write")
 
 
+# Coding-agent CLIs stargate knows how to talk about. It configures none of
+# them: a command prefix needs vendor-specific flags (read-only for the
+# architect, where the final message goes, sandbox for the writers), and
+# guessing those would produce a config that runs and does the wrong thing.
+# Naming what is installed is the part that can be done without guessing --
+# `examples/` carries the three verified ones.
+KNOWN_AGENT_CLIS = {
+    "claude": "Claude Code (examples/claude)",
+    "codex": "OpenAI Codex CLI (examples/codex)",
+    "kiro-cli": "Kiro CLI (examples/kiro)",
+    "amp": "Sourcegraph Amp",
+    "copilot": "GitHub Copilot CLI",
+    "crush": "Charm Crush",
+    "cursor-agent": "Cursor CLI",
+    "gemini": "Gemini CLI",
+    "goose": "Block Goose",
+    "opencode": "opencode",
+    "q": "Amazon Q Developer CLI",
+    "qwen": "Qwen Code",
+}
+
+
+# The wrappers this repository ships under `examples/`. A config whose command
+# prefix is one of them drives the vendor underneath it, so the vendor is in
+# use even though its executable never appears in the config. A wrapper the
+# user wrote under a name of their own cannot be seen from here.
+AGENT_CLI_WRAPPERS = {
+    "claude-json-stargate": "claude",
+    "kiro-stargate": "kiro-cli",
+}
+
+
+def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
+    """Known agent CLIs on PATH that this config does not use: (name, path, what).
+
+    A command prefix may name its executable by path (`/usr/local/bin/gemini`),
+    so the comparison is on basenames: reporting a configured agent as an
+    unused alternative reads as advice to change what already works. For the
+    same reason a shipped wrapper counts as the vendor it calls.
+
+    Only a configured executable that resolves counts as in use. A stale
+    absolute path is reported `MISSING`, and the working CLI of the same name
+    on PATH is the answer to it -- suppressing that leaves the reader with the
+    dead end this report exists to end.
+    """
+    in_use = {Path(binary).name for binary in configured if shutil.which(binary)}
+    in_use |= {AGENT_CLI_WRAPPERS[name] for name in in_use & AGENT_CLI_WRAPPERS.keys()}
+    found = []
+    for name, description in sorted(KNOWN_AGENT_CLIS.items()):
+        if name in in_use:
+            continue
+        if path := shutil.which(name):
+            found.append((name, path, description))
+    return found
+
+
 @dataclass
 class Capability:
     """A file operation that a probe must demonstrate, not merely describe."""
@@ -265,6 +321,16 @@ def doctor(
         "and model availability are NOT checked -- an agent can still fail on its\n"
         "first call (e.g. \"Credit balance is too low\")."
     )
+
+    if others := available_agent_clis(binaries):
+        print("\nOther agent CLIs on PATH, not used by this config:")
+        for name, path, description in others:
+            print(f"         {name:12} {path}  -- {description}")
+        print(
+            "         Stargate drives any of them as a command prefix, but the flags\n"
+            "         differ per vendor; write the agent entry yourself, starting from\n"
+            "         examples/README.md, and verify it with `stargate doctor --probe`."
+        )
 
     if probe:
         ok = probe_agents(config, test_command) and ok

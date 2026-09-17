@@ -102,12 +102,12 @@ leaves a commit on its own branch, including when the verdict is `CHANGES_REQUES
 the test command failed, or when the token budget stopped it; the verdict goes into the
 commit message.
 
-Full user documentation: [`README.md`](README.md) (1401 lines — it is the reference, do not
+Full user documentation: [`README.md`](README.md) (1404 lines — it is the reference, do not
 duplicate it here). Verified single-vendor configurations: [`examples/`](examples/).
 
 ## Repository state
 
-**Both modes are implemented and covered.** 238 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 245 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 
@@ -279,9 +279,9 @@ test builds whatever it needs in there and leaves nothing outside it.
 
 **Where to write.** `tests/test_<area>.py`, one module per area — currently
 `test_fanout_graph`, `test_fanout_scheduler`, `test_fanout_signals`, `test_fanout_git_state`,
-`test_fanout_finish`, `test_fanout_cli_docs`, `test_review_cycle`, `test_harness`. Do not add
-new tests to `test_stargate.py`; it is the history. Shared helpers go in `tests/harness.py`,
-never duplicated.
+`test_fanout_finish`, `test_fanout_cli_docs`, `test_review_cycle`, `test_agent_clis`,
+`test_harness`. Do not add new tests to `test_stargate.py`; it is the history. Shared
+helpers go in `tests/harness.py`, never duplicated.
 
 **The two levels:**
 

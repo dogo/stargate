@@ -237,6 +237,19 @@ and agents, each role's resolved command, all five resolved prompt files
 with their evidence. It makes no external calls, so `FOUND` means only that the
 executable is on `PATH` — see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
+
+It also lists the coding-agent CLIs it recognises that are installed but unused
+by the effective config — the answer to a `MISSING claude` on a machine that has
+`gemini`. It never rewrites the config from that: the flags that make a role
+read-only, or put the final message in a file, are vendor-specific, and a guessed
+command would run and do the wrong thing. See
+[Adding a different agent CLI](#adding-a-different-agent-cli).
+
+What it compares is the executable each role actually names. A CLI reached
+through a wrapper of your own is therefore still reported as unused — the two
+wrappers under [`examples/`](examples/) are the only ones it knows to look
+through.
+
 The effective-settings table reports values and provenance. Most settings are only
 validated by the command that uses them, but an invalid `blocking_severities` is reported
 here as an `ERROR` and exits `1`, with the offending value still shown in the table —
@@ -1310,8 +1323,9 @@ can fill any role whose permission and output requirements it supports.
 
 ## Adding a different agent CLI
 
-Nothing in the package names a vendor: the only mentions of Claude or Codex in
-`stargate/*.py` are comments and the `--help` line. An agent is six YAML keys —
+No vendor is wired into the package: the names in `stargate/*.py` are a table
+`doctor` reads to say which CLIs are installed, plus comments and the `--help`
+line — none of them configures anything. An agent is six YAML keys —
 `command`, `env`, `probe`, `probe_expect`, `usage_pattern`, and the `{output}` /
 `{test_command}` placeholders — so adding a CLI is a config change.
 
@@ -1319,8 +1333,8 @@ Finding out *what to put* in that config is the actual work, and `doctor` only
 catches the first of the four things that go wrong:
 
 1. **It is not on PATH, or the prompt is not the last argument.** `doctor`
-   reports this immediately; `doctor --probe` also proves the CLI can read and
-   write when its role needs to.
+   reports this immediately, along with any recognised CLI that *is* installed;
+   `doctor --probe` also proves the CLI can read and write when its role needs to.
 2. **Its stdout is a session trace, not the answer.** Then it needs `{output}`
    (see [Final message vs. stdout](#final-message-vs-stdout)). A CLI with no
    flag for that needs a small wrapper.
