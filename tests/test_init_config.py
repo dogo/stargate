@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +14,59 @@ from stargate.wizard import init_config
 from tests.harness import ROOT, fake_bin, make_repo, stargate, stargate_tty
 
 PACKAGE = ROOT / "stargate"
+
+
+def test_init_config_import_order_cannot_break_the_lint_gate(root: Path) -> None:
+    # A make-test-only run must also catch the import error missed by the prior run.
+    proc = subprocess.run(
+        [sys.executable, "-m", "ruff", "check", "--no-cache", "--select", "I",
+         "tests/test_init_config.py"],
+        cwd=ROOT, text=True, capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_generated_config_documents_packaged_settings_without_overriding_them(root: Path) -> None:
+    repo = make_repo(root)
+    bindir = Path(fake_bin(root, "codex"))
+    (bindir / "git").symlink_to(shutil.which("git"))
+    env = {"PATH": str(bindir)}
+    proc = stargate_tty(repo, "init-config", config_home=root, answers="\n" * 4, env=env)
+    assert proc.returncode == 0, proc.stdout
+    text = (root / "stargate/agents.yaml").read_text()
+    packaged = (PACKAGE / "agents.yaml").read_text()
+    settings = packaged[packaged.index("\nsettings:\n") + 1:]
+    documented = "\n".join(f"# {line}".rstrip() for line in settings.splitlines())
+    assert documented in text, proc.stdout + text
+    for setting in ('test_command: ""', "test_command_detection: report",
+                    "agent_timeout_seconds: 1800", "max_task_tokens: 0"):
+        assert f"#   {setting}" in text, proc.stdout + text
+    assert "settings" not in yaml.safe_load(text), proc.stdout + text
+    proc = stargate(repo, "doctor", config_home=root, env=env)
+    assert proc.returncode == 0, proc.stdout
+    # [2] proves the default still comes from the packaged layer, not the new file.
+    assert any(line.split() == ["max_review_loops", "2", "[2]"]
+               for line in proc.stdout.splitlines()), proc.stdout
+
+
+def test_corrupt_packaged_vendors_reports_a_clean_error_instead_of_a_traceback(root: Path) -> None:
+    package = root / "pkg" / "stargate"
+    shutil.copytree(PACKAGE, package, ignore=shutil.ignore_patterns("__pycache__"))
+    (package / "vendors.yaml").write_text(
+        "version: 1\nvendors:\n  broken:\n    description: two writers, no reader\n"
+        "    agents:\n"
+        "      broken_one: {command: [claude], probe_expect: write}\n"
+        "      broken_two: {command: [claude], probe_expect: write}\n"
+    )
+    # Setup must reach its own error handler even outside a Git repository.
+    proc = stargate(root, "init-config", config_home=root,
+                    env={"PYTHONPATH": str(root / "pkg"), "PATH": fake_bin(root)})
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "ERROR: Packaged vendor broken needs one reader and one writer" in proc.stderr, (
+        proc.stdout + proc.stderr
+    )
+    assert "Traceback" not in proc.stdout + proc.stderr, proc.stdout + proc.stderr
+    assert not (root / "stargate").exists(), proc.stdout + proc.stderr
 
 
 def test_packaged_vendor_blocks_stay_identical_to_the_verified_examples(root: Path) -> None:

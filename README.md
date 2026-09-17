@@ -170,8 +170,10 @@ Detection only checks PATH and never runs an agent or makes a billable probe.
 Architect and reviewer use the vendor's reader block; developer and fixer use
 its writer block. The Claude reviewer also retains the packaged default's
 scoped `Bash({test_command})` grant, so it can verify the approved test command.
-Generated configs inherit settings from the packaged layer. Vendor comments
-and example-level settings, including Kiro's timeout, are not copied; see the
+Generated configs inherit settings from the packaged layer and reproduce those
+defaults as comments for reference. Uncomment `settings:` and the desired setting
+to override it. Vendor comments and example-level settings, including Kiro's
+timeout, are not copied; see the
 linked [vendor notes](examples/README.md) before customizing those settings.
 
 Existing configs are refused unless you pass `--force`, which prints the path

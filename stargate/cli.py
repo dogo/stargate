@@ -235,12 +235,13 @@ def main() -> int:
     if args.command == "run":
         _validate_run_arguments(parser, args)
 
-    if args.command == "init-config":
-        return init_config(script_dir, force=args.force)
     if args.command == "init-prompts":
         return init_prompts(script_dir)
 
     try:
+        if args.command == "init-config":
+            return init_config(script_dir, force=args.force)
+
         if args.command in ("run", "resume"):
             # The shared handler also kills agents owned by fan-out workers.
             install_signal_handlers()
