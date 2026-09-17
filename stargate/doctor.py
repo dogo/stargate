@@ -44,6 +44,39 @@ PROBE_TIMEOUT_DEFAULT = 120
 PROBE_CAPABILITIES = ("read", "write")
 
 
+# Coding-agent CLIs stargate knows how to talk about. It configures none of
+# them: a command prefix needs vendor-specific flags (read-only for the
+# architect, where the final message goes, sandbox for the writers), and
+# guessing those would produce a config that runs and does the wrong thing.
+# Naming what is installed is the part that can be done without guessing --
+# `examples/` carries the three verified ones.
+KNOWN_AGENT_CLIS = {
+    "claude": "Claude Code (examples/claude)",
+    "codex": "OpenAI Codex CLI (examples/codex)",
+    "kiro": "Kiro CLI (examples/kiro)",
+    "amp": "Sourcegraph Amp",
+    "copilot": "GitHub Copilot CLI",
+    "crush": "Charm Crush",
+    "cursor-agent": "Cursor CLI",
+    "gemini": "Gemini CLI",
+    "goose": "Block Goose",
+    "opencode": "opencode",
+    "q": "Amazon Q Developer CLI",
+    "qwen": "Qwen Code",
+}
+
+
+def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
+    """Known agent CLIs on PATH that this config does not use: (name, path, what)."""
+    found = []
+    for name, description in sorted(KNOWN_AGENT_CLIS.items()):
+        if name in configured:
+            continue
+        if path := shutil.which(name):
+            found.append((name, path, description))
+    return found
+
+
 @dataclass
 class Capability:
     """A file operation that a probe must demonstrate, not merely describe."""
@@ -265,6 +298,16 @@ def doctor(
         "and model availability are NOT checked -- an agent can still fail on its\n"
         "first call (e.g. \"Credit balance is too low\")."
     )
+
+    if others := available_agent_clis(binaries):
+        print("\nOther agent CLIs on PATH, not used by this config:")
+        for name, path, description in others:
+            print(f"         {name:12} {path}  -- {description}")
+        print(
+            "         Stargate drives any of them as a command prefix, but the flags\n"
+            "         differ per vendor; write the agent entry yourself, starting from\n"
+            "         examples/README.md, and verify it with `stargate doctor --probe`."
+        )
 
     if probe:
         ok = probe_agents(config, test_command) and ok
