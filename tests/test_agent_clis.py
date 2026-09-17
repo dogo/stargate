@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from stargate.doctor import available_agent_clis
+from tests.harness import doctor, make_repo, write_config
 
 
 def fake_bin(root: Path, *names: str) -> str:
@@ -56,3 +57,43 @@ def test_an_installed_kiro_cli_is_named_by_the_executable_vendors_ship(root: Pat
     with patch.dict(os.environ, {"PATH": fake_bin(root, "kiro-cli")}):
         found = available_agent_clis({"git"})
     assert [name for name, _, _ in found] == ["kiro-cli"], found
+
+
+def test_a_shipped_wrapper_counts_as_the_vendor_it_calls(root: Path) -> None:
+    # examples/kiro drives Kiro through `kiro-stargate`, which execs kiro-cli.
+    # Naming kiro-cli as an unused alternative there advises switching away
+    # from the one configuration this repository verified against that vendor.
+    with patch.dict(os.environ, {"PATH": fake_bin(root, "kiro-cli", "kiro-stargate")}):
+        found = available_agent_clis({"git", "kiro-stargate"})
+    assert found == [], found
+
+
+def test_a_configured_path_that_does_not_exist_still_points_at_the_cli_on_path(
+    root: Path,
+) -> None:
+    # `MISSING /opt/gemini/bin/gemini` with a working `gemini` one directory
+    # away is exactly the dead end this report exists to end; the basename
+    # match must not hide an alternative for a binary that is not there.
+    bindir = fake_bin(root, "gemini")
+    with patch.dict(os.environ, {"PATH": bindir}):
+        found = available_agent_clis({"git", "/opt/gemini/bin/gemini"})
+    assert [(name, path) for name, path, _ in found] == [
+        ("gemini", f"{bindir}/gemini")
+    ], found
+
+
+def test_doctor_reports_the_unused_clis_below_the_binary_report(root: Path) -> None:
+    # The helper being right is not the feature: doctor has to call it, and
+    # print it where a `MISSING` line sends the reader looking -- after the
+    # FOUND/MISSING block, not among it.
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    bindir = fake_bin(root, "gemini")
+    proc = doctor(repo, config, env={"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    header = "Other agent CLIs on PATH, not used by this config:"
+    assert header in proc.stdout, proc.stdout
+    assert f"gemini       {bindir}/gemini  -- Gemini CLI" in proc.stdout, proc.stdout
+    assert proc.stdout.index(header) > proc.stdout.rindex("FOUND    "), proc.stdout

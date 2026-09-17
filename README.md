@@ -245,6 +245,11 @@ read-only, or put the final message in a file, are vendor-specific, and a guesse
 command would run and do the wrong thing. See
 [Adding a different agent CLI](#adding-a-different-agent-cli).
 
+What it compares is the executable each role actually names. A CLI reached
+through a wrapper of your own is therefore still reported as unused — the two
+wrappers under [`examples/`](examples/) are the only ones it knows to look
+through.
+
 The effective-settings table reports values and provenance. Most settings are only
 validated by the command that uses them, but an invalid `blocking_severities` is reported
 here as an `ERROR` and exits `1`, with the offending value still shown in the table —
@@ -1318,8 +1323,9 @@ can fill any role whose permission and output requirements it supports.
 
 ## Adding a different agent CLI
 
-Nothing in the package names a vendor: the only mentions of Claude or Codex in
-`stargate/*.py` are comments and the `--help` line. An agent is six YAML keys —
+No vendor is wired into the package: the names in `stargate/*.py` are a table
+`doctor` reads to say which CLIs are installed, plus comments and the `--help`
+line — none of them configures anything. An agent is six YAML keys —
 `command`, `env`, `probe`, `probe_expect`, `usage_pattern`, and the `{output}` /
 `{test_command}` placeholders — so adding a CLI is a config change.
 

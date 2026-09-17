@@ -66,14 +66,31 @@ KNOWN_AGENT_CLIS = {
 }
 
 
+# The wrappers this repository ships under `examples/`. A config whose command
+# prefix is one of them drives the vendor underneath it, so the vendor is in
+# use even though its executable never appears in the config. A wrapper the
+# user wrote under a name of their own cannot be seen from here.
+AGENT_CLI_WRAPPERS = {
+    "claude-json-stargate": "claude",
+    "kiro-stargate": "kiro-cli",
+}
+
+
 def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
     """Known agent CLIs on PATH that this config does not use: (name, path, what).
 
     A command prefix may name its executable by path (`/usr/local/bin/gemini`),
     so the comparison is on basenames: reporting a configured agent as an
-    unused alternative reads as advice to change what already works.
+    unused alternative reads as advice to change what already works. For the
+    same reason a shipped wrapper counts as the vendor it calls.
+
+    Only a configured executable that resolves counts as in use. A stale
+    absolute path is reported `MISSING`, and the working CLI of the same name
+    on PATH is the answer to it -- suppressing that leaves the reader with the
+    dead end this report exists to end.
     """
-    in_use = {Path(binary).name for binary in configured}
+    in_use = {Path(binary).name for binary in configured if shutil.which(binary)}
+    in_use |= {AGENT_CLI_WRAPPERS[name] for name in in_use & AGENT_CLI_WRAPPERS.keys()}
     found = []
     for name, description in sorted(KNOWN_AGENT_CLIS.items()):
         if name in in_use:
