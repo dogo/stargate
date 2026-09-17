@@ -43,7 +43,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - run: python -m pip install --upgrade pip && python -m pip install -e .
+      - run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
 
       # test_stargate.py is both the runner and part of the suite; there is no
       # pytest here, and collection by pytest would break.
