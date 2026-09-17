@@ -2,23 +2,11 @@
 from __future__ import annotations
 
 import os
-import stat
 from pathlib import Path
 from unittest.mock import patch
 
 from stargate.doctor import available_agent_clis
-from tests.harness import doctor, make_repo, write_config
-
-
-def fake_bin(root: Path, *names: str) -> str:
-    """A PATH containing only executables with these names."""
-    bindir = root / "bin"
-    bindir.mkdir(exist_ok=True)
-    for name in names:
-        exe = bindir / name
-        exe.write_text("#!/bin/sh\nexit 0\n")
-        exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
-    return str(bindir)
+from tests.harness import doctor, fake_bin, make_repo, write_config
 
 
 def test_installed_agent_cli_is_reported_when_the_config_ignores_it(root: Path) -> None:

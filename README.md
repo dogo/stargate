@@ -143,11 +143,44 @@ make test     # smoke test with fake agents
 
 ## Configure
 
-Seed a user-level config:
+Choose the agent CLI for each role and write a user-level config:
 
 ```bash
 stargate init-config         # writes ~/.config/stargate/agents.yaml
+stargate init-config --force # replace it, keeping a timestamped backup
 ```
+
+On a terminal, setup asks one question for each role: architect, developer,
+reviewer, and fixer. Enter keeps the suggested vendor (the packaged default's
+vendor when installed, otherwise the first available one). Choose a number or
+vendor name to change it, for example:
+
+```text
+architect [claude]: codex
+developer [codex]: claude
+```
+
+Only installed, verified command prefixes are offered: Claude Code (`claude`),
+Codex (`codex`), and Kiro through `kiro-stargate`. Finding `kiro-cli` alone is not
+enough: install the wrapper described in [examples/kiro](examples/kiro/) first
+(the supplied wrapper uses macOS paths). Other known CLIs may be reported as
+“detected, not configurable”; their vendor-specific flags cannot be guessed.
+Detection only checks PATH and never runs an agent or makes a billable probe.
+
+Architect and reviewer use the vendor's reader block; developer and fixer use
+its writer block. The Claude reviewer also retains the packaged default's
+scoped `Bash({test_command})` grant, so it can verify the approved test command.
+Generated configs inherit settings from the packaged layer. Vendor comments
+and example-level settings, including Kiro's timeout, are not copied; see the
+linked [vendor notes](examples/README.md) before customizing those settings.
+
+Existing configs are refused unless you pass `--force`, which prints the path
+of a timestamped backup. Without a terminal on stdin, setup skips questions and
+copies the packaged default verbatim. If no verified prefix is installed, it
+also copies that default and lists the missing executables; install the needed
+CLIs before running it. Inspect the result with `stargate doctor`. To verify
+credentials and capabilities, explicitly run `stargate doctor --probe` (one
+real, billable call per distinct agent).
 
 Without `--config`, every existing file in this lookup chain is layered, most
 specific first:
@@ -1323,9 +1356,10 @@ can fill any role whose permission and output requirements it supports.
 
 ## Adding a different agent CLI
 
-No vendor is wired into the package: the names in `stargate/*.py` are a table
-`doctor` reads to say which CLIs are installed, plus comments and the `--help`
-line — none of them configures anything. An agent is six YAML keys —
+The CLI names in `stargate/doctor.py` only support PATH detection; they do not
+compose commands. `stargate/vendors.yaml` packages the three verified vendor
+blocks from `examples/` for `init-config`. Other CLIs still need a command
+prefix you configure and verify yourself. An agent is six YAML keys —
 `command`, `env`, `probe`, `probe_expect`, `usage_pattern`, and the `{output}` /
 `{test_command}` placeholders — so adding a CLI is a config change.
 

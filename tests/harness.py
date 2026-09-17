@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import pty
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -169,10 +171,17 @@ def clean(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def stargate(
-    repo: Path, *args: str, config_home: Path
+    repo: Path, *args: str, config_home: Path, stdin: str | int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "stargate", *args],
+        # No inherited terminal: ordinary subprocess tests must never prompt.
+        input=stdin if isinstance(stdin, str) else None,
+        stdin=None if isinstance(stdin, str) else (
+            subprocess.DEVNULL if stdin is None else stdin
+        ),
+        timeout=60,
         cwd=repo,
         text=True,
         capture_output=True,
@@ -180,8 +189,39 @@ def stargate(
             **os.environ,
             "PYTHONPATH": str(ROOT),
             "XDG_CONFIG_HOME": str(config_home),
+            **(env or {}),
         },
     )
+
+
+def stargate_tty(
+    repo: Path, *args: str, config_home: Path, answers: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Feed a real terminal on stdin; keep stdout free of terminal echo."""
+    master, slave = pty.openpty()
+    try:
+        os.write(master, answers.encode())
+        return stargate(repo, *args, config_home=config_home, stdin=slave, env=env)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or b""
+        raise AssertionError(
+            "CLI timed out; the wizard may need more answers:\n" + output.decode()
+        ) from exc
+    finally:
+        os.close(slave)
+        os.close(master)
+
+
+def fake_bin(root: Path, *names: str) -> str:
+    """A PATH containing only executables with these names."""
+    bindir = root / "bin"
+    bindir.mkdir(exist_ok=True)
+    for name in names:
+        exe = bindir / name
+        exe.write_text("#!/bin/sh\nexit 0\n")
+        exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    return str(bindir)
 
 
 def recorded_run(repo: Path, run_id: str) -> tuple[Path, Path, str]:

@@ -1,0 +1,109 @@
+# Verified vendor blocks for init-config; examples/ is not packaged.
+# Keep agents identical to examples/<vendor>/agents.yaml (drift-tested).
+# Never guess flags for other CLIs listed by doctor.
+version: 1
+vendors:
+  claude:
+    description: Claude Code (examples/claude)
+    agents:
+      # `claude -p --output-format text` prints only the final message, so these
+      # roles need no {output} wrapper -- stdout IS the answer.
+      claude_reader:
+        command:
+          - claude
+          - -p
+          - --output-format
+          - text
+          - --disallowedTools
+          - Edit Write NotebookEdit
+          - --model
+          - opus
+        probe: "Read the file {probe_file} and reply with its contents, nothing else."
+        probe_expect: read
+
+      # Print mode denies edits unless a permission mode allows them. acceptEdits
+      # is the narrow one: file edits without prompting, everything else still
+      # asks (and in print mode, an ask is a denial).
+      claude_writer:
+        command:
+          - claude
+          - -p
+          - --output-format
+          - text
+          - --permission-mode
+          - acceptEdits
+          - --model
+          - sonnet
+        probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+        probe_expect: write
+    # Preserve the packaged reviewer's ability to run the approved test command.
+    # The architect runs in the real repository and must not receive this grant.
+    # expand_test_command drops the grant when no safe test command is configured.
+    # Keep the verified full command: variadic flags must not swallow the prompt.
+    reviewer_command:
+      - claude
+      - -p
+      - --output-format
+      - text
+      - --disallowedTools
+      - Edit Write NotebookEdit
+      # Print mode otherwise denies arbitrary execution, leaving the reviewer
+      # able only to trust the pasted test report. This grant follows the exact
+      # command stargate runs and is dropped when none was approved. It is not
+      # on the architect because that role runs in the real repository.
+      - --allowedTools
+      - Bash({test_command})
+      - --model
+      - opus
+  codex:
+    description: OpenAI Codex CLI (examples/codex)
+    agents:
+      # codex exec streams the whole session to stdout, so every role needs
+      # {output} -- without it the next role's prompt would be the previous
+      # role's trace. -o is codex's own flag for exactly this.
+      codex_reader:
+        command:
+          - codex
+          - exec
+          - --sandbox
+          - read-only
+          - --output-last-message
+          - "{output}"
+        probe: "Read the file {probe_file} and reply with its contents, nothing else."
+        probe_expect: read
+        usage_pattern: 'tokens used\s+([\d,]+)'
+
+      codex_writer:
+        command:
+          - codex
+          - exec
+          - --sandbox
+          - workspace-write
+          - --output-last-message
+          - "{output}"
+        probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+        probe_expect: write
+        usage_pattern: 'tokens used\s+([\d,]+)'
+  kiro:
+    description: Kiro CLI through kiro-stargate (examples/kiro)
+    agents:
+      kiro_reader:
+        command:
+          - kiro-stargate
+          - "{output}"
+          - --trust-tools=read,grep
+        probe: "Read the file {probe_file} and reply with its contents, nothing else."
+        probe_expect: read
+        usage_pattern: 'Credits:\s+([\d.,]+)'
+
+      kiro_writer:
+        command:
+          - kiro-stargate
+          - "{output}"
+          - --trust-all-tools
+        probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+        probe_expect: write
+        # kiro-cli reports fractional credits, not tokens. Capturing the dot makes
+        # parse_usage strip it, so the budget counts hundredths of a credit --
+        # set max_task_tokens in that same unit or leave it at 0.
+        usage_pattern: 'Credits:\s+([\d.,]+)'
