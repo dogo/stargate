@@ -46,6 +46,13 @@ def load_vendors(script_dir: Path) -> list[Vendor]:
     return vendors
 
 
+def vendor_installed(binary: str) -> bool:
+    # Known wrappers require the CLI they run, too. This deliberately covers
+    # kiro as well as opencode through the shared wrapper-to-executable map.
+    underlying = AGENT_CLI_WRAPPERS.get(binary)
+    return bool(shutil.which(binary)) and (underlying is None or bool(shutil.which(underlying)))
+
+
 def ask(role: str, options: list[Vendor], default: Vendor) -> Vendor:
     capability = "reads your repository" if role in ("architect", "reviewer") else "may edit files"
     print(f"\n{role} — {capability}")
@@ -111,7 +118,7 @@ def init_config(script_dir: Path, *, force: bool = False) -> int:
         return 1
 
     vendors = load_vendors(script_dir)
-    installed = [vendor for vendor in vendors if shutil.which(vendor.binary)]
+    installed = [vendor for vendor in vendors if vendor_installed(vendor.binary)]
     other_clis = available_agent_clis({vendor.binary for vendor in vendors})
     found = {name for name, _, _ in other_clis}
     for vendor in vendors:
@@ -119,10 +126,15 @@ def init_config(script_dir: Path, *, force: bool = False) -> int:
         if vendor not in installed and underlying in found:
             print(f"MISSING {vendor.binary}: {underlying} found, but the "
                   f"examples/{vendor.name} wrapper is not on PATH.")
+        elif vendor not in installed and underlying and shutil.which(vendor.binary):
+            print(f"MISSING {underlying}: the examples/{vendor.name} wrapper is on PATH, "
+                  "but the CLI it runs is not.")
     if not installed:
         print("No verified agent CLI is available. Missing command executables:")
         for vendor in vendors:
-            print(f"  MISSING {vendor.binary} — {vendor.description}")
+            missing = (AGENT_CLI_WRAPPERS[vendor.binary]
+                       if shutil.which(vendor.binary) else vendor.binary)
+            print(f"  MISSING {missing} — {vendor.description}")
         print("Writing the packaged default; install its CLIs or re-run setup after installation.")
 
     content = (script_dir / "agents.yaml").read_text()

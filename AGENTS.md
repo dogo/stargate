@@ -107,7 +107,7 @@ duplicate it here). Verified single-vendor configurations: [`examples/`](example
 
 ## Repository state
 
-**Both modes are implemented and covered.** 262 tests, all passing (`make test`, exit 0).
+**Both modes are implemented and covered.** 264 tests, all passing (`make test`, exit 0).
 Current work lives on `main`; there are no open feature branches beyond the `stargate/*`
 ones the runs themselves left behind.
 
@@ -126,9 +126,11 @@ What exists:
   does not make the run pay for a fresh review, as long as the worktree fingerprint matches.
 - `doctor` and `doctor --probe`, the latter making one real (billable) call per distinct
   agent, exercising the read or write capability that role actually depends on.
-- `examples/`: Claude Code, Codex CLI, Kiro CLI and Gemini CLI, each verified with `--probe`,
+- `examples/`: five vendors — Claude Code, Codex CLI, Kiro CLI, Gemini CLI and opencode —
+  each verified with `--probe`,
   with the differences between them documented (who needs `{output}`, who reports usage,
-  who needs a wrapper).
+  who needs a wrapper). Kiro and opencode require wrappers for different reasons:
+  Kiro's sibling executable/output markers; opencode's silence into regular files.
 - CI, in two workflows. `.github/workflows/ci.yml` runs ruff and the suite on every push to
   `main` and every pull request, on Python 3.10 and 3.13. `.github/workflows/release.yml`
   triggers on a version tag: it checks the tag against `pyproject.toml`, builds, and publishes
