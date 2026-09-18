@@ -1,17 +1,19 @@
 #!/bin/sh
 # opencode adapter for stargate. Verified against opencode 1.18.31.
 #
-# Three things this works around:
+# Four things this works around:
 #  1. opencode writes NOTHING when its stdout is a regular file, and that is
 #     exactly what stargate hands a command: run_process() passes an open trace
 #     file as stdout with stderr merged into it (core.py). Piping it -- which
 #     this script does by construction -- is what makes it emit anything at all.
 #  2. Its output is a session trace, not the final message: ANSI escapes, a
-#     "> <agent> - <model>" header and tool lines before the answer. stargate
+#     "> <agent> · <model>" header and tool lines before the answer. stargate
 #     wants the reviewer's verdict as the exact last line, so those are stripped
 #     and the clean text is handed to {output}.
 #  3. Auth uses the AI SDK variable names: GOOGLE_GENERATIVE_AI_API_KEY, not
 #     GEMINI_API_KEY. This maps one to the other when only the latter is set.
+#  4. POSIX sh reports only the last pipeline command's status. A FIFO lets
+#     opencode write into a pipe while wait preserves its failure for retries.
 set -e
 out=$1; shift
 
@@ -20,12 +22,29 @@ if [ -z "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] && [ -n "${GEMINI_API_KEY:-}" ]; t
   export GOOGLE_GENERATIVE_AI_API_KEY
 fi
 
-NO_COLOR=1 opencode run "$@" 2>&1 \
-  | perl -CSD -0777 -pe '
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/opencode-stargate.XXXXXX")
+trap 'rm -rf "$tmp"' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+mkfifo "$tmp/trace"
+
+NO_COLOR=1 opencode run "$@" >"$tmp/trace" 2>&1 &
+pid=$!
+
+# Only remove the first content line when it has the session header shape.
+# These three tool markers were observed in 1.18.31. Unknown future markers
+# deliberately pass through rather than risk deleting ordinary prose.
+perl -CSD -0777 -pe '
       s/\e\[[0-9;]*[a-zA-Z]//g;
-      s/^>\s.*\n//mg;
-      s/^[\x{2731}\x{2192}\x{2190}\x{22EE}\x{2022}\x{2713}\x{25CF}\x{2713}]\s.*\n//mg;
+      s/\A\s*\n//;
+      s/\A>[ \t]+\S+[ \t]+\x{00B7}[ \t]+[^\n]+(?:\n|\z)//;
+      s/^[\x{2731}\x{2192}\x{2190}][ \t]+[^\n]*(?:\n|\z)//mg;
       s/\A\s*\n//;
       s/\s+\z/\n/;
-    ' \
+    ' <"$tmp/trace" \
   | tee "$out"
+
+status=0
+wait "$pid" || status=$?
+exit "$status"

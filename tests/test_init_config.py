@@ -210,9 +210,9 @@ def test_unverified_clis_are_reported_but_cannot_be_selected(root: Path) -> None
     assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout
 
 
-def test_kiro_wrapper_is_sufficient_for_verified_reader_and_writer_choices(root: Path) -> None:
+def test_a_wrapper_and_the_cli_it_runs_together_offer_the_verified_choices(root: Path) -> None:
     proc = stargate_tty(root, "init-config", config_home=root, answers="\n" * 4,
-                        env={"PATH": fake_bin(root, "kiro-stargate")})
+                        env={"PATH": fake_bin(root, "kiro-stargate", "kiro-cli")})
     assert proc.returncode == 0, proc.stdout
     config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
     assert config["workflow"] == dict(architect="kiro_reader", developer="kiro_writer",
@@ -271,3 +271,20 @@ def test_gemini_is_not_offered_when_its_executable_is_absent(root: Path) -> None
     assert "Choose a listed number" in proc.stdout, proc.stdout
     config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
     assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout
+
+
+def test_a_wrapper_without_the_cli_it_runs_does_not_make_the_vendor_selectable(root: Path) -> None:
+    for vendor, cli in (("opencode", "opencode"), ("kiro", "kiro-cli")):
+        case = root / vendor
+        case.mkdir()
+        wrapper = f"{vendor}-stargate"
+        proc = stargate_tty(case, "init-config", config_home=case, answers="",
+                            env={"PATH": fake_bin(case, wrapper)})
+        assert proc.returncode == 0, proc.stdout
+        assert (f"MISSING {cli}: the examples/{vendor} wrapper is on PATH, "
+                "but the CLI it runs is not.") in proc.stdout, proc.stdout
+        assert f"MISSING {wrapper}" not in proc.stdout, proc.stdout
+        assert "architect [" not in proc.stdout, proc.stdout
+        assert (case / "stargate/agents.yaml").read_bytes() == (
+            PACKAGE / "agents.yaml"
+        ).read_bytes(), proc.stdout

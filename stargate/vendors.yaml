@@ -176,9 +176,12 @@ vendors:
       # Auth uses GOOGLE_GENERATIVE_AI_API_KEY (Vercel AI SDK), not GEMINI_API_KEY;
       # the wrapper maps the latter when only it is set.
       # No usage_pattern: opencode reports no token usage in this mode.
-      # The wrapper strips ANSI, the "> <agent> · <model>" header and tool markers
-      # (→ Read, ← Write, ✱ Glob), but results (e.g. "Wrote file successfully.") remain
-      # mid-output. The last-line verdict is clean, which is the stargate contract.
+      # The wrapper preserves opencode's exit status through a FIFO and wait.
+      # It strips ANSI, the "> <agent> · <model>" header only on the first content
+      # line, and only the observed → / ← / ✱ tool marker lines. Blockquotes,
+      # bullets and unknown future markers survive to avoid deleting real content.
+      # Results (e.g. "Wrote file successfully.") remain mid-output.
+      # The last-line verdict is clean, which is the stargate contract.
       # --agent plan is the built-in read-only agent (edit "*": deny), selectable
       # by flag: why opencode was chosen over crush, whose read-only needs a config.
       # No scoped Bash({test_command}) equivalent: the reviewer gets the test report.

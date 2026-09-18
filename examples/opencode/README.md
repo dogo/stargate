@@ -23,8 +23,14 @@ opencode emits **nothing** when stdout is a regular file. That is exactly what
 stargate's `core.py` `run_process()` supplies: an open trace file as stdout,
 with stderr merged into it. In the verified experiment,
 `opencode run ... > file 2>&1` produced zero bytes and had to be killed after
-300s; the same command piped (`2>&1 | tail`) completed normally. The wrapper's
-pipeline supplies the pipe that makes opencode produce output under stargate.
+300s; the same command piped (`2>&1 | tail`) completed normally.
+
+The wrapper supplies a FIFO (named pipe) in a private temporary directory.
+opencode writes into it as a background job; the wrapper filters the output,
+then uses `wait` to exit with opencode's own status. POSIX `sh` has no `pipefail`: a
+plain pipeline would report `tee`'s success even after an authentication or quota
+failure, preventing stargate from retrying. The FIFO and directory are removed
+on exit, including INT, TERM and HUP interrupts (SIGKILL cannot be trapped).
 
 This is a different reason from kiro's wrapper, which handles its
 `argv[0]`-relative sibling executable and the `> ` output marker.
@@ -56,11 +62,16 @@ verified results against opencode 1.18.31:
 select opencode through the wizard, also set `settings.probe_timeout_seconds`
 to `420` in the generated config; otherwise it inherits the flaky 120s default.
 
-## Known output limitation
+## Output filtering
 
-The wrapper strips ANSI escapes, the `> <agent> · <model>` header and tool
-marker lines (`→ Read`, `← Write`, `✱ Glob`). Tool **result** text such as
-`Wrote file successfully.` still passes through mid-output. This is harmless
+The wrapper strips ANSI escapes everywhere and the `> <agent> · <model>` header
+only on the first content line. Markdown blockquotes and bullets in the reply
+survive. Only lines beginning with the three observed tool markers followed by
+whitespace (`→ Read`, `← Write`, `✱ Glob`) are removed. Unknown future markers
+deliberately pass through rather than risk deleting real content.
+
+Tool **result** text such as `Wrote file successfully.` still passes through
+mid-output. This is harmless
 for verdict parsing: stargate's contract is the verdict on the **last** line,
 which is clean.
 
