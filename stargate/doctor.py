@@ -49,7 +49,7 @@ PROBE_CAPABILITIES = ("read", "write")
 # architect, where the final message goes, sandbox for the writers), and
 # guessing those would produce a config that runs and does the wrong thing.
 # Naming what is installed is the part that can be done without guessing --
-# `examples/` carries the four verified ones.
+# `examples/` carries the five verified ones.
 KNOWN_AGENT_CLIS = {
     "claude": "Claude Code (examples/claude)",
     "codex": "OpenAI Codex CLI (examples/codex)",
@@ -60,7 +60,7 @@ KNOWN_AGENT_CLIS = {
     "cursor-agent": "Cursor CLI",
     "gemini": "Gemini CLI (examples/gemini)",
     "goose": "Block Goose",
-    "opencode": "opencode",
+    "opencode": "opencode (examples/opencode)",
     "q": "Amazon Q Developer CLI",
     "qwen": "Qwen Code",
 }
@@ -73,6 +73,7 @@ KNOWN_AGENT_CLIS = {
 AGENT_CLI_WRAPPERS = {
     "claude-json-stargate": "claude",
     "kiro-stargate": "kiro-cli",
+    "opencode-stargate": "opencode",
 }
 
 

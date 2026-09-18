@@ -78,6 +78,22 @@ def test_packaged_vendor_blocks_stay_identical_to_the_verified_examples(root: Pa
     assert '"vendors.yaml"' in (ROOT / "pyproject.toml").read_text()
 
 
+def test_opencode_without_its_wrapper_cannot_produce_an_unrunnable_opencode_config(
+    root: Path,
+) -> None:
+    # Bare opencode is silent into stargate's regular trace file. Offering it
+    # without the wrapper would produce a config that hangs instead of answering.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="",
+                        env={"PATH": fake_bin(root, "opencode")})
+    assert proc.returncode == 0, proc.stdout
+    assert "opencode found" in proc.stdout, proc.stdout
+    assert "MISSING opencode-stargate" in proc.stdout, proc.stdout
+    assert "architect [" not in proc.stdout, proc.stdout
+    assert (root / "stargate/agents.yaml").read_bytes() == (
+        PACKAGE / "agents.yaml"
+    ).read_bytes(), proc.stdout
+
+
 def test_the_claude_reviewer_preserves_the_packaged_defaults_grant_verbatim(root: Path) -> None:
     vendors = yaml.safe_load((PACKAGE / "vendors.yaml").read_text())["vendors"]
     packaged = yaml.safe_load((PACKAGE / "agents.yaml").read_text())

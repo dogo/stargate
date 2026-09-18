@@ -1,0 +1,31 @@
+#!/bin/sh
+# opencode adapter for stargate. Verified against opencode 1.18.31.
+#
+# Three things this works around:
+#  1. opencode writes NOTHING when its stdout is a regular file, and that is
+#     exactly what stargate hands a command: run_process() passes an open trace
+#     file as stdout with stderr merged into it (core.py). Piping it -- which
+#     this script does by construction -- is what makes it emit anything at all.
+#  2. Its output is a session trace, not the final message: ANSI escapes, a
+#     "> <agent> - <model>" header and tool lines before the answer. stargate
+#     wants the reviewer's verdict as the exact last line, so those are stripped
+#     and the clean text is handed to {output}.
+#  3. Auth uses the AI SDK variable names: GOOGLE_GENERATIVE_AI_API_KEY, not
+#     GEMINI_API_KEY. This maps one to the other when only the latter is set.
+set -e
+out=$1; shift
+
+if [ -z "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] && [ -n "${GEMINI_API_KEY:-}" ]; then
+  GOOGLE_GENERATIVE_AI_API_KEY="$GEMINI_API_KEY"
+  export GOOGLE_GENERATIVE_AI_API_KEY
+fi
+
+NO_COLOR=1 opencode run "$@" 2>&1 \
+  | perl -CSD -0777 -pe '
+      s/\e\[[0-9;]*[a-zA-Z]//g;
+      s/^>\s.*\n//mg;
+      s/^[\x{2731}\x{2192}\x{2190}\x{22EE}\x{2022}\x{2713}\x{25CF}\x{2713}]\s.*\n//mg;
+      s/\A\s*\n//;
+      s/\s+\z/\n/;
+    ' \
+  | tee "$out"

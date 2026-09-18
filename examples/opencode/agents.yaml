@@ -1,0 +1,64 @@
+# stargate config driving every role with opencode through opencode-stargate.
+# Verified with read/write probes against opencode 1.18.31; see README.md.
+version: 5
+
+agents:
+  # opencode emits nothing when stdout is a regular file, exactly what core.py's
+  # run_process() supplies: an open trace file with stderr merged into it.
+  # `opencode run ... > file 2>&1` produced zero bytes and was killed after 300s;
+  # the same command piped (`2>&1 | tail`) completed. The wrapper supplies the
+  # pipe. This differs from kiro's argv[0]/sibling-binary and output-marker issues.
+  # {output} is the wrapper's first argument, like kiro's. Stargate appends the
+  # prompt last, where it becomes opencode's positional message.
+  # --file is an array option: NEVER end a command with it or it swallows the
+  # prompt. --model takes one value and is safe last.
+  # Name a current model explicitly: `opencode models` still lists Gemini 2.5,
+  # but Google rejects gemini-2.5-flash for new accounts; this model works.
+  # Auth uses GOOGLE_GENERATIVE_AI_API_KEY (Vercel AI SDK), not GEMINI_API_KEY;
+  # the wrapper maps the latter when only it is set.
+  # No usage_pattern: opencode reports no token usage in this mode.
+  # The wrapper strips ANSI, the "> <agent> · <model>" header and tool markers
+  # (→ Read, ← Write, ✱ Glob), but results (e.g. "Wrote file successfully.") remain
+  # mid-output. The last-line verdict is clean, which is the stargate contract.
+  # --agent plan is the built-in read-only agent (edit "*": deny), selectable
+  # by flag: why opencode was chosen over crush, whose read-only needs a config.
+  # No scoped Bash({test_command}) equivalent: the reviewer gets the test report.
+  opencode_reader:
+    command:
+      - opencode-stargate
+      - "{output}"
+      - --agent
+      - plan
+      - --model
+      - google/gemini-3.6-flash
+    probe: "Read the file {probe_file} and reply with its contents, nothing else."
+    probe_expect: read
+
+  # --agent build --auto auto-approves permissions that are not explicitly denied.
+  opencode_writer:
+    command:
+      - opencode-stargate
+      - "{output}"
+      - --agent
+      - build
+      - --auto
+      - --model
+      - google/gemini-3.6-flash
+    probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+    probe_expect: write
+
+workflow:
+  architect: opencode_reader
+  developer: opencode_writer
+  reviewer: opencode_reader
+  fixer: opencode_writer
+
+settings:
+  max_review_loops: 2
+  test_command: ""
+  test_command_detection: off
+  commit: true
+  agent_timeout_seconds: 600
+  # Trivial prompts took 22s to 153s: the 120s default flakes. At 420s, the
+  # opencode_reader (read) probe was OK in 138.6s, opencode_writer (write) in 111.2s.
+  probe_timeout_seconds: 420
