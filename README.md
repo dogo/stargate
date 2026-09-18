@@ -93,11 +93,11 @@ and the merged tree goes through review once as a whole.
 
 ### Agents
 
-**Claude Code**, **Codex CLI**, and **Kiro CLI** are validated integrations, not
-a closed list of supported agents. The packaged configuration uses Claude for
-the architect and reviewer and Codex for the developer and fixer; the
+**Claude Code**, **Codex CLI**, **Kiro CLI**, and **Gemini CLI** are validated
+integrations, not a closed list of supported agents. The packaged configuration
+uses Claude for the architect and reviewer and Codex for the developer and fixer; the
 [`examples/`](examples/) directory includes verified single-vendor
-configurations for all three CLIs and documents the differences between them
+configurations for all four CLIs and documents the differences between them
 (who needs `{output}`, who reports usage, who needs a wrapper). Anything with a
 non-interactive command prefix works — `stargate doctor --probe` tells you
 whether yours does, in one real call per agent.
@@ -161,9 +161,10 @@ developer [codex]: claude
 ```
 
 Only installed, verified command prefixes are offered: Claude Code (`claude`),
-Codex (`codex`), and Kiro through `kiro-stargate`. Finding `kiro-cli` alone is not
-enough: install the wrapper described in [examples/kiro](examples/kiro/) first
-(the supplied wrapper uses macOS paths). Other known CLIs may be reported as
+Codex (`codex`), Kiro through `kiro-stargate`, and Gemini (`gemini`). Finding
+`kiro-cli` alone is not enough: install the wrapper described in
+[examples/kiro](examples/kiro/) first (the supplied wrapper uses macOS paths).
+Other known CLIs may be reported as
 “detected, not configurable”; their vendor-specific flags cannot be guessed.
 Detection only checks PATH and never runs an agent or makes a billable probe.
 
@@ -1353,13 +1354,13 @@ workflow:
   reviewer: kiro_reviewer
 ```
 
-The mapping is vendor-agnostic: Claude, Codex, Kiro, or another compatible CLI
+The mapping is vendor-agnostic: Claude, Codex, Kiro, Gemini, or another compatible CLI
 can fill any role whose permission and output requirements it supports.
 
 ## Adding a different agent CLI
 
 The CLI names in `stargate/doctor.py` only support PATH detection; they do not
-compose commands. `stargate/vendors.yaml` packages the three verified vendor
+compose commands. `stargate/vendors.yaml` packages the four verified vendor
 blocks from `examples/` for `init-config`. Other CLIs still need a command
 prefix you configure and verify yourself. An agent is six YAML keys —
 `command`, `env`, `probe`, `probe_expect`, `usage_pattern`, and the `{output}` /
@@ -1385,9 +1386,9 @@ Points 2 through 4 only surface in a real run, so finish with one against a
 throwaway repository before trusting a new agent with your own.
 
 [`examples/`](examples/) has a folder per CLI — [claude](examples/claude/),
-[codex](examples/codex/), [kiro](examples/kiro/) — each running every role on
-that one vendor, with a table comparing how they map onto the knobs above and
-notes on which of the four problems each one actually hit.
+[codex](examples/codex/), [kiro](examples/kiro/), [gemini](examples/gemini/) — each
+running every role on that one vendor, with a table comparing how they map onto
+the knobs above and notes on which of the four problems each one actually hit.
 
 ## Why command prefixes instead of SDKs?
 

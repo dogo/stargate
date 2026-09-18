@@ -182,13 +182,14 @@ def test_generated_config_loads_through_normal_layering_without_running_agents(r
 
 
 def test_unverified_clis_are_reported_but_cannot_be_selected(root: Path) -> None:
+    # Gemini is now verified; Cursor remains detection-only.
     proc = stargate_tty(root, "init-config", config_home=root,
-                        answers="gemini\n0\n99\n\n\n\n\n",
-                        env={"PATH": fake_bin(root, "codex", "gemini")})
+                        answers="cursor-agent\n0\n99\n\n\n\n\n",
+                        env={"PATH": fake_bin(root, "codex", "cursor-agent")})
     assert proc.returncode == 0, proc.stdout
-    assert "not configurable by init-config: gemini" in proc.stdout, proc.stdout
+    assert "not configurable by init-config: cursor-agent" in proc.stdout, proc.stdout
     assert proc.stdout.count("Choose a listed number") == 3, proc.stdout
-    assert "1. gemini" not in proc.stdout, proc.stdout
+    assert "1. cursor-agent" not in proc.stdout, proc.stdout
     config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
     assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout
 
@@ -225,3 +226,32 @@ def test_interrupting_role_selection_preserves_existing_config_without_a_backup(
         assert init_config(PACKAGE, force=True) == 130
     assert target.read_text() == "hand edited\n"
     assert not list(target.parent.glob("*.bak"))
+
+
+def test_gemini_is_offered_and_fills_every_role_when_only_its_cli_is_installed(root: Path) -> None:
+    # Installing the verified executable must make both capabilities reachable.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="\n" * 4,
+                        env={"PATH": fake_bin(root, "gemini")})
+    assert proc.returncode == 0, proc.stdout
+    assert "gemini: Gemini CLI (examples/gemini)" in proc.stdout, proc.stdout
+    config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
+    assert config["workflow"] == dict(architect="gemini_reader", developer="gemini_writer",
+                                      reviewer="gemini_reader", fixer="gemini_writer"), proc.stdout
+    # Plan mode cannot run tests, so it must not get a separate reviewer grant.
+    assert set(config["agents"]) == {"gemini_reader", "gemini_writer"}, proc.stdout
+    for name, mode in (("gemini_reader", "plan"), ("gemini_writer", "auto_edit")):
+        assert config["agents"][name]["command"] == [
+            "gemini", "--output-format", "text", "--approval-mode", mode,
+            "--skip-trust", "--prompt",
+        ], proc.stdout
+
+
+def test_gemini_is_not_offered_when_its_executable_is_absent(root: Path) -> None:
+    # A catalog entry alone must not offer a config whose first run would fail.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="gemini\n\n\n\n\n",
+                        env={"PATH": fake_bin(root, "codex")})
+    assert proc.returncode == 0, proc.stdout
+    assert "gemini" not in proc.stdout, proc.stdout
+    assert "Choose a listed number" in proc.stdout, proc.stdout
+    config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
+    assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout

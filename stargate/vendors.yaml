@@ -107,3 +107,54 @@ vendors:
         # parse_usage strip it, so the budget counts hundredths of a credit --
         # set max_task_tokens in that same unit or leave it at 0.
         usage_pattern: 'Credits:\s+([\d.,]+)'
+  gemini:
+    description: Gemini CLI (examples/gemini)
+    agents:
+      # `gemini --output-format text` prints the answer on stdout, like `claude -p`.
+      # No {output} wrapper is needed. Text mode reports no token usage, so neither
+      # block has a usage_pattern, just like the Claude text-mode entries.
+      #
+      # --prompt takes the prompt as its VALUE and is not variadic. Keep it last:
+      # stargate appends the prompt immediately after it. These array options would
+      # swallow the appended prompt and must NEVER end a command: --policy,
+      # --admin-policy, --include-directories, --extensions, --allowed-tools,
+      # --allowed-mcp-server-names (the same trap as Claude's --disallowedTools).
+      #
+      # --skip-trust is required on BOTH blocks: a run's worktree is a fresh directory
+      # outside the repository, so it is never trusted. Without it Gemini prints
+      # `Approval mode overridden to "default" because the current folder is not trusted`
+      # and the writer silently loses its ability to edit.
+      #
+      # plan is read-only. Unlike Claude Code's --permission-mode plan, Gemini's plan
+      # mode answers on stdout instead of diverting the answer to a plan file.
+      # --allowed-tools is [DEPRECATED] in 0.60.0 and only bypasses confirmation;
+      # it restricts nothing and must not be used as a read-only mechanism.
+      # No reviewer_command: plan mode forbids shell execution, so there is no
+      # Bash({test_command}) grant like Claude's. The reviewer trusts the pasted
+      # test report because the vendor offers no narrower option.
+      gemini_reader:
+        command:
+          - gemini
+          - --output-format
+          - text
+          - --approval-mode
+          - plan
+          - --skip-trust
+          - --prompt
+        probe: "Read the file {probe_file} and reply with its contents, nothing else."
+        probe_expect: read
+
+      # auto_edit is the narrow mode: edit tools are auto-approved, everything else
+      # still prompts, and headless a prompt is a denial. Same reasoning as Claude's
+      # acceptEdits. Do not use yolo.
+      gemini_writer:
+        command:
+          - gemini
+          - --output-format
+          - text
+          - --approval-mode
+          - auto_edit
+          - --skip-trust
+          - --prompt
+        probe: "Create the file {probe_file} containing exactly OK, then reply OK."
+        probe_expect: write
