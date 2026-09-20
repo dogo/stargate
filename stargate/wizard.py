@@ -14,7 +14,7 @@ import yaml
 
 from .config import ROLES, user_config
 from .core import StargateError
-from .doctor import AGENT_CLI_WRAPPERS, available_agent_clis
+from .doctor import AGENT_CLI_WRAPPERS, WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP, available_agent_clis
 
 
 @dataclass(frozen=True)
@@ -47,9 +47,11 @@ def load_vendors(script_dir: Path) -> list[Vendor]:
 
 
 def vendor_installed(binary: str) -> bool:
-    # Known wrappers require the CLI they run, too. This deliberately covers
-    # kiro as well as opencode through the shared wrapper-to-executable map.
+    # Wrappers invoking their CLI bare need it on PATH; wrappers with their
+    # own lookup (Kiro's configured app-bundle path) do not.
     underlying = AGENT_CLI_WRAPPERS.get(binary)
+    if binary in WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP:
+        underlying = None
     return bool(shutil.which(binary)) and (underlying is None or bool(shutil.which(underlying)))
 
 

@@ -47,11 +47,17 @@ The config explicitly selects `google/gemini-3.6-flash`, which worked in the
 verified probes. `opencode models` still lists the Gemini 2.5 family, but
 Google rejects `gemini-2.5-flash` for new accounts.
 
-## It is slow
+## Latency depends on the provider's throttling
 
-Trivial prompts took **22s to 153s**, so the 120s default probe timeout flakes.
-This example sets `probe_timeout_seconds: 420`, the value used for these
-verified results against opencode 1.18.31:
+Observed round trips for trivial prompts range from about **12s to 153s**.
+The high end was measured while the Gemini free tier was throttling, with
+rate limiting and backoff. After the quota reset, a clean probe returned
+`opencode_reader OK [14.5s]` and `opencode_writer OK [12.1s]`.
+
+This example sets `probe_timeout_seconds: 420` as headroom for that throttling,
+which exceeded the 120s default, rather than as a claim about opencode's own
+speed. These verified results against opencode 1.18.31 used the raised timeout
+on the throttled tier:
 
 | Agent | Capability | Result | Time |
 |---|---|---|---|
@@ -60,7 +66,8 @@ verified results against opencode 1.18.31:
 
 `init-config` copies the agent blocks, **not** the example's settings. If you
 select opencode through the wizard, also set `settings.probe_timeout_seconds`
-to `420` in the generated config; otherwise it inherits the flaky 120s default.
+to `420` in the generated config; otherwise it inherits the 120s default, which
+can time out during free-tier throttling.
 
 ## Output filtering
 

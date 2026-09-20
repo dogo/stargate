@@ -76,6 +76,13 @@ AGENT_CLI_WRAPPERS = {
     "opencode-stargate": "opencode",
 }
 
+# Kiro resolves ${KIRO_BIN:-/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli}
+# itself: the app-bundle path avoids the Homebrew symlink breaking its sibling
+# executable lookup. Requiring kiro-cli on PATH would reject working installs.
+# The other wrappers invoke their CLI bare, so PATH is required by default;
+# add an exception here only when a wrapper carries its own CLI lookup.
+WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP = {"kiro-stargate"}
+
 
 def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
     """Known agent CLIs on PATH that this config does not use: (name, path, what).

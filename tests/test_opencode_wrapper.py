@@ -21,7 +21,7 @@ def run_wrapper(root: Path, script: str) -> tuple[subprocess.CompletedProcess[st
         text=True, capture_output=True, timeout=60,
     )
     assert not list(temporary.iterdir()), proc.stdout + proc.stderr
-    return proc, output.read_text()
+    return proc, output.read_text() if output.exists() else ""
 
 
 def test_a_failing_opencode_exits_nonzero_instead_of_answering_with_the_error(root: Path) -> None:

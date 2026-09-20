@@ -62,6 +62,8 @@ settings:
   test_command_detection: off
   commit: true
   agent_timeout_seconds: 600
-  # Trivial prompts took 22s to 153s: the 120s default flakes. At 420s, the
+  # Trivial prompts took about 12s to 153s; the high end coincided with Gemini
+  # free-tier throttling and backoff, not opencode's own speed. 420s provides
+  # headroom for that throttling beyond the 120s default. At 420s, the
   # opencode_reader (read) probe was OK in 138.6s, opencode_writer (write) in 111.2s.
   probe_timeout_seconds: 420
