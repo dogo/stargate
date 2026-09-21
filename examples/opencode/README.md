@@ -8,7 +8,8 @@ stargate --config examples/opencode/agents.yaml doctor --probe
 stargate --config examples/opencode/agents.yaml run "your task"
 ```
 
-The wrapper and `opencode` must both be on PATH. Stargate passes `{output}` as
+The wrapper, `opencode` and `python3` must be on PATH. Python is already a
+stargate dependency; no `jq` installation is needed. Stargate passes `{output}` as
 the wrapper's first argument and appends the prompt last, where it becomes
 opencode's positional message. The reader uses `--agent plan`, the built-in
 read-only agent (`edit "*": deny`). That flag-selectable read-only mode is why
@@ -23,15 +24,16 @@ opencode emits **nothing** when stdout is a regular file. That is exactly what
 stargate's `core.py` `run_process()` supplies: an open trace file as stdout,
 with stderr merged into it. In the verified experiment,
 `opencode run ... > file 2>&1` produced zero bytes and had to be killed after
-300s; the same command piped (`2>&1 | tail`) completed normally.
+300s; the same command piped (`2>&1 | tail`) completed normally. This defect is
+independent of the output format, so JSON mode still needs the FIFO.
 
 The wrapper supplies a FIFO (named pipe) in a private temporary directory.
 opencode writes into it as a background job; the wrapper filters the output,
 then uses `wait` to preserve opencode's own failure status. If opencode succeeds,
-an output-write failure from `tee` still makes the wrapper exit nonzero.
-POSIX `sh` has no `pipefail`: a
-plain pipeline would report `tee`'s success even after an authentication or quota
-failure, preventing stargate from retrying. On normal exit and on INT, TERM and
+a failure in the Python reader (including writing the answer) still makes the
+wrapper exit nonzero. POSIX `sh` has no `pipefail`: a plain pipeline would report
+only the reader's status even after an authentication or quota failure,
+preventing stargate from retrying. On normal exit and on INT, TERM and
 HUP, the wrapper reaps opencode, stopping it if necessary, and removes the FIFO
 and directory. When the wrapper leads its process group (as it does under
 stargate's `run_process()`), cleanup also sends TERM to that group to stop
@@ -68,8 +70,9 @@ rate limiting and backoff. After the quota reset, a clean probe returned
 
 This example sets `probe_timeout_seconds: 420` as headroom for that throttling,
 which exceeded the 120s default, rather than as a claim about opencode's own
-speed. These verified results against opencode 1.18.31 used the raised timeout
-on the throttled tier:
+speed. The example keeps the packaged **1800s** work timeout and only raises
+the probe timeout. These verified results against opencode 1.18.31 used the
+raised timeout on the throttled tier:
 
 | Agent | Capability | Result | Time |
 |---|---|---|---|
@@ -99,20 +102,35 @@ settings:
 This gives throttled probes more time before the timeout path where the wrapper
 cannot clean up opencode.
 
-## Output filtering
+## Output
 
-The wrapper strips ANSI escapes everywhere and the `> <agent> · <model>` header
-only on the first content line. Markdown blockquotes and bullets in the reply
-survive. Only lines beginning with the three observed tool markers followed by
-whitespace (`→ Read`, `← Write`, `✱ Glob`) are removed. Unknown future markers
-deliberately pass through rather than risk deleting real content.
+Both agent commands supply `--format json`, which the wrapper requires. Update
+or reinstall the wrapper and config together. The adapter consumes opencode's
+newline-delimited JSON event stream and writes the latest assistant response
+to `{output}` and stdout. This event
+shape was verified with opencode 1.18.31:
+text is in `part.text` when `part.type` is `text`; tool use has its own event
+type, so tool results never reach the answer file. When valid text follows a
+tool event, it replaces earlier narration, preventing that narration from
+prefixing a JSON review. A trailing tool event preserves the preceding answer.
+If a text part is re-emitted
+as it grows, the reader keeps the last value for its `part.id`, concatenating
+the remaining parts in first-appearance order. Text parts without a string ID
+share one fallback key and are treated as a single growing part.
 
-Tool **result** text such as `Wrote file successfully.` still passes through
-mid-output. This is harmless
-for verdict parsing: stargate's contract is the verdict on the **last** line,
-which is clean.
+Lines that are not JSON objects go to stderr, which stargate includes in its
+run trace, rather than into the answer. Input and output use UTF-8 regardless
+of the locale; undecodable diagnostic bytes are escaped on stderr and skipped.
+Other event types are ignored. If no
+text parts arrive (for example, a custom config omits `--format json`), the
+answer is empty and stargate reports that the agent declares `{output}` but
+wrote nothing.
 
 ## What this config gives up
+
+`--agent build --auto` auto-approves permissions that are not explicitly denied,
+including shell execution inside the run's worktree. This is broader than
+Claude's `acceptEdits` and Gemini's `auto_edit`, which auto-approve edits only.
 
 opencode reports no token usage in this mode, so there is no `usage_pattern`
 and `max_task_tokens` never fires for an all-opencode run.

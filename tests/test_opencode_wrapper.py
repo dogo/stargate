@@ -1,6 +1,7 @@
 """The opencode wrapper's failure signalling, output filtering and surviving processes."""
 from __future__ import annotations
 
+import json
 import os
 import signal as signals
 import subprocess
@@ -8,23 +9,31 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
+from stargate.stages import parse_review
 from tests.harness import ROOT, fake_bin
 
 
-def run_wrapper(root: Path, script: str) -> tuple[subprocess.CompletedProcess[str], str]:
+def _event(part_id: str, text: str) -> str:
+    return json.dumps({"type": "text", "part": {"type": "text", "id": part_id, "text": text}})
+
+
+def run_wrapper(
+    root: Path, script: str, *, env: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str]:
     bindir = Path(fake_bin(root, "opencode"))
     (bindir / "opencode").write_text("#!/bin/sh\n" + script + "\n")
     temporary = root / "tmp"
     temporary.mkdir()
     output = root / "answer.txt"
     proc = subprocess.run(
-        [str(ROOT / "examples/opencode/opencode-stargate"), str(output), "--agent", "plan", "p"],
+        [str(ROOT / "examples/opencode/opencode-stargate"), str(output),
+         "--agent", "plan", "--format", "json", "p"],
         env={"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "HOME": str(root),
-             "TMPDIR": str(temporary)},
-        text=True, capture_output=True, timeout=60,
+             "TMPDIR": str(temporary), **(env or {})},
+        text=True, encoding="utf-8", capture_output=True, timeout=60,
     )
     assert not list(temporary.iterdir()), proc.stdout + proc.stderr
-    return proc, output.read_text() if output.is_file() else ""
+    return proc, output.read_text(encoding="utf-8") if output.is_file() else ""
 
 
 def test_an_unwritable_answer_cannot_turn_a_successful_request_into_success(root: Path) -> None:
@@ -33,49 +42,163 @@ def test_an_unwritable_answer_cannot_turn_a_successful_request_into_success(root
         case.mkdir()
         # A directory fails writes even when the suite runs as root.
         (case / "answer.txt").mkdir()
-        proc, _ = run_wrapper(case, f'echo reply; exit {status}')
+        proc, _ = run_wrapper(case, f"cat <<'EOF'\n{_event('reply', 'reply')}\nEOF\nexit {status}")
         assert proc.returncode != 0, proc.stdout + proc.stderr
         if status:
             assert proc.returncode == status, proc.stdout + proc.stderr
 
 
-def test_a_failing_opencode_exits_nonzero_instead_of_answering_with_the_error(root: Path) -> None:
+def test_a_failing_opencode_exits_nonzero_and_keeps_its_diagnostic_out_of_the_answer(
+    root: Path,
+) -> None:
     proc, answer = run_wrapper(root, 'echo "authentication failed" >&2; exit 17')
     assert proc.returncode == 17, proc.stdout + proc.stderr
-    assert "authentication failed" in answer, proc.stdout + proc.stderr
+    assert "authentication failed" in proc.stderr, proc.stdout + proc.stderr
+    assert (root / "answer.txt").is_file(), proc.stdout + proc.stderr
+    assert answer == "", proc.stdout + proc.stderr
 
 
-def test_a_blockquote_and_a_bullet_in_the_reply_survive_the_filter(root: Path) -> None:
+def test_markdown_in_the_reply_reaches_the_answer_untouched(root: Path) -> None:
+    reply = (
+        "> plan · google/gemini-3.6-flash\n> quoted text from the diff\n• a bullet\n"
+        "✱ Glob *.py\n→ Read AGENTS.md\n← Write impl.txt\n"
+        "✓ checked\n● another bullet\n⋮ ordinary prose\n◆ a future marker\n"
+        "\x1b[32mVERDICT: APPROVED\x1b[0m\n"
+    )
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{_event('reply', reply)}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == reply, proc.stdout + proc.stderr
+    assert proc.stdout == answer, proc.stdout + proc.stderr
+
+
+def test_a_tool_result_before_the_final_answer_cannot_push_a_json_review_off_the_first_line(
+    root: Path,
+) -> None:
+    review = json.dumps({"verdict": "APPROVED", "findings": []})
+    tool = json.dumps({"type": "tool_use", "part": {
+        "id": "tool", "type": "tool", "state": {"output": "Wrote file successfully."},
+    }})
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{tool}\n{_event('reply', review)}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == review + "\n", proc.stdout + proc.stderr
+    assert answer.startswith("{"), proc.stdout + proc.stderr
+    assert parse_review(answer) == ("APPROVED", [], "json"), answer
+
+
+def test_pre_tool_narration_cannot_prefix_the_final_json_review(root: Path) -> None:
+    review = json.dumps({"verdict": "APPROVED", "findings": []})
+    events = "\n".join([
+        _event("first", "Let me read the file first."),
+        '{"type": "tool_use", "part": {"type": "tool"}}',
+        _event("second", "Let me check one more file."),
+        '{"type": "tool_use", "part": {"type": "tool"}}',
+        _event("first", review[:10]),
+        _event("last", review[10:]),
+        _event("first", review[:10]),
+    ])
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{events}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == review + "\n", proc.stdout + proc.stderr
+    assert proc.stdout == answer, proc.stdout + proc.stderr
+    assert parse_review(answer) == ("APPROVED", [], "json"), answer
+
+
+def test_a_tool_event_after_the_final_answer_does_not_empty_the_output(root: Path) -> None:
+    review = json.dumps({"verdict": "APPROVED", "findings": []})
+    events = "\n".join([
+        _event("reply", review),
+        '{"type": "tool_use", "part": {"type": "tool"}}',
+        '{"part": {"type": "tool"}}',
+        '{"part": {"type": "text", "text": null}}',
+        '{"type": "step_finish"}',
+    ])
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{events}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == review + "\n", proc.stdout + proc.stderr
+    assert proc.stdout == answer, proc.stdout + proc.stderr
+    assert parse_review(answer) == ("APPROVED", [], "json"), answer
+
+
+def test_growing_text_without_a_string_id_does_not_duplicate_the_json_review(root: Path) -> None:
+    review = json.dumps({"verdict": "APPROVED", "findings": []})
+    for index, fields in enumerate(({}, {"id": None}, {"id": 42}, {"id": []})):
+        case = root / str(index)
+        case.mkdir()
+        events = "\n".join(
+            json.dumps({"part": {"type": "text", "text": text, **fields}})
+            for text in (review[:10], review)
+        )
+        proc, answer = run_wrapper(case, f"cat <<'EOF'\n{events}\nEOF")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert answer == review + "\n", proc.stdout + proc.stderr
+        assert parse_review(answer) == ("APPROVED", [], "json"), answer
+
+
+def test_invalid_diagnostic_bytes_preserve_utf8_answers_and_the_request_exit_status(
+    root: Path,
+) -> None:
+    reply = "Revisão ✓"
+    # Literal UTF-8 tests input decoding as well as output under an ASCII locale.
+    event = json.dumps(json.loads(_event("reply", reply)), ensure_ascii=False)
+    for status in (0, 17):
+        case = root / str(status)
+        case.mkdir()
+        script = (
+            "printf 'invalid \\377 diagnostic\\n' >&2\n"
+            # Exceed pipe buffering: a reader that dies early interrupts the writer.
+            "i=0; while [ $i -lt 4096 ]; do echo '{}'; i=$((i + 1)); done\n"
+            f"cat <<'EOF'\n{event}\nEOF\nexit {status}"
+        )
+        proc, answer = run_wrapper(case, script, env={
+            "LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0",
+            "PYTHONIOENCODING": "ascii:strict",
+        })
+        assert proc.returncode == status, proc.stdout + proc.stderr
+        assert answer == reply + "\n", proc.stdout + proc.stderr
+        assert proc.stdout == answer, proc.stdout + proc.stderr
+        assert "invalid \\xff diagnostic" in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_a_text_part_reemitted_as_it_grows_is_not_duplicated_in_the_answer(root: Path) -> None:
+    events = "\n".join([
+        _event("first", "VERD"), _event("second", ": APPROVED"), _event("first", "VERDICT"),
+    ])
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{events}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == "VERDICT: APPROVED\n", proc.stdout + proc.stderr
+
+
+def test_a_stray_non_json_line_does_not_crash_the_wrapper_or_reach_the_answer(root: Path) -> None:
+    events = "\n".join([
+        _event("first", "VERDICT"), "stray diagnostic", "[]", "null", '"string"', "42",
+        '{"part": null}', '{"part": {"type": "text", "text": 42}}',
+        _event("second", ": APPROVED"),
+    ])
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{events}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == "VERDICT: APPROVED\n", proc.stdout + proc.stderr
+    for diagnostic in ("stray diagnostic", "[]", "null", '"string"', "42"):
+        assert diagnostic in proc.stderr, proc.stdout + proc.stderr
+
+
+def test_a_stream_without_assistant_text_leaves_an_empty_answer_for_stargate_to_reject(
+    root: Path,
+) -> None:
     proc, answer = run_wrapper(root, """cat <<'EOF'
-
-> plan · google/gemini-3.6-flash
-→ Read AGENTS.md
-← Write impl.txt
-✱ Glob *.py
-
-> quoted text from the diff
-• a bullet
-✓ checked
-● another bullet
-⋮ ordinary prose
-◆ a future marker
-\x1b[32mVERDICT: APPROVED\x1b[0m
+{"type": "step_start", "part": {"type": "step-start"}}
+{"type": "tool_use", "part": {"type": "tool", "text": "Wrote file successfully."}}
+{"type": "step_finish", "part": {"type": "step-finish"}}
 EOF""")
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert answer == (
-        "> quoted text from the diff\n• a bullet\n✓ checked\n● another bullet\n"
-        "⋮ ordinary prose\n◆ a future marker\nVERDICT: APPROVED\n"
-    ), proc.stdout + proc.stderr
-
-
-def test_a_reply_starting_with_a_blockquote_is_not_mistaken_for_a_header(root: Path) -> None:
-    proc, answer = run_wrapper(root, 'echo "> quoted text"; echo done')
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert answer == "> quoted text\ndone\n", proc.stdout + proc.stderr
+    assert answer == "", proc.stdout + proc.stderr
+    assert (root / "answer.txt").is_file(), proc.stdout + proc.stderr
+    assert proc.stdout == "", proc.stdout + proc.stderr
 
 
 def test_opencode_is_still_handed_a_pipe_and_not_a_regular_file(root: Path) -> None:
-    proc, answer = run_wrapper(root, '[ -p /dev/stdout ] || echo REGULAR-FILE; echo done')
+    proc, answer = run_wrapper(root, """[ -p /dev/stdout ] && msg=done || msg=REGULAR-FILE
+printf '{"part":{"type":"text","id":"reply","text":"%s"}}\n' "$msg"
+""")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert answer == "done\n", proc.stdout + proc.stderr
 

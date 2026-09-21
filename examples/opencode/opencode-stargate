@@ -1,20 +1,22 @@
 #!/bin/sh
 # opencode adapter for stargate. Verified against opencode 1.18.31.
+# Callers must supply --format json (as both shipped agent commands do).
 #
 # Five things this works around:
 #  1. opencode writes NOTHING when its stdout is a regular file, and that is
 #     exactly what stargate hands a command: run_process() passes an open trace
 #     file as stdout with stderr merged into it (core.py). Piping it -- which
-#     this script does by construction -- is what makes it emit anything at all.
-#  2. Its output is a session trace, not the final message: ANSI escapes, a
-#     "> <agent> · <model>" header and tool lines before the answer. stargate
-#     wants the reviewer's verdict as the exact last line, so those are stripped
-#     and the clean text is handed to {output}.
+#     this script does by construction -- is what makes it emit anything at all,
+#     independently of the output format.
+#  2. The JSON event stream contains tool events as well as assistant text.
+#     Text following a tool replaces interim narration, with the last value
+#     of each part; a trailing tool preserves the latest assistant response.
 #  3. Auth uses the AI SDK variable names: GOOGLE_GENERATIVE_AI_API_KEY, not
 #     GEMINI_API_KEY. This maps one to the other when only the latter is set.
 #  4. POSIX sh reports only the last pipeline command's status. A FIFO lets
 #     opencode write into a pipe while wait preserves its failure for retries.
-#  5. A trapped exit must stop and reap the background opencode request.
+#  5. Every exit path must stop and reap the background opencode request so it
+#     cannot keep running and billing after the wrapper exits.
 set -e
 out=$1; shift
 
@@ -50,23 +52,66 @@ trap 'exit 143' TERM
 trap 'exit 129' HUP
 mkfifo "$tmp/trace"
 
+# Prevent colour inside JSON text values; the reader does not strip it.
 NO_COLOR=1 opencode run "$@" </dev/null >"$tmp/trace" 2>&1 &
 pid=$!
 
-# Only remove the first content line when it has the session header shape.
-# These three tool markers were observed in 1.18.31. Unknown future markers
-# deliberately pass through rather than risk deleting ordinary prose.
+# python3, not jq: stargate requires Python, so the user already has that
+# dependency; jq is not guaranteed to be installed.
 # Background the filter so wait can run signal traps immediately; a foreground
 # pipeline would defer cleanup until the very request we must stop finishes.
-perl -CSD -0777 -pe '
-      s/\e\[[0-9;]*[a-zA-Z]//g;
-      s/\A\s*\n//;
-      s/\A>[ \t]+\S+[ \t]+\x{00B7}[ \t]+[^\n]+(?:\n|\z)//;
-      s/^[\x{2731}\x{2192}\x{2190}][ \t]+[^\n]*(?:\n|\z)//mg;
-      s/\A\s*\n//;
-      s/\s+\z/\n/;
-    ' <"$tmp/trace" \
-  | tee "$out" &
+python3 -u -c '
+import json
+import sys
+
+# JSON is UTF-8 regardless of the locale. Decode inside the guard so stray
+# tool diagnostic bytes cannot stop the drain and give opencode SIGPIPE.
+sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
+parts = {}
+tool_seen = False
+missing_id = object()
+for raw_line in sys.stdin.buffer:
+    try:
+        line = raw_line.decode("utf-8")
+        event = json.loads(line)
+    except (ValueError, RecursionError):
+        sys.stderr.write(raw_line.decode("utf-8", errors="backslashreplace"))
+        continue
+    if not isinstance(event, dict):
+        sys.stderr.write(line)
+        continue
+    part = event.get("part")
+    # Replace interim narration only when a subsequent response arrives:
+    # a trailing tool must not discard the only assistant answer we have.
+    if event.get("type") == "tool_use" or (
+        isinstance(part, dict) and part.get("type") == "tool"
+    ):
+        tool_seen = True
+        continue
+    if not isinstance(part, dict) or part.get("type") != "text":
+        continue
+    if not isinstance(part.get("text"), str):
+        continue
+    if tool_seen:
+        parts.clear()
+        tool_seen = False
+    part_id = part.get("id")
+    if not isinstance(part_id, str):
+        # Without usable IDs, treat text as one growing part to avoid duplication.
+        part_id = missing_id
+    # Replacing a growing part preserves its first-appearance order.
+    parts[part_id] = part["text"]
+
+# Drain the FIFO before opening the answer: a write failure must not cause
+# SIGPIPE in opencode and hide its own failure status.
+answer = "".join(parts.values()).rstrip()
+if answer:
+    answer += "\n"
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    output.write(answer)
+sys.stdout.write(answer)
+' "$out" <"$tmp/trace" &
 filter=$!
 filter_status=0
 wait "$filter" 2>/dev/null || filter_status=$?
@@ -75,7 +120,7 @@ status=0
 wait "$pid" || status=$?
 # Reaped: the kernel may reuse its PID, so cleanup must no longer signal it.
 pid=
-# A successful request still failed if tee could not write the answer artifact.
+# A successful request still failed if the reader could not write the answer.
 if [ "$status" -eq 0 ]; then
   status=$filter_status
 fi

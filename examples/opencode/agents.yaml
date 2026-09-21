@@ -18,11 +18,8 @@ agents:
   # the wrapper maps the latter when only it is set.
   # No usage_pattern: opencode reports no token usage in this mode.
   # The wrapper preserves opencode's exit status through a FIFO and wait.
-  # It strips ANSI, the "> <agent> · <model>" header only on the first content
-  # line, and only the observed → / ← / ✱ tool marker lines. Blockquotes,
-  # bullets and unknown future markers survive to avoid deleting real content.
-  # Results (e.g. "Wrote file successfully.") remain mid-output.
-  # The last-line verdict is clean, which is the stargate contract.
+  # --format json separates tool events from assistant text. The wrapper
+  # writes only text parts to {output}, keeping the last value of each id.
   # --agent plan is the built-in read-only agent (edit "*": deny), selectable
   # by flag: why opencode was chosen over crush, whose read-only needs a config.
   # No scoped Bash({test_command}) equivalent: the reviewer gets the test report.
@@ -32,6 +29,8 @@ agents:
       - "{output}"
       - --agent
       - plan
+      - --format
+      - json
       - --model
       - google/gemini-3.6-flash
     probe: "Read the file {probe_file} and reply with its contents, nothing else."
@@ -45,6 +44,8 @@ agents:
       - --agent
       - build
       - --auto
+      - --format
+      - json
       - --model
       - google/gemini-3.6-flash
     probe: "Create the file {probe_file} containing exactly OK, then reply OK."
@@ -59,9 +60,8 @@ workflow:
 settings:
   max_review_loops: 2
   test_command: ""
-  test_command_detection: off
+  test_command_detection: "off"
   commit: true
-  agent_timeout_seconds: 600
   # Trivial prompts took about 12s to 153s; the high end coincided with Gemini
   # free-tier throttling and backoff, not opencode's own speed. 420s provides
   # headroom for that throttling beyond the 120s default. At 420s, the
