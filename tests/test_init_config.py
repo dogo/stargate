@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import yaml
 
+from stargate.detect import detection_mode
 from stargate.wizard import init_config
 from tests.harness import ROOT, fake_bin, make_repo, stargate, stargate_tty
 
@@ -76,6 +77,22 @@ def test_packaged_vendor_blocks_stay_identical_to_the_verified_examples(root: Pa
     for name, path in examples.items():
         assert vendors[name]["agents"] == yaml.safe_load(path.read_text())["agents"], name
     assert '"vendors.yaml"' in (ROOT / "pyproject.toml").read_text()
+
+
+def test_an_example_disabling_detection_is_not_read_back_as_the_report_default(
+    root: Path,
+) -> None:
+    # Bare off is a YAML boolean: detection_mode silently turns False into
+    # report, so the example would still report a guessed test command.
+    kiro = yaml.safe_load((ROOT / "examples/kiro/agents.yaml").read_text())
+    assert detection_mode(kiro) == "off", kiro["settings"]
+    for path in sorted((ROOT / "examples").glob("*/agents.yaml")):
+        configured = yaml.safe_load(path.read_text()).get("settings", {}).get(
+            "test_command_detection"
+        )
+        if configured is None:
+            continue
+        assert isinstance(configured, str), f"{path}: {configured!r}"
 
 
 def test_opencode_without_its_wrapper_cannot_produce_an_unrunnable_opencode_config(

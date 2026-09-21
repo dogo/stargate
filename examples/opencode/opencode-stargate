@@ -8,9 +8,10 @@
 #     file as stdout with stderr merged into it (core.py). Piping it -- which
 #     this script does by construction -- is what makes it emit anything at all,
 #     independently of the output format.
-#  2. The JSON event stream contains tool events as well as assistant text.
-#     Text following a tool replaces interim narration, with the last value
-#     of each part; a trailing tool preserves the latest assistant response.
+#  2. --format json gives tool use its OWN event type, so tool result text can
+#     never reach {output} at all. That separation is why this wrapper requires
+#     the flag. Among the text events, the answer is the text following the
+#     last tool use; earlier text is interim narration (see the reader below).
 #  3. Auth uses the AI SDK variable names: GOOGLE_GENERATIVE_AI_API_KEY, not
 #     GEMINI_API_KEY. This maps one to the other when only the latter is set.
 #  4. POSIX sh reports only the last pipeline command's status. A FIFO lets
@@ -82,8 +83,8 @@ for raw_line in sys.stdin.buffer:
         sys.stderr.write(line)
         continue
     part = event.get("part")
-    # Replace interim narration only when a subsequent response arrives:
-    # a trailing tool must not discard the only assistant answer we have.
+    # Tool use is a separate event type, so its result text is never an answer.
+    # Record only that the assistant went back to work.
     if event.get("type") == "tool_use" or (
         isinstance(part, dict) and part.get("type") == "tool"
     ):
@@ -93,12 +94,24 @@ for raw_line in sys.stdin.buffer:
         continue
     if not isinstance(part.get("text"), str):
         continue
+    # The answer is the text following the LAST tool use. Anything said before
+    # reading a file ("Let me read the file first.") is interim narration, and
+    # concatenating it would put prose ahead of a JSON review, which
+    # parse_review() in stages.py rejects -- the P1 this reader exists to fix.
+    # The clear fires HERE, on the arrival of a later text part, never on the
+    # tool event: a trailing tool must leave the only answer we have intact.
     if tool_seen:
         parts.clear()
         tool_seen = False
     part_id = part.get("id")
     if not isinstance(part_id, str):
-        # Without usable IDs, treat text as one growing part to avoid duplication.
+        # No usable id: one shared key, last value wins. Without ids, a part
+        # re-emitted as it grows ("VERD" then "VERDICT: APPROVED") and two
+        # genuinely distinct parts are indistinguishable, so one of the two
+        # must lose. Unique keys would concatenate the growing part into
+        # "VERDVERDICT: APPROVED" and break parse_review() unpredictably;
+        # collapsing loses at most the earlier part, which is bounded.
+        # opencode 1.18.31 sends ids in practice, so this path is defensive only.
         part_id = missing_id
     # Replacing a growing part preserves its first-appearance order.
     parts[part_id] = part["text"]

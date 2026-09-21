@@ -119,6 +119,22 @@ def test_a_tool_event_after_the_final_answer_does_not_empty_the_output(root: Pat
     assert parse_review(answer) == ("APPROVED", [], "json"), answer
 
 
+def test_text_after_the_last_tool_use_wins_over_an_earlier_complete_answer(root: Path) -> None:
+    # With a tool call between two text parts, a superseded draft and a closing
+    # remark are indistinguishable. Later text wins by design: preserving the
+    # earlier text would let interim narration break a final JSON review.
+    review = json.dumps({"verdict": "APPROVED", "findings": []})
+    events = "\n".join([
+        _event("first", review),
+        '{"type": "tool_use", "part": {"type": "tool"}}',
+        _event("second", "Let me know if you want more detail."),
+    ])
+    proc, answer = run_wrapper(root, f"cat <<'EOF'\n{events}\nEOF")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert answer == "Let me know if you want more detail.\n", proc.stdout + proc.stderr
+    assert proc.stdout == answer, proc.stdout + proc.stderr
+
+
 def test_growing_text_without_a_string_id_does_not_duplicate_the_json_review(root: Path) -> None:
     review = json.dumps({"verdict": "APPROVED", "findings": []})
     for index, fields in enumerate(({}, {"id": None}, {"id": 42}, {"id": []})):
@@ -197,7 +213,7 @@ EOF""")
 
 def test_opencode_is_still_handed_a_pipe_and_not_a_regular_file(root: Path) -> None:
     proc, answer = run_wrapper(root, """[ -p /dev/stdout ] && msg=done || msg=REGULAR-FILE
-printf '{"part":{"type":"text","id":"reply","text":"%s"}}\n' "$msg"
+printf '{"part":{"type":"text","id":"reply","text":"%s"}}\\n' "$msg"
 """)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert answer == "done\n", proc.stdout + proc.stderr
