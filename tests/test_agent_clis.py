@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 from stargate.doctor import available_agent_clis
 from tests.harness import doctor, fake_bin, make_repo, write_config
@@ -85,3 +88,68 @@ def test_doctor_reports_the_unused_clis_below_the_binary_report(root: Path) -> N
     assert header in proc.stdout, proc.stdout
     assert f"gemini       {bindir}/gemini  -- Gemini CLI" in proc.stdout, proc.stdout
     assert proc.stdout.index(header) > proc.stdout.rindex("FOUND    "), proc.stdout
+
+
+def _wrapper_only_path(root: Path, wrapper: str) -> str:
+    bindir = fake_bin(root, wrapper)
+    git = shutil.which("git")
+    assert git is not None, "the integration tests require git"
+    (Path(bindir) / "git").symlink_to(git)
+    return bindir
+
+
+def test_a_wrapper_on_path_does_not_hide_the_missing_cli_it_runs(root: Path) -> None:
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    cfg = yaml.safe_load(config.read_text())
+    bindir = _wrapper_only_path(root, "claude-json-stargate")
+    # Both a bare command and an absolute wrapper path imply the CLI dependency.
+    for head in ("claude-json-stargate", str(Path(bindir) / "claude-json-stargate")):
+        cfg["agents"]["noop"]["command"] = [head, "--print"]
+        config.write_text(yaml.safe_dump(cfg))
+        proc = doctor(repo, config, env={"PATH": bindir})
+
+        assert proc.returncode == 1, proc.stdout
+        assert any(
+            line.split()[:2] == ["MISSING", "claude"]
+            and "required by claude-json-stargate" in line
+            for line in proc.stdout.splitlines()
+        ), proc.stdout
+        assert any(
+            line.split()[:2] == ["FOUND", head] for line in proc.stdout.splitlines()
+        ), proc.stdout
+
+
+def test_a_direct_cli_requirement_is_not_attributed_only_to_a_wrapper(root: Path) -> None:
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    cfg = yaml.safe_load(config.read_text())
+    cfg["agents"]["noop"]["command"] = ["claude-json-stargate"]
+    cfg["agents"]["direct"] = {"command": ["claude"]}
+    cfg["workflow"]["developer"] = "direct"
+    config.write_text(yaml.safe_dump(cfg))
+    bindir = _wrapper_only_path(root, "claude-json-stargate")
+    proc = doctor(repo, config, env={"PATH": bindir})
+
+    assert proc.returncode == 1, proc.stdout
+    assert any(
+        line.split()[:2] == ["MISSING", "claude"]
+        and "configured directly; also required by claude-json-stargate" in line
+        for line in proc.stdout.splitlines()
+    ), proc.stdout
+
+
+def test_a_wrapper_that_resolves_its_own_cli_is_not_required_on_path(root: Path) -> None:
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    cfg = yaml.safe_load(config.read_text())
+    cfg["agents"]["noop"]["command"] = ["kiro-stargate"]
+    config.write_text(yaml.safe_dump(cfg))
+    bindir = _wrapper_only_path(root, "kiro-stargate")
+    proc = doctor(repo, config, env={"PATH": bindir})
+
+    assert proc.returncode == 0, proc.stdout
+    assert "kiro-cli" not in proc.stdout, proc.stdout

@@ -35,7 +35,7 @@ from .config import (
     token_cap,
     value_source,
 )
-from .core import StargateError
+from .core import StargateError, run_process
 from .detect import detection_mode, selected_test_command
 
 PROBE_TIMEOUT_DEFAULT = 120
@@ -74,6 +74,13 @@ AGENT_CLI_WRAPPERS = {
     "claude-json-stargate": "claude",
     "kiro-stargate": "kiro-cli",
 }
+
+# Kiro resolves ${KIRO_BIN:-/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli}
+# itself: the app-bundle path avoids the Homebrew symlink breaking its sibling
+# executable lookup. Requiring kiro-cli on PATH would reject working installs.
+# The other wrappers invoke their CLI bare, so PATH is required by default;
+# add an exception here only when a wrapper carries its own CLI lookup.
+WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP = {"kiro-stargate"}
 
 
 def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
@@ -148,17 +155,21 @@ def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
     writes_final = any("{output}" in part for part in command)
     cmd = [part.replace("{output}", str(output)) for part in command]
     cmd = expand_test_command(cmd, test_command)
+    # Only the runner's log_path branch kills the whole process group on timeout:
+    # a direct-child kill can leave a spawned agent running and billing.
     try:
-        proc = subprocess.run(
-            [*cmd, prompt], cwd=cwd, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, timeout=timeout,
-            env=env,
+        proc = run_process(
+            [*cmd, prompt], cwd, check=False, timeout=timeout,
+            log_path=output.with_suffix(".log"), env=env,
+            timeout_is_error=False, display_args=cmd,
         )
-    except subprocess.TimeoutExpired:
-        return f"probe timed out after {timeout}s"
-    except OSError as exc:
+    except (StargateError, OSError) as exc:
         return str(exc)
 
+    # The shared runner uses 124 for timeouts; an agent exiting 124 is also
+    # reported as a timeout.
+    if proc.returncode == 124:
+        return f"probe timed out after {timeout}s"
     if proc.returncode:
         return proc.stdout.strip() or f"agent exited with status {proc.returncode}"
     # Exit 0 while writing nothing to {output} is the false positive this flag
@@ -308,13 +319,24 @@ def doctor(
     for source in sources:
         for command in source["commands"]:
             binaries.add(command[0])
+    direct_heads = {commands[role][0] for role in ROLES}
+    required_by: dict[str, str] = {}
     for role in ROLES:
-        binaries.add(commands[role][0])
+        head = commands[role][0]
+        binaries.add(head)
+        wrapper = Path(head).name
+        cli = AGENT_CLI_WRAPPERS.get(wrapper)
+        if cli is not None and wrapper not in WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP:
+            binaries.add(cli)
+            required_by.setdefault(cli, wrapper)
 
     for binary in sorted(binaries):
         path = shutil.which(binary)
         state = "FOUND" if path else "MISSING"
-        print(f"{state:8} {binary:12} {path or ''}")
+        note = f"  -- required by {required_by[binary]}" if binary in required_by else ""
+        if note and binary in direct_heads:
+            note = f"  -- configured directly; also required by {required_by[binary]}"
+        print(f"{state:8} {binary:12} {path or ''}{note}")
         ok = ok and bool(path)
     print(
         "\nFOUND means the executable is on PATH. Authentication, credits, quota\n"
