@@ -115,3 +115,34 @@ def test_a_timed_out_probe_leaves_no_agent_process_still_running(root: Path) -> 
         if pid is not None:
             with suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
+
+
+def test_an_agent_exiting_124_keeps_the_output_that_explains_it(root: Path) -> None:
+    """The runner's synthetic timeout code collides with a real agent status.
+
+    124 is what run_process() reports for its own deadline, so an agent that
+    exits 124 for its own reasons -- a wrapper propagating a downstream
+    timeout(1), say -- is indistinguishable from one stargate killed. Reporting
+    only "probe timed out" threw away the stderr that would have explained it,
+    naming a timeout that never happened.
+    """
+    repo = make_repo(root)
+    bindir = fake_bin(root, "code-124")
+    (Path(bindir) / "code-124").write_text(
+        "#!/bin/sh\necho 'upstream refused the request' >&2\nexit 124\n"
+    )
+    config = root / "agents.yaml"
+    config.write_text(yaml.safe_dump({
+        "agents": {"quick": {"command": ["code-124"], "probe": "cheap"}},
+        "workflow": dict.fromkeys(("architect", "developer", "reviewer", "fixer"), "quick"),
+        # Generous, so a real deadline cannot be what produced the 124.
+        "settings": {"probe_timeout_seconds": 60, "agent_timeout_seconds": 60},
+    }))
+
+    proc = doctor(
+        repo, config, "--probe",
+        env={"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}", "TMPDIR": str(root)},
+    )
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "upstream refused the request" in proc.stdout, proc.stdout

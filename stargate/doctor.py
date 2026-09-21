@@ -166,10 +166,15 @@ def probe_one(command: tuple[str, ...], prompt: str, cwd: Path, output: Path,
     except (StargateError, OSError) as exc:
         return str(exc)
 
-    # The shared runner uses 124 for timeouts; an agent exiting 124 is also
-    # reported as a timeout.
+    # The shared runner uses 124 for timeouts, and an agent that genuinely exits
+    # 124 is indistinguishable from one -- some wrappers propagate a downstream
+    # timeout(1) status. Keep the captured output either way, so a real failure
+    # still explains itself instead of being reported only as a timeout that may
+    # never have happened.
     if proc.returncode == 124:
-        return f"probe timed out after {timeout}s"
+        timed_out = f"probe timed out after {timeout}s"
+        tail = (proc.stdout or "").strip()
+        return f"{timed_out}; last output: {tail}" if tail else timed_out
     if proc.returncode:
         return proc.stdout.strip() or f"agent exited with status {proc.returncode}"
     # Exit 0 while writing nothing to {output} is the false positive this flag
