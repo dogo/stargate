@@ -1,7 +1,7 @@
 #!/bin/sh
 # opencode adapter for stargate. Verified against opencode 1.18.31.
 #
-# Four things this works around:
+# Five things this works around:
 #  1. opencode writes NOTHING when its stdout is a regular file, and that is
 #     exactly what stargate hands a command: run_process() passes an open trace
 #     file as stdout with stderr merged into it (core.py). Piping it -- which
@@ -14,6 +14,7 @@
 #     GEMINI_API_KEY. This maps one to the other when only the latter is set.
 #  4. POSIX sh reports only the last pipeline command's status. A FIFO lets
 #     opencode write into a pipe while wait preserves its failure for retries.
+#  5. A trapped exit must stop and reap the background opencode request.
 set -e
 out=$1; shift
 
@@ -23,18 +24,40 @@ if [ -z "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] && [ -n "${GEMINI_API_KEY:-}" ]; t
 fi
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/opencode-stargate.XXXXXX")
-trap 'rm -rf "$tmp"' 0
+pid=
+# Keep opencode in our group: set -m would put it outside run_process()'s
+# SIGKILL sweep, which no trap can catch. When we lead the group (stargate's
+# start_new_session case), TERM reaches Bun's children too. Otherwise only
+# signal our child: signalling the inherited group would hit our caller.
+cleanup() {
+  trap '' INT TERM HUP
+  if [ -n "$pid" ]; then
+    if kill -0 "-$$" 2>/dev/null; then
+      kill -TERM "-$$" 2>/dev/null || :
+    else
+      kill -TERM "$pid" 2>/dev/null || :
+    fi
+    # Bound the wait even if opencode ignores TERM.
+    kill -KILL "$pid" 2>/dev/null || :
+    wait "$pid" 2>/dev/null || :
+    pid=
+  fi
+  rm -rf "$tmp" || :
+}
+trap cleanup 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 mkfifo "$tmp/trace"
 
-NO_COLOR=1 opencode run "$@" >"$tmp/trace" 2>&1 &
+NO_COLOR=1 opencode run "$@" </dev/null >"$tmp/trace" 2>&1 &
 pid=$!
 
 # Only remove the first content line when it has the session header shape.
 # These three tool markers were observed in 1.18.31. Unknown future markers
 # deliberately pass through rather than risk deleting ordinary prose.
+# Background the filter so wait can run signal traps immediately; a foreground
+# pipeline would defer cleanup until the very request we must stop finishes.
 perl -CSD -0777 -pe '
       s/\e\[[0-9;]*[a-zA-Z]//g;
       s/\A\s*\n//;
@@ -43,8 +66,17 @@ perl -CSD -0777 -pe '
       s/\A\s*\n//;
       s/\s+\z/\n/;
     ' <"$tmp/trace" \
-  | tee "$out"
+  | tee "$out" &
+filter=$!
+filter_status=0
+wait "$filter" 2>/dev/null || filter_status=$?
 
 status=0
 wait "$pid" || status=$?
+# Reaped: the kernel may reuse its PID, so cleanup must no longer signal it.
+pid=
+# A successful request still failed if tee could not write the answer artifact.
+if [ "$status" -eq 0 ]; then
+  status=$filter_status
+fi
 exit "$status"

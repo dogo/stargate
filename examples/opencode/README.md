@@ -27,10 +27,22 @@ with stderr merged into it. In the verified experiment,
 
 The wrapper supplies a FIFO (named pipe) in a private temporary directory.
 opencode writes into it as a background job; the wrapper filters the output,
-then uses `wait` to exit with opencode's own status. POSIX `sh` has no `pipefail`: a
+then uses `wait` to preserve opencode's own failure status. If opencode succeeds,
+an output-write failure from `tee` still makes the wrapper exit nonzero.
+POSIX `sh` has no `pipefail`: a
 plain pipeline would report `tee`'s success even after an authentication or quota
-failure, preventing stargate from retrying. The FIFO and directory are removed
-on exit, including INT, TERM and HUP interrupts (SIGKILL cannot be trapped).
+failure, preventing stargate from retrying. On normal exit and on INT, TERM and
+HUP, the wrapper reaps opencode, stopping it if necessary, and removes the FIFO
+and directory. When the wrapper leads its process group (as it does under
+stargate's `run_process()`), cleanup also sends TERM to that group to stop
+opencode's Bun children. Otherwise it signals only opencode, to avoid signalling
+the caller's group; descendants can survive a signal sent only to the wrapper.
+
+SIGKILL cannot be trapped. The wrapper deliberately keeps opencode in its group
+so stargate's whole-group SIGKILL reaches it too. A `doctor --probe` timeout,
+however, kills **only the wrapper**: opencode can outlive it and keep billing.
+Raising the probe timeout reduces the chance of hitting this unresolved path;
+it does not provide cleanup after SIGKILL. See the timeout setting below.
 
 This is a different reason from kiro's wrapper, which handles its
 `argv[0]`-relative sibling executable and the `> ` output marker.
@@ -64,10 +76,28 @@ on the throttled tier:
 | `opencode_reader` | read | OK | 138.6s |
 | `opencode_writer` | write | OK | 111.2s |
 
-`init-config` copies the agent blocks, **not** the example's settings. If you
-select opencode through the wizard, also set `settings.probe_timeout_seconds`
-to `420` in the generated config; otherwise it inherits the 120s default, which
-can time out during free-tier throttling.
+`init-config` copies the agent blocks, **not** the example's settings. A
+wizard-generated config inherits the packaged **120s** probe timeout. Opencode
+can exceed it under provider throttling: the measured 138.6s read probe above
+exceeded that default, while the 111.2s write probe approached it.
+
+The generated file already carries these lines in its commented settings block
+at the bottom (with other settings between them):
+
+```yaml
+# settings:
+#   probe_timeout_seconds: 120
+```
+
+Uncomment `settings:` and `probe_timeout_seconds`, and raise the latter to `420`:
+
+```yaml
+settings:
+  probe_timeout_seconds: 420
+```
+
+This gives throttled probes more time before the timeout path where the wrapper
+cannot clean up opencode.
 
 ## Output filtering
 
