@@ -690,3 +690,26 @@ def test_readme_and_reviewer_prompt_document_the_findings_contract(
 
     for fragment in ("APPROVED", "CHANGES_REQUESTED", '"severity"', "demonstrated impact"):
         assert fragment in REVIEWER_PROMPT, fragment
+
+
+def test_a_json_review_inside_a_markdown_fence_is_not_discarded(root: Path) -> None:
+    """Found in a real run, not imagined -- twice in the same run.
+
+    The reviewer answered with ```json around a complete object. Both times the
+    verdict was thrown away and the run failed, the second time discarding a
+    405-second APPROVED review that a fixer pass had already been paid for.
+    A fence is the commonest shape a model emits when asked for JSON, so
+    rejecting it fails the run on formatting rather than on content.
+    """
+    from stargate.stages import parse_review
+
+    review = _review_file(root, "fenced.json", "APPROVED", [LOW]).read_text()
+
+    for fenced in (
+        f"```json\n{review}\n```",
+        f"```\n{review}\n```",
+        f"```json\n{review}\n```\n\nNote: I could not run the suite.\n",
+    ):
+        verdict, findings, contract = parse_review(fenced)
+        assert (verdict, contract) == ("APPROVED", "json"), (verdict, contract, fenced[:20])
+        assert findings[0]["severity"] == "low", findings
