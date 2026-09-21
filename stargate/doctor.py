@@ -2,6 +2,7 @@
 probe each distinct agent for the capabilities its role needs."""
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -39,6 +40,10 @@ from .core import StargateError, run_process
 from .detect import detection_mode, selected_test_command
 
 PROBE_TIMEOUT_DEFAULT = 120
+
+# Non-agent requirements keep resolving in stargate's environment. Task source
+# and pull-request env handling is a separate follow-up to the agent checks.
+ORCHESTRATOR = "stargate"
 
 
 PROBE_CAPABILITIES = ("read", "write")
@@ -278,6 +283,13 @@ def probe_agents(config: dict[str, Any], test_command: str) -> bool:
     return ok
 
 
+def agent_search_path(env: dict[str, str] | None) -> str | None:
+    """Match subprocess lookup, including the default search when PATH is removed."""
+    # Passing None to which would reuse doctor's PATH even when the child has
+    # explicitly removed it. get_exec_path supplies the child's exec default.
+    return None if env is None else os.pathsep.join(os.get_exec_path(env))
+
+
 def doctor(
     config: dict[str, Any],
     layers: list[tuple[Path, dict[str, Any]]],
@@ -309,10 +321,19 @@ def doctor(
         for role in ROLES
     }
     ok = True
-    binaries = {"git"}
+    required: dict[str, dict[str, str | None]] = {}
+
+    def require(binary: str, by: str, search_path: str | None) -> None:
+        required.setdefault(binary, {})[by] = search_path
+
+    require("git", ORCHESTRATOR, None)
     try:
         sources = task_sources(config)
         pr_command = pull_request_command(config)
+        search_paths = {
+            role: agent_search_path(agent_env(agent_entry(config, role)))
+            for role in ROLES
+        }
     except StargateError as exc:
         # Returns instead of setting ok=False like blocking_severities does, and
         # the difference is position: this runs before the probe block, so
@@ -320,36 +341,59 @@ def doctor(
         print(f"\nERROR    {exc}")
         return 1
     if pr_command:
-        binaries.add(pr_command[0])
+        require(pr_command[0], ORCHESTRATOR, None)
     for source in sources:
         for command in source["commands"]:
-            binaries.add(command[0])
+            require(command[0], ORCHESTRATOR, None)
     direct_heads = {commands[role][0] for role in ROLES}
     required_by: dict[str, str] = {}
     for role in ROLES:
         head = commands[role][0]
-        binaries.add(head)
+        require(head, role, search_paths[role])
         wrapper = Path(head).name
         cli = AGENT_CLI_WRAPPERS.get(wrapper)
         if cli is not None and wrapper not in WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP:
-            binaries.add(cli)
+            # The wrapper invokes its CLI inside the same agent environment.
+            require(cli, role, search_paths[role])
             required_by.setdefault(cli, wrapper)
 
-    for binary in sorted(binaries):
-        path = shutil.which(binary)
-        state = "FOUND" if path else "MISSING"
-        note = f"  -- required by {required_by[binary]}" if binary in required_by else ""
-        if note and binary in direct_heads:
-            note = f"  -- configured directly; also required by {required_by[binary]}"
-        print(f"{state:8} {binary:12} {path or ''}{note}")
-        ok = ok and bool(path)
+    # FOUND requires every requirer's environment to resolve the binary: one
+    # working role must not hide another that cannot run. Name failing roles
+    # when environments differ so a CLI on doctor's PATH is not a mystery MISSING.
+    for binary in sorted(required):
+        requirers = required[binary]
+        resolved = {
+            who: shutil.which(binary, path=search)
+            for who, search in requirers.items()
+        }
+        missing = [who for who, path in resolved.items() if not path]
+        state = "MISSING" if missing else "FOUND"
+        # Environments may resolve to different files; show the first requirer's
+        # path, while the notes explain any failure that changes the exit code.
+        path = "" if missing else (next(iter(resolved.values())) or "")
+        notes = []
+        if binary in required_by:
+            notes.append(
+                f"configured directly; also required by {required_by[binary]}"
+                if binary in direct_heads else f"required by {required_by[binary]}"
+            )
+        if missing and (
+            len(missing) != len(resolved)
+            or any(requirers[who] is not None for who in missing)
+        ):
+            notes.append("not on the PATH of: " + ", ".join(missing))
+        note = f"  -- {'; '.join(notes)}" if notes else ""
+        print(f"{state:8} {binary:12} {path}{note}")
+        ok = ok and not missing
     print(
-        "\nFOUND means the executable is on PATH. Authentication, credits, quota\n"
-        "and model availability are NOT checked -- an agent can still fail on its\n"
-        "first call (e.g. \"Credit balance is too low\")."
+        "\nFOUND means the executable is on PATH for every agent that needs it.\n"
+        "An agent entry's `env:` can change or remove PATH, so a line can be\n"
+        "MISSING for one role while the same name resolves for stargate itself.\n"
+        "Authentication, credits, quota and model availability are NOT checked --\n"
+        "an agent can still fail on its first call (e.g. \"Credit balance is too low\")."
     )
 
-    if others := available_agent_clis(binaries):
+    if others := available_agent_clis(set(required)):
         print("\nOther agent CLIs on PATH, not used by this config:")
         for name, path, description in others:
             print(f"         {name:12} {path}  -- {description}")

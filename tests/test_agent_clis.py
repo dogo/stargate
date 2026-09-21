@@ -1,4 +1,4 @@
-"""Reporting which coding-agent CLIs are installed but unused by this config."""
+"""Required executables in agent environments and installed but unused CLIs."""
 from __future__ import annotations
 
 import os
@@ -153,3 +153,67 @@ def test_a_wrapper_that_resolves_its_own_cli_is_not_required_on_path(root: Path)
 
     assert proc.returncode == 0, proc.stdout
     assert "kiro-cli" not in proc.stdout, proc.stdout
+
+
+def test_a_cli_only_on_the_agents_own_path_is_not_reported_missing(root: Path) -> None:
+    # A private PATH can make an agent work even though doctor cannot see its
+    # CLI. This applies to both the command head and a wrapper's dependency.
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    cfg = yaml.safe_load(config.read_text())
+    private = root / "private"
+    private.mkdir()
+    bindir = fake_bin(private, "vendor-cli", "claude-json-stargate", "claude")
+    doctor_path = _wrapper_only_path(root, "unused-cli")
+    cfg["agents"]["noop"]["env"] = {"PATH": bindir}
+    for head, binary in (("vendor-cli", "vendor-cli"), ("claude-json-stargate", "claude")):
+        cfg["agents"]["noop"]["command"] = [head, "--print"]
+        config.write_text(yaml.safe_dump(cfg))
+        proc = doctor(repo, config, env={"PATH": doctor_path})
+
+        assert proc.returncode == 0, proc.stdout
+        for required in (head, binary):
+            assert any(
+                line.split()[:2] == ["FOUND", required]
+                for line in proc.stdout.splitlines()
+            ), proc.stdout
+
+
+def test_a_cli_removed_from_an_agents_environment_is_reported_missing(root: Path) -> None:
+    # A working developer must not mask an architect that cannot reach the
+    # same CLI, whether it names the CLI directly or uses a known wrapper.
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    cfg = yaml.safe_load(config.read_text())
+    bindir = _wrapper_only_path(root, "claude-json-stargate")
+    fake_bin(root, "vendor-cli", "claude")
+    empty = root / "empty"
+    empty.mkdir()
+    for head, binary in (
+        ("vendor-cli", "vendor-cli"),
+        (str(Path(bindir) / "claude-json-stargate"), "claude"),
+    ):
+        cfg["agents"]["noop"]["command"] = [head, "--print"]
+        cfg["agents"]["dev"]["command"] = [binary]
+        for search_path in (str(empty), None):
+            cfg["agents"]["noop"]["env"] = {"PATH": search_path}
+            config.write_text(yaml.safe_dump(cfg))
+            proc = doctor(repo, config, env={"PATH": bindir})
+
+            assert proc.returncode == 1, proc.stdout
+            lines = [
+                line for line in proc.stdout.splitlines()
+                if line.split()[:2] == ["MISSING", binary]
+            ]
+            assert len(lines) == 1, proc.stdout
+            assert lines[0].endswith("not on the PATH of: architect"), proc.stdout
+            if binary == "claude":
+                assert (
+                    "configured directly; also required by claude-json-stargate" in lines[0]
+                ), proc.stdout
+                assert any(
+                    line.split()[:2] == ["FOUND", head]
+                    for line in proc.stdout.splitlines()
+                ), proc.stdout

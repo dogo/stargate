@@ -271,7 +271,7 @@ It prints the numbered config layers and provenance of the effective settings
 and agents, each role's resolved command, all five resolved prompt files
 (including `fanout.md`), and the configured or detected project test commands
 with their evidence. It makes no external calls, so `FOUND` means only that the
-executable is on `PATH` — see
+executable resolves in every agent environment that requires it — see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
 
 It also lists the coding-agent CLIs it recognises that are installed but unused
@@ -287,6 +287,11 @@ is configured but `claude` must also be installed on `PATH`. `kiro-stargate` res
 its own CLI, so `kiro-cli` need not be on `PATH`. A CLI reached through a wrapper
 of your own is still reported as unused — the two wrappers under
 [`examples/`](examples/) are the only ones it knows to look through.
+
+Each role's executable and its wrapper's required CLI are resolved using that
+entry's `env:`, so a private `PATH` can make a CLI outside stargate's PATH `FOUND`.
+Removing or narrowing `PATH` can instead make a locally installed CLI
+`MISSING -- not on the PATH of: <role>`, with exit code `1`.
 
 The effective-settings table reports values and provenance. Most settings are only
 validated by the command that uses them, but an invalid `blocking_severities` is reported
