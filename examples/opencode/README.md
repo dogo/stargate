@@ -54,7 +54,11 @@ can stop it.
 
 `doctor --probe` timeouts are covered by the same thing: probes run through
 `run_process()`, which starts a new session and kills the group, so a timed-out
-probe leaves nothing behind.
+probe leaves no agent process running and nothing still billing. That is the
+whole guarantee: SIGKILL does not run the EXIT trap either, so the private
+`$TMPDIR/opencode-stargate.*` directory and its FIFO survive a killed run and
+accumulate across repeated timeouts. They are inert, but removing them is
+yours to do.
 
 This is a different reason from kiro's wrapper, which handles its
 `argv[0]`-relative sibling executable and the `> ` output marker.
