@@ -25,6 +25,12 @@ surrounding text:
 
 Rules:
 - Produce between 1 and {max_tasks} tasks.
+- Use the fewest coherent tasks that satisfy the goal; the maximum is a ceiling, not
+  a target. Return one task for a localized change that gains nothing from splitting.
+- Validate proposed mechanisms against relevant code, callers, and tests. Distinguish
+  confirmed constraints from hypotheses in task descriptions, and express acceptance
+  as observable behavior. Do not prescribe an unverified solution as a requirement.
+- Do not launch other agents or orchestrator runs; return the graph for the orchestrator.
 - `name` is required and must be a usable, non-empty string. Give it a short
   ASCII letter/digit word so it can name the run branch.
 - Every item in `tasks` must be an object with a unique `id` and a non-empty
