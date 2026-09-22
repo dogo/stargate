@@ -59,6 +59,16 @@ def test_a_shipped_wrapper_counts_as_the_vendor_it_calls(root: Path) -> None:
     assert found == [], found
 
 
+def test_the_opencode_wrapper_does_not_offer_its_underlying_cli_as_an_unused_alternative(
+    root: Path,
+) -> None:
+    # Replacing the verified wrapper with bare opencode would produce no output
+    # under stargate, so doctor must recognize the vendor already being driven.
+    with patch.dict(os.environ, {"PATH": fake_bin(root, "opencode", "opencode-stargate")}):
+        found = available_agent_clis({"git", "opencode-stargate"})
+    assert found == [], found
+
+
 def test_a_configured_path_that_does_not_exist_still_points_at_the_cli_on_path(
     root: Path,
 ) -> None:

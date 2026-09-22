@@ -34,6 +34,6 @@ workflow:
 settings:
   max_review_loops: 2
   test_command: ""
-  test_command_detection: off
+  test_command_detection: "off"
   commit: true
   agent_timeout_seconds: 600

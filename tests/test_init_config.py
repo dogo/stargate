@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 import yaml
 
+from stargate.detect import detection_mode
+from stargate.doctor import AGENT_CLI_WRAPPERS, WRAPPER_EXTRA_BINARIES
 from stargate.wizard import init_config
 from tests.harness import ROOT, fake_bin, make_repo, stargate, stargate_tty
 
@@ -76,6 +78,82 @@ def test_packaged_vendor_blocks_stay_identical_to_the_verified_examples(root: Pa
     for name, path in examples.items():
         assert vendors[name]["agents"] == yaml.safe_load(path.read_text())["agents"], name
     assert '"vendors.yaml"' in (ROOT / "pyproject.toml").read_text()
+
+
+def test_an_example_disabling_detection_is_not_read_back_as_the_report_default(
+    root: Path,
+) -> None:
+    # Bare off is a YAML boolean: detection_mode silently turns False into
+    # report, so the example would still report a guessed test command.
+    kiro = yaml.safe_load((ROOT / "examples/kiro/agents.yaml").read_text())
+    assert detection_mode(kiro) == "off", kiro["settings"]
+    for path in sorted((ROOT / "examples").glob("*/agents.yaml")):
+        configured = yaml.safe_load(path.read_text()).get("settings", {}).get(
+            "test_command_detection"
+        )
+        if configured is None:
+            continue
+        assert isinstance(configured, str), f"{path}: {configured!r}"
+
+
+def test_opencode_without_its_wrapper_cannot_produce_an_unrunnable_opencode_config(
+    root: Path,
+) -> None:
+    # Bare opencode is silent into stargate's regular trace file. Offering it
+    # without the wrapper would produce a config that hangs instead of answering.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="",
+                        env={"PATH": fake_bin(root, "opencode")})
+    assert proc.returncode == 0, proc.stdout
+    assert "opencode found" in proc.stdout, proc.stdout
+    assert "MISSING opencode-stargate" in proc.stdout, proc.stdout
+    assert "architect [" not in proc.stdout, proc.stdout
+    assert (root / "stargate/agents.yaml").read_bytes() == (
+        PACKAGE / "agents.yaml"
+    ).read_bytes(), proc.stdout
+
+
+def test_opencode_is_not_offered_when_the_python3_its_wrapper_runs_is_absent(root: Path) -> None:
+    # The wrapper and CLI resolve, but every invocation would fail inside the
+    # wrapper. Stargate itself runs through sys.executable, independently of PATH.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="",
+                        env={"PATH": fake_bin(root, "opencode-stargate", "opencode")})
+    assert proc.returncode == 0, proc.stdout
+    assert "architect [" not in proc.stdout, proc.stdout
+    assert "MISSING python3 (required by opencode-stargate)" in proc.stdout, proc.stdout
+    assert "but the CLI it runs is not" not in proc.stdout, proc.stdout
+    assert (root / "stargate/agents.yaml").read_bytes() == (
+        PACKAGE / "agents.yaml"
+    ).read_bytes(), proc.stdout
+
+
+def test_a_missing_wrapper_dependency_is_named_with_the_wrapper_that_needs_it(root: Path) -> None:
+    # The diagnostic must also appear when another vendor keeps the menu usable.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="\n" * 4,
+                        env={"PATH": fake_bin(root, "codex", "opencode-stargate", "opencode")})
+    assert proc.returncode == 0, proc.stdout
+    assert "MISSING python3 (required by opencode-stargate)" in proc.stdout, proc.stdout
+    assert "but the CLI it runs is not" not in proc.stdout, proc.stdout
+    assert "opencode: opencode through opencode-stargate" not in proc.stdout, proc.stdout
+    config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
+    assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout
+
+
+def test_opencode_is_offered_when_its_wrapper_cli_and_python3_all_resolve(root: Path) -> None:
+    proc = stargate_tty(root, "init-config", config_home=root, answers="\n" * 4,
+                        env={"PATH": fake_bin(root, "opencode-stargate", "opencode", "python3")})
+    assert proc.returncode == 0, proc.stdout
+    assert "opencode: opencode through opencode-stargate" in proc.stdout, proc.stdout
+    assert "MISSING python3" not in proc.stdout, proc.stdout
+    config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
+    assert config["workflow"] == dict(
+        architect="opencode_reader", developer="opencode_writer",
+        reviewer="opencode_reader", fixer="opencode_writer",
+    ), proc.stdout
+    assert set(config["agents"]) == {"opencode_reader", "opencode_writer"}, proc.stdout
+
+
+def test_a_declared_wrapper_dependency_belongs_to_a_shipped_wrapper(root: Path) -> None:
+    assert set(WRAPPER_EXTRA_BINARIES) <= set(AGENT_CLI_WRAPPERS)
 
 
 def test_the_claude_reviewer_preserves_the_packaged_defaults_grant_verbatim(root: Path) -> None:
@@ -194,9 +272,9 @@ def test_unverified_clis_are_reported_but_cannot_be_selected(root: Path) -> None
     assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout
 
 
-def test_kiro_wrapper_is_sufficient_for_verified_reader_and_writer_choices(root: Path) -> None:
+def test_a_wrapper_and_the_cli_it_runs_together_offer_the_verified_choices(root: Path) -> None:
     proc = stargate_tty(root, "init-config", config_home=root, answers="\n" * 4,
-                        env={"PATH": fake_bin(root, "kiro-stargate")})
+                        env={"PATH": fake_bin(root, "kiro-stargate", "kiro-cli")})
     assert proc.returncode == 0, proc.stdout
     config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
     assert config["workflow"] == dict(architect="kiro_reader", developer="kiro_writer",
@@ -255,3 +333,34 @@ def test_gemini_is_not_offered_when_its_executable_is_absent(root: Path) -> None
     assert "Choose a listed number" in proc.stdout, proc.stdout
     config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
     assert set(config["workflow"].values()) == {"codex_reader", "codex_writer"}, proc.stdout
+
+
+def test_a_path_resolving_wrapper_without_its_cli_does_not_make_the_vendor_selectable(
+    root: Path,
+) -> None:
+    # The wrapper invokes opencode through PATH; without it the config cannot run.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="",
+                        env={"PATH": fake_bin(root, "opencode-stargate")})
+    assert proc.returncode == 0, proc.stdout
+    assert ("MISSING opencode: the examples/opencode wrapper is on PATH, "
+            "but the CLI it runs is not.") in proc.stdout, proc.stdout
+    assert "MISSING opencode-stargate" not in proc.stdout, proc.stdout
+    assert "architect [" not in proc.stdout, proc.stdout
+    assert (root / "stargate/agents.yaml").read_bytes() == (
+        PACKAGE / "agents.yaml"
+    ).read_bytes(), proc.stdout
+
+
+def test_a_wrapper_with_its_own_cli_lookup_stays_selectable_without_the_cli_on_path(
+    root: Path,
+) -> None:
+    # Kiro uses KIRO_BIN or its app-bundle path. Requiring kiro-cli on PATH
+    # rejects the macOS installs the wrapper was written for.
+    proc = stargate_tty(root, "init-config", config_home=root, answers="\n" * 4,
+                        env={"PATH": fake_bin(root, "kiro-stargate")})
+    assert proc.returncode == 0, proc.stdout
+    assert "kiro: Kiro CLI through kiro-stargate (examples/kiro)" in proc.stdout, proc.stdout
+    assert "MISSING kiro-cli" not in proc.stdout, proc.stdout
+    config = yaml.safe_load((root / "stargate/agents.yaml").read_text())
+    assert config["workflow"] == dict(architect="kiro_reader", developer="kiro_writer",
+                                      reviewer="kiro_reader", fixer="kiro_writer"), proc.stdout

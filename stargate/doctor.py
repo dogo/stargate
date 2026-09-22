@@ -54,7 +54,7 @@ PROBE_CAPABILITIES = ("read", "write")
 # architect, where the final message goes, sandbox for the writers), and
 # guessing those would produce a config that runs and does the wrong thing.
 # Naming what is installed is the part that can be done without guessing --
-# `examples/` carries the four verified ones.
+# `examples/` carries the five verified ones.
 KNOWN_AGENT_CLIS = {
     "claude": "Claude Code (examples/claude)",
     "codex": "OpenAI Codex CLI (examples/codex)",
@@ -65,7 +65,7 @@ KNOWN_AGENT_CLIS = {
     "cursor-agent": "Cursor CLI",
     "gemini": "Gemini CLI (examples/gemini)",
     "goose": "Block Goose",
-    "opencode": "opencode",
+    "opencode": "opencode (examples/opencode)",
     "q": "Amazon Q Developer CLI",
     "qwen": "Qwen Code",
 }
@@ -78,6 +78,7 @@ KNOWN_AGENT_CLIS = {
 AGENT_CLI_WRAPPERS = {
     "claude-json-stargate": "claude",
     "kiro-stargate": "kiro-cli",
+    "opencode-stargate": "opencode",
 }
 
 # Kiro resolves ${KIRO_BIN:-/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli}
@@ -86,6 +87,10 @@ AGENT_CLI_WRAPPERS = {
 # The other wrappers invoke their CLI bare, so PATH is required by default;
 # add an exception here only when a wrapper carries its own CLI lookup.
 WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP = {"kiro-stargate"}
+
+# Extra executables required by shipped wrappers. Running stargate under a
+# Python interpreter does not imply that the wrapper can find python3 on PATH.
+WRAPPER_EXTRA_BINARIES = {"opencode-stargate": ("python3",)}
 
 
 def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:

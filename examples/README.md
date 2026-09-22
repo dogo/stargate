@@ -18,16 +18,16 @@ reads and writes rather than checking that a binary exists:
 stargate --config examples/<vendor>/agents.yaml doctor --probe
 ```
 
-| | [claude](claude/) | [codex](codex/) | [kiro](kiro/) | [gemini](gemini/) |
-|---|---|---|---|---|
-| Version verified | 2.1.236 | 0.152.0 | 2.21.0 | 0.60.0 |
-| Needs `{output}` | no | yes | yes | no |
-| Has its own flag for it | — | `--output-last-message` | none, needs a wrapper | — |
-| Wrapper required | no | no | **yes** | no |
-| Reports usage | only as JSON | `tokens used N` | `Credits: N.NN` | none in text mode |
-| `usage_pattern` works out of the box | no | yes | no | no |
-| Read-only role | `--disallowedTools` | `--sandbox read-only` | `--trust-tools=read,grep` | `--approval-mode plan` |
-| Scoped `{test_command}` grant | yes, `Bash(...)` | no, sandbox not allow-list | no, category only | no, plan mode forbids shell |
+| | [claude](claude/) | [codex](codex/) | [kiro](kiro/) | [gemini](gemini/) | [opencode](opencode/) |
+|---|---|---|---|---|---|
+| Version verified | 2.1.236 | 0.152.0 | 2.21.0 | 0.60.0 | 1.18.31 |
+| Needs `{output}` | no | yes | yes | no | yes |
+| Has its own flag for it | — | `--output-last-message` | none, needs a wrapper | — | none, needs a wrapper |
+| Wrapper required | no | no | **yes** | no | **yes** |
+| Reports usage | only as JSON | `tokens used N` | `Credits: N.NN` | none in text mode | none |
+| `usage_pattern` works out of the box | no | yes | no | no | no |
+| Read-only role | `--disallowedTools` | `--sandbox read-only` | `--trust-tools=read,grep` | `--approval-mode plan` | `--agent plan` |
+| Scoped `{test_command}` grant | yes, `Bash(...)` | no, sandbox not allow-list | no, category only | no, plan mode forbids shell | no |
 
 ## The four things that go wrong
 
@@ -38,12 +38,16 @@ In the order you find out, which is not the order of severity:
    swallows the prompt unless another option follows it. Gemini's array options
    (`--policy`, `--admin-policy`, `--include-directories`, `--extensions`,
    `--allowed-tools`, `--allowed-mcp-server-names`) have the same trap; keep
-   its non-variadic `--prompt` last.
+   its non-variadic `--prompt` last. opencode's `--file` is also an array option;
+   its config ends with the single-valued `--model` instead.
 2. **stdout is a session trace, not the answer.** Then the command needs
-   `{output}`. Codex has a flag; kiro needs a wrapper.
+   `{output}`. Codex has a flag; kiro needs a wrapper. opencode needs a wrapper
+   for a different reason too: it emits nothing at all into the regular file
+   stargate supplies as stdout. The wrapper's pipeline makes it emit output.
 3. **`usage_pattern` matches nothing, or the wrong number.** Silent. The run
    succeeds and reports `Tokens reported: 0`, so `max_task_tokens` never fires.
-   Kiro's fractional credits and Claude's and Gemini's missing patterns are examples.
+   Kiro's fractional credits and Claude's, Gemini's and opencode's missing patterns
+   are examples.
 4. **Permission flags are coarser than the packaged ones.** `doctor` checks
    that the `{test_command}` placeholder expanded, never what the vendor's flag
    actually grants.

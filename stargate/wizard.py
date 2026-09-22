@@ -14,7 +14,12 @@ import yaml
 
 from .config import ROLES, user_config
 from .core import StargateError
-from .doctor import AGENT_CLI_WRAPPERS, available_agent_clis
+from .doctor import (
+    AGENT_CLI_WRAPPERS,
+    WRAPPER_EXTRA_BINARIES,
+    WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP,
+    available_agent_clis,
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,25 @@ def load_vendors(script_dir: Path) -> list[Vendor]:
             raise StargateError(f"Packaged vendor {name} has inconsistent command executables")
         vendors.append(Vendor(name, entry["description"], agents, reader, writer, binary, reviewer))
     return vendors
+
+
+def missing_requirements(binary: str) -> list[str]:
+    """Missing executables, with the requiring wrapper named for extra dependencies."""
+    missing = [binary] if not shutil.which(binary) else []
+    # Wrappers invoking their CLI bare need it on PATH; wrappers with their
+    # own lookup (Kiro's configured app-bundle path) do not.
+    underlying = AGENT_CLI_WRAPPERS.get(binary)
+    if (underlying and binary not in WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP
+            and not shutil.which(underlying)):
+        missing.append(underlying)
+    missing += [f"{name} (required by {binary})"
+                for name in WRAPPER_EXTRA_BINARIES.get(binary, ())
+                if not shutil.which(name)]
+    return missing
+
+
+def vendor_installed(binary: str) -> bool:
+    return not missing_requirements(binary)
 
 
 def ask(role: str, options: list[Vendor], default: Vendor) -> Vendor:
@@ -111,18 +135,32 @@ def init_config(script_dir: Path, *, force: bool = False) -> int:
         return 1
 
     vendors = load_vendors(script_dir)
-    installed = [vendor for vendor in vendors if shutil.which(vendor.binary)]
+    installed = [vendor for vendor in vendors if vendor_installed(vendor.binary)]
     other_clis = available_agent_clis({vendor.binary for vendor in vendors})
     found = {name for name, _, _ in other_clis}
     for vendor in vendors:
+        if vendor in installed:
+            continue
         underlying = AGENT_CLI_WRAPPERS.get(vendor.binary)
-        if vendor not in installed and underlying in found:
+        wrapper_found = bool(shutil.which(vendor.binary))
+        if underlying in found:
             print(f"MISSING {vendor.binary}: {underlying} found, but the "
                   f"examples/{vendor.name} wrapper is not on PATH.")
+        elif (underlying and wrapper_found
+              and vendor.binary not in WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP
+              and not shutil.which(underlying)):
+            print(f"MISSING {underlying}: the examples/{vendor.name} wrapper is on PATH, "
+                  "but the CLI it runs is not.")
+        if wrapper_found:
+            for name in WRAPPER_EXTRA_BINARIES.get(vendor.binary, ()):
+                if not shutil.which(name):
+                    print(f"MISSING {name} (required by {vendor.binary}): the "
+                          f"examples/{vendor.name} wrapper cannot run without it.")
     if not installed:
         print("No verified agent CLI is available. Missing command executables:")
         for vendor in vendors:
-            print(f"  MISSING {vendor.binary} — {vendor.description}")
+            missing = missing_requirements(vendor.binary)[0]
+            print(f"  MISSING {missing} — {vendor.description}")
         print("Writing the packaged default; install its CLIs or re-run setup after installation.")
 
     content = (script_dir / "agents.yaml").read_text()
