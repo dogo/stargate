@@ -227,3 +227,35 @@ def test_a_cli_removed_from_an_agents_environment_is_reported_missing(root: Path
                     line.split()[:2] == ["FOUND", head]
                     for line in proc.stdout.splitlines()
                 ), proc.stdout
+
+
+def test_doctor_requires_the_extra_executables_a_wrapper_declares(root: Path) -> None:
+    """The wizard and doctor must agree on what "installed" means.
+
+    `opencode-stargate` runs `python3` unconditionally, and `vendor_installed()`
+    already refuses to offer the vendor without it. Doctor reported FOUND and
+    exited 0 for the same machine, so an existing config looked healthy right up
+    to the first call, which failed for every role.
+    """
+    repo = make_repo(root)
+    config = root / "agents.yaml"
+    write_config(config, 'echo "VERDICT: APPROVED"', test_command="true")
+    cfg = yaml.safe_load(config.read_text())
+    bindir = _wrapper_only_path(root, "opencode-stargate")
+    (Path(bindir) / "opencode").write_text("#!/bin/sh\nexit 0\n")
+    (Path(bindir) / "opencode").chmod(0o755)
+    cfg["agents"]["noop"]["command"] = ["opencode-stargate", "{output}"]
+    config.write_text(yaml.safe_dump(cfg))
+
+    proc = doctor(repo, config, env={"PATH": bindir})
+
+    assert proc.returncode == 1, proc.stdout
+    assert any(
+        line.split()[:2] == ["MISSING", "python3"]
+        and "required by opencode-stargate" in line
+        for line in proc.stdout.splitlines()
+    ), proc.stdout
+    # The CLI it runs is present, so only the declared extra may be missing.
+    assert any(
+        line.split()[:2] == ["FOUND", "opencode"] for line in proc.stdout.splitlines()
+    ), proc.stdout
