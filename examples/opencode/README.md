@@ -8,8 +8,13 @@ stargate --config examples/opencode/agents.yaml doctor --probe
 stargate --config examples/opencode/agents.yaml run "your task"
 ```
 
-The wrapper, `opencode` and `python3` must be on PATH. Python is already a
-stargate dependency; no `jq` installation is needed. Stargate passes `{output}` as
+The wrapper, `opencode` and `python3` must all be on PATH. `python3` is the
+wrapper's own dependency: stargate can run from a venv shim or an absolute
+interpreter with no `python3` command on PATH. `init-config` will not offer
+opencode when it is missing, and reports
+`MISSING python3 (required by opencode-stargate)`. No `jq` is needed.
+
+Stargate passes `{output}` as
 the wrapper's first argument and appends the prompt last, where it becomes
 opencode's positional message. The reader uses `--agent plan`, the built-in
 read-only agent (`edit "*": deny`). That flag-selectable read-only mode is why

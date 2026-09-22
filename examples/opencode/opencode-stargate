@@ -57,8 +57,10 @@ mkfifo "$tmp/trace"
 NO_COLOR=1 opencode run "$@" </dev/null >"$tmp/trace" 2>&1 &
 pid=$!
 
-# python3, not jq: stargate requires Python, so the user already has that
-# dependency; jq is not guaranteed to be installed.
+# python3 reads the JSON stream without jq. It is an extra PATH dependency:
+# stargate can run under a venv shim or an absolute interpreter without a
+# python3 command on PATH. WRAPPER_EXTRA_BINARIES in stargate/doctor.py
+# declares it so init-config will not offer opencode when it is missing.
 # Background the filter so wait can run signal traps immediately; a foreground
 # pipeline would defer cleanup until the very request we must stop finishes.
 python3 -u -c '

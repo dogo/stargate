@@ -83,6 +83,10 @@ AGENT_CLI_WRAPPERS = {
 # add an exception here only when a wrapper carries its own CLI lookup.
 WRAPPERS_WITH_THEIR_OWN_CLI_LOOKUP = {"kiro-stargate"}
 
+# Extra executables required by shipped wrappers. Running stargate under a
+# Python interpreter does not imply that the wrapper can find python3 on PATH.
+WRAPPER_EXTRA_BINARIES = {"opencode-stargate": ("python3",)}
+
 
 def available_agent_clis(configured: set[str]) -> list[tuple[str, str, str]]:
     """Known agent CLIs on PATH that this config does not use: (name, path, what).
