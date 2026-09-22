@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # PyPI distribution name only: "stargate" is taken by DataStax. The command
 # and the import package are still `stargate`.
 name = "stargate-cli"
-version = "1.0.0"
+version = "1.1.0"
 description = "Tiny local orchestrator that lets heterogeneous coding-agent CLIs collaborate on one task."
 readme = "README.md"
 requires-python = ">=3.10"
