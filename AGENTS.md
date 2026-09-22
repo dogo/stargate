@@ -21,7 +21,7 @@ Touch only what you must. Don't improve adjacent code.
 Match existing style. Don't refactor what isn't broken.
 
 ## Rule 4: Goal-Driven Execution
-Define success criteria. Loop until verified.
+Define success criteria. Verify, and reconsider the approach when a loop stops making progress.
 Strong success criteria let the agent loop independently.
 
 ## Rule 5: Use the model only for judgment calls
@@ -31,7 +31,8 @@ If code can answer, code answers.
 
 ## Rule 6: Token budgets are not advisory
 Per-task: 16,000 tokens. Per-session: 30,000 tokens.
-If approaching budget, summarize and start fresh.
+If approaching budget, checkpoint completed work, evidence, and the smallest remaining step.
+Resuming or starting a new run does not reset the cost of the same task.
 Surface the breach. Do not silently overrun.
 
 ## Rule 7: Surface conflicts, don't average them
@@ -58,6 +59,38 @@ If you think a convention is harmful, surface it. Don't fork silently.
 "Completed" is wrong if anything was skipped silently.
 "Tests pass" is wrong if any were skipped.
 Default to surfacing uncertainty, not hiding it.
+
+## Execution strategy for the controlling agent
+
+These rules govern how the agent helping the user chooses the work process. A role
+already invoked by Stargate must complete its assigned stage within its permissions;
+it must not launch nested orchestrator runs or delegate its stage to more agents.
+
+- Default to direct editing for understood, localized changes, including documentation,
+  comments, and small fixes. Assess risk and uncertainty, not just line count: a tiny
+  change to isolation or publication may need focused independent review.
+- Use a full orchestrator cycle when the user explicitly requests it or when architectural
+  uncertainty or independently actionable work justifies its extra cost. Before choosing
+  delegation, state the concrete benefit and the validation needed. Availability of the
+  orchestrator is not a reason to use it for every increment.
+- Keep expected review on each push and required checks. Use focused validation during
+  iteration; run the full suite when required or when the affected behavior warrants it.
+  Do not repeat a passing check on an unchanged tree without a concrete unresolved concern.
+  For instruction-only edits, check the diff and prompt contracts; do not launch real agents
+  merely to validate wording. Report exactly what was and was not verified.
+- Before delegating, describe the observable problem, confirmed constraints, hypotheses,
+  and acceptance criteria. Check relevant code, callers, and existing tests first. Do not
+  turn an unverified implementation idea into a mandatory mechanism in the brief.
+- A finding caused by your own brief requires correcting and validating the premise before
+  another cycle. If the same issue returns after a fix, inspect the cause directly and
+  explain what new evidence or changed approach justifies the next attempt.
+- After the first quota interruption, reassess before resuming: preserve useful work,
+  identify what remains, and choose the smallest sufficient next step. Do not blindly
+  restart a full cycle or recreate completed stages. Repeated quota exhaustion or findings
+  caused by your briefs require a different approach, not another identical run.
+- Track cumulative effort across retries and sessions using available usage reports and
+  run history. If quota usage is unavailable, say so; do not invent precision. Per-run
+  token limits are not a guarantee against exhausting a provider's session quota.
 
 ---
 

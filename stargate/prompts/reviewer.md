@@ -28,13 +28,21 @@ Review for:
 - unnecessary complexity
 
 Failing tests above are a blocking finding: request changes and say which test failed and why.
-The results above are a report, not evidence. If your tools let you run the
-project's test command in this worktree, run that exact command rather than
-trusting pasted output.
-If you cannot run it -- or could not read a file you needed to judge -- say so in
-the top-level `unverified` string described below, not as a finding.
+Use the orchestrator's results above as evidence for the tested tree. Do not rerun
+a passing suite solely because you are a separate reviewer. Run focused checks for
+concrete gaps or suspected regressions; rerun the configured command when results
+are missing, stale, inconsistent with the tree, or required by repository policy.
+Skipped or unavailable tests are not passing tests. If a needed check cannot be run,
+or a needed file cannot be read, say so in the top-level `unverified` string below,
+not as a finding. Distinguish supplied test results from checks you ran yourself.
 
 Do not request cosmetic churn unless it materially improves correctness or maintainability.
+Judge the implementation against the user task and repository invariants; an evidenced
+correction to a mistaken plan is not itself a defect. For each blocking finding, identify
+a concrete failing scenario or unmet requirement. Do not block solely on preferences or
+optional cleanup. Report all supported findings in this pass; do not ration them across
+rounds. On a follow-up, check fixes and their impact without reopening settled issues
+unless new evidence warrants it. Do not launch other agents or orchestrator runs.
 
 Your response must be exactly one JSON object and nothing else -- no prose before or
 after it, no code fence:
