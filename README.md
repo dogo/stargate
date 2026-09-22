@@ -272,7 +272,7 @@ It prints the numbered config layers and provenance of the effective settings
 and agents, each role's resolved command, all five resolved prompt files
 (including `fanout.md`), and the configured or detected project test commands
 with their evidence. It makes no external calls, so `FOUND` means only that the
-executable is on `PATH` — see
+executable resolves in every agent environment that requires it — see
 [Probing agents](#probing-agents) to actually verify that an agent can run.
 
 It also lists the coding-agent CLIs it recognises that are installed but unused
@@ -282,10 +282,19 @@ read-only, or put the final message in a file, are vendor-specific, and a guesse
 command would run and do the wrong thing. See
 [Adding a different agent CLI](#adding-a-different-agent-cli).
 
-What it compares is the executable each role actually names. A CLI reached
-through a wrapper of your own is therefore still reported as unused — the two
+It checks the executable each role names and the CLI required by a known wrapper:
+for example, `MISSING claude -- required by claude-json-stargate` means the wrapper
+is configured but `claude` must also be installed on `PATH`. `kiro-stargate` resolves
+its own CLI, so `kiro-cli` need not be on `PATH`. `opencode-stargate` additionally needs `python3` on
+`PATH`, because the adapter reads opencode's JSON event stream with it. A CLI
+reached through a wrapper of your own is still reported as unused — the three
 wrappers under [`examples/`](examples/) are the only ones it knows to look
 through.
+
+Each role's executable and its wrapper's required CLI are resolved using that
+entry's `env:`, so a private `PATH` can make a CLI outside stargate's PATH `FOUND`.
+Removing or narrowing `PATH` can instead make a locally installed CLI
+`MISSING -- not on the PATH of: <role>`, with exit code `1`.
 
 The effective-settings table reports values and provenance. Most settings are only
 validated by the command that uses them, but an invalid `blocking_severities` is reported
@@ -306,6 +315,10 @@ Agent probes:
   FAIL developer, fixer (write) [6.1s]
        agent exited 0 but did not write probe-1.txt; its file-editing tools are not working
 ```
+
+The sample shows the probe results; each probe also echoes its command as
+`$ <command>` and, while waiting, reports elapsed time and captured bytes every
+30 seconds.
 
 The prompt and required capability live in the config, so the orchestrator
 stays vendor-agnostic. `{probe_file}` becomes an absolute path inside the
