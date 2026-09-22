@@ -45,11 +45,20 @@ stargate's `run_process()`), cleanup also sends TERM to that group to stop
 opencode's Bun children. Otherwise it signals only opencode, to avoid signalling
 the caller's group; descendants can survive a signal sent only to the wrapper.
 
-SIGKILL cannot be trapped. The wrapper deliberately keeps opencode in its group
-so stargate's whole-group SIGKILL reaches it too. A `doctor --probe` timeout,
-however, kills **only the wrapper**: opencode can outlive it and keep billing.
-Raising the probe timeout reduces the chance of hitting this unresolved path;
-it does not provide cleanup after SIGKILL. See the timeout setting below.
+SIGKILL cannot be trapped, so no trap here runs when stargate kills on a
+deadline. That is exactly why the wrapper keeps opencode inside its own process
+group instead of giving it a new one with `set -m`: being in the group is what
+lets a whole-group kill reach opencode and its Bun children. Do not "simplify"
+that away -- a private group would put opencode beyond the only mechanism that
+can stop it.
+
+`doctor --probe` timeouts are covered by the same thing: probes run through
+`run_process()`, which starts a new session and kills the group, so a timed-out
+probe leaves no agent process running and nothing still billing. That is the
+whole guarantee: SIGKILL does not run the EXIT trap either, so the private
+`$TMPDIR/opencode-stargate.*` directory and its FIFO survive a killed run and
+accumulate across repeated timeouts. They are inert, but removing them is
+yours to do.
 
 This is a different reason from kiro's wrapper, which handles its
 `argv[0]`-relative sibling executable and the `> ` output marker.

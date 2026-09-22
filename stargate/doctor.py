@@ -361,6 +361,14 @@ def doctor(
             # The wrapper invokes its CLI inside the same agent environment.
             require(cli, role, search_paths[role])
             required_by.setdefault(cli, wrapper)
+        # Declared by the wrapper itself, so it is needed whether or not its CLI
+        # resolves through PATH. The wizard already refuses to offer a vendor
+        # without these; doctor agreeing is the point -- one command calling a
+        # configuration usable while the other calls it broken is worse than
+        # either verdict alone.
+        for extra in WRAPPER_EXTRA_BINARIES.get(wrapper, ()):
+            require(extra, role, search_paths[role])
+            required_by.setdefault(extra, wrapper)
 
     # FOUND requires every requirer's environment to resolve the binary: one
     # working role must not hide another that cannot run. Name failing roles
