@@ -5,6 +5,7 @@ import argparse
 import json
 import signal
 import sys
+from importlib import metadata
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,14 @@ from .run import REDOABLE_STAGES, clean_runs, list_runs
 from .source import fetch_task
 from .stages import orchestrate
 from .wizard import init_config
+
+
+def _version() -> str:
+    """Read installed metadata while keeping uninstalled source checkouts usable."""
+    try:
+        return metadata.version("stargate-cli")
+    except metadata.PackageNotFoundError:
+        return "unknown (source checkout)"
 
 
 def _positive_int(value: str) -> int:
@@ -83,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="stargate",
         description="Tiny vendor-agnostic multi-agent orchestrator.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"stargate {_version()}",
+        help="Print the installed version and exit.",
     )
     parser.add_argument(
         "--config",

@@ -117,6 +117,7 @@ can instead start from one of the verified configurations in
 
 ```bash
 pipx install stargate-cli     # or: uv tool install stargate-cli
+stargate --version            # print the installed version
 ```
 
 From this checkout, or straight from Git:
