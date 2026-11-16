@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from stargate.watch import watch
+from stargate.core import StargateError
+from stargate.watch import render, watch
 from tests.harness import make_repo, stargate
 
 
@@ -108,17 +109,16 @@ def test_one_damaged_run_does_not_hide_the_others(root: Path) -> None:
 
 
 def test_unreadable_runs_directory_is_an_error_not_an_empty_view(root: Path) -> None:
-    repo = make_repo(root)
-    runs = _write_run(repo, "20260910-190331-demo", {"status": "approved"}).parent
-    runs.chmod(0)
-    try:
-        proc = stargate(repo, "watch", "--once", config_home=root / "config-home")
-    finally:
-        runs.chmod(0o755)
+    (root / ".stargate" / "runs").mkdir(parents=True)
 
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert "Could not read recorded runs" in proc.stderr, proc.stderr
-    assert "No recorded runs" not in proc.stdout, proc.stdout
+    # Simulated in-process: chmod does not stop root from reading the directory.
+    with patch("pathlib.Path.iterdir", side_effect=PermissionError("denied")):
+        try:
+            render(root, 80)
+        except StargateError as exc:
+            assert "Could not read recorded runs" in str(exc), exc
+        else:
+            raise AssertionError("an unreadable runs directory rendered as empty")
 
 
 def test_live_frame_fits_the_terminal_so_the_newest_run_stays_on_screen(root: Path) -> None:
