@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .core import StargateError
-from .run import read_run
+from .run import display_text, read_run
 
 MAX_RUNS = 5
 TASK_ID_WIDTH = 16
@@ -52,7 +52,7 @@ def _task_lines(path: Path, fanout: dict[str, Any], width: int) -> tuple[list[st
         record = records.get(task_id) if isinstance(task_id, str) else None
         if not isinstance(record, dict):
             continue
-        status = str(record.get("status", "?"))
+        status = display_text(record.get("status", "?"))
         stage = record.get("stage", "-")
         tokens = _int(record.get("tokens_used"))
         if status == "running":
@@ -65,10 +65,10 @@ def _task_lines(path: Path, fanout: dict[str, Any], width: int) -> tuple[list[st
             unrecorded += max(0, live_tokens - tokens)
             tokens = max(tokens, live_tokens)
         deps = record.get("depends_on")
-        deps = ",".join(map(str, deps)) if isinstance(deps, list) else ""
+        deps = display_text(",".join(map(str, deps))) if isinstance(deps, list) else ""
         lines.append(_clip(
-            f"      {_clip(task_id, TASK_ID_WIDTH):<{TASK_ID_WIDTH}} {status:<10} "
-            f"{str(stage):<10} {tokens:>9,} tok"
+            f"      {_clip(display_text(task_id), TASK_ID_WIDTH):<{TASK_ID_WIDTH}} "
+            f"{status:<10} {display_text(stage):<10} {tokens:>9,} tok"
             + (f"  after {deps}" if deps else ""),
             width,
         ))
@@ -114,7 +114,7 @@ def render(repo: Path, width: int, limit: int = MAX_RUNS) -> str:
         if row["error"]:
             lines.append(_clip(f"    {row['error']}", width))
         elif state.get("error"):
-            lines.append(_clip(f"    error {' '.join(str(state['error']).split())}", width))
+            lines.append(_clip(f"    error {display_text(state['error'])}", width))
         lines.extend(tasks)
         lines.append("")
     hidden = len(paths) - limit

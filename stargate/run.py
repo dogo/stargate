@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -352,6 +353,13 @@ def load_run(repo: Path, run_id: str, config: dict[str, Any], use_frozen: bool) 
 RESUMABLE_STATUSES = ("running", "failed", "budget_exceeded")
 
 
+def display_text(value: Any) -> str:
+    """Collapse whitespace and drop control characters so recorded text cannot drive a terminal."""
+    return "".join(
+        c for c in " ".join(str(value).split()) if unicodedata.category(c) != "Cc"
+    )
+
+
 def read_run(path: Path) -> dict[str, Any]:
     """Build one listing row, including runs whose state cannot be read."""
     state_path = path / "state.json"
@@ -375,7 +383,7 @@ def read_run(path: Path) -> dict[str, Any]:
         row["error"] = f"unreadable state.json ({exc})"
         return row
 
-    status = " ".join(str(state.get("status") or "unknown").split())
+    status = display_text(state.get("status") or "unknown")
     worktree = str(state.get("worktree") or "")
     missing = False
     if worktree:
@@ -384,14 +392,14 @@ def read_run(path: Path) -> dict[str, Any]:
         except (OSError, ValueError):
             missing = True
     row.update(
-        run_id=" ".join(str(state.get("run_id") or path.name).split()),
+        run_id=display_text(state.get("run_id") or path.name),
         status=status,
-        stage=" ".join(str(state.get("stage") or "-").split()),
-        branch=" ".join(str(state.get("branch") or "(unknown)").split()),
-        worktree=" ".join(worktree.split()) or "(unknown)",
+        stage=display_text(state.get("stage") or "-"),
+        branch=display_text(state.get("branch") or "(unknown)"),
+        worktree=display_text(worktree) or "(unknown)",
         worktree_missing=missing,
-        updated=" ".join(str(state.get("updated_at") or "-").split()),
-        task=(" ".join(str(state.get("task") or "").split()) or "-"),
+        updated=display_text(state.get("updated_at") or "-"),
+        task=(display_text(state.get("task") or "") or "-"),
         # A run that reached a verdict but could not commit -- a signing
         # prompt that timed out, a hook that rejected the tree -- is exactly
         # the run a resume can finish, whatever terminal status it recorded.

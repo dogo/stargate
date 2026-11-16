@@ -1178,7 +1178,9 @@ was stopped by an uncatchable hard kill such as SIGKILL or power loss. Missing
 or corrupt `state.json` files are shown as unknown rather than crashing or
 hiding the run. If `.stargate/runs/` does not exist or is empty, the command
 reports that there are no runs. Listing only reads recorded state: it never
-creates, repairs or deletes run artifacts.
+creates, repairs or deletes run artifacts. Control characters in recorded text
+are dropped, in `list` and `watch`, so a task fetched from a URL cannot clear
+or spoof the terminal.
 
 `stargate watch` is a live, read-only view of the newest runs: status, stage,
 tokens and, for fan-out runs, each task's status, stage and tokens, read from
