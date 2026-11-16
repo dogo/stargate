@@ -1180,6 +1180,12 @@ hiding the run. If `.stargate/runs/` does not exist or is empty, the command
 reports that there are no runs. Listing only reads recorded state: it never
 creates, repairs or deletes run artifacts.
 
+`stargate watch` is a live, read-only view of the newest runs: status, stage,
+tokens and, for fan-out runs, each task's status, stage and tokens, read from
+the task's own state while it runs. It refreshes every `--interval` seconds
+(default 2) using plain ANSI, with no extra dependency, until Ctrl-C. It prints
+a single snapshot with `--once` or when stdout is not a terminal.
+
 ## Cleaning runs
 
 `stargate clean <run-id>` removes one run. `stargate clean --all` preflights
