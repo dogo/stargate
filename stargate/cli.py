@@ -22,7 +22,15 @@ from .doctor import doctor
 from .run import REDOABLE_STAGES, clean_runs, list_runs
 from .source import fetch_task
 from .stages import orchestrate
+from .watch import watch
 from .wizard import init_config
+
+
+def _positive_seconds(value: str) -> float:
+    seconds = float(value)
+    if not 0 < seconds < float("inf"):
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return seconds
 
 
 def _version() -> str:
@@ -131,6 +139,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "list", aliases=["runs"],
         help="List the runs recorded in this repository, newest first."
+    )
+    watch_parser = sub.add_parser(
+        "watch", help="Show the newest runs, refreshed until Ctrl-C."
+    )
+    watch_parser.add_argument(
+        "--interval", type=_positive_seconds, default=2.0,
+        help="Seconds between refreshes (default 2).",
+    )
+    watch_parser.add_argument(
+        "--once", action="store_true", help="Print one snapshot and exit."
     )
     clean = sub.add_parser(
         "clean", help="Remove a run's merged branches, clean worktrees and artifacts."
@@ -266,6 +284,8 @@ def main() -> int:
 
         if args.command in ("list", "runs"):
             return list_runs(repo_root(Path.cwd()))
+        if args.command == "watch":
+            return watch(repo_root(Path.cwd()), args.interval, args.once)
         if args.command == "clean":
             return clean_runs(repo_root(Path.cwd()), args.run_id, args.all_runs)
 
