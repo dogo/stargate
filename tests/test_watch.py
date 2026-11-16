@@ -2,10 +2,21 @@
 
 from __future__ import annotations
 
+import io
 import json
+import os
 from pathlib import Path
+from unittest.mock import patch
 
+from stargate.watch import watch
 from tests.harness import make_repo, stargate
+
+
+def _write_run(repo: Path, run_id: str, state: dict) -> Path:
+    artifacts = repo / ".stargate" / "runs" / run_id
+    artifacts.mkdir(parents=True)
+    (artifacts / "state.json").write_text(json.dumps({"run_id": run_id, **state}))
+    return artifacts
 
 
 def test_watch_once_shows_live_task_progress_and_is_read_only(root: Path) -> None:
@@ -60,3 +71,76 @@ def test_watch_rejects_an_interval_that_would_crash_the_loop(root: Path) -> None
 
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "positive number of seconds" in proc.stderr, proc.stderr
+
+
+def test_long_task_ids_keep_the_progress_columns_visible(root: Path) -> None:
+    repo = make_repo(root)
+    long_id = "t" * 48  # the longest ID the fan-out graph accepts
+    _write_run(repo, "20260910-190331-demo", {
+        "status": "running", "mode": "fanout",
+        "fanout": {"order": [long_id], "tasks": {
+            long_id: {"status": "complete", "stage": "done", "tokens_used": 4321},
+        }},
+    })
+
+    proc = stargate(repo, "watch", "--once", config_home=root / "config-home",
+                    env={"COLUMNS": "80"})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "4,321 tok" in proc.stdout, proc.stdout
+
+
+def test_one_damaged_run_does_not_hide_the_others(root: Path) -> None:
+    repo = make_repo(root)
+    _write_run(repo, "20260910-190331-broken", {
+        "status": "running", "mode": "fanout", "tokens_used": "lots",
+        "fanout": {"order": [["x"], "a"], "tasks": {
+            "a": {"status": "running", "tokens_used": {}, "depends_on": "a"},
+        }},
+    })
+    _write_run(repo, "20260909-120000-healthy", {"status": "approved", "tokens_used": 77})
+
+    proc = stargate(repo, "watch", "--once", config_home=root / "config-home")
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "20260910-190331-broken" in proc.stdout, proc.stdout
+    assert "tokens 77" in proc.stdout, proc.stdout
+
+
+def test_unreadable_runs_directory_is_an_error_not_an_empty_view(root: Path) -> None:
+    repo = make_repo(root)
+    runs = _write_run(repo, "20260910-190331-demo", {"status": "approved"}).parent
+    runs.chmod(0)
+    try:
+        proc = stargate(repo, "watch", "--once", config_home=root / "config-home")
+    finally:
+        runs.chmod(0o755)
+
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert "Could not read recorded runs" in proc.stderr, proc.stderr
+    assert "No recorded runs" not in proc.stdout, proc.stdout
+
+
+def test_live_frame_fits_the_terminal_so_the_newest_run_stays_on_screen(root: Path) -> None:
+    for day in range(1, 6):
+        _write_run(root, f"2026091{day}-120000-run{day}", {
+            "status": "running", "mode": "fanout",
+            "fanout": {"order": list("abcdefgh"), "tasks": {
+                t: {"status": "pending", "stage": "pending"} for t in "abcdefgh"
+            }},
+        })
+
+    class Tty(io.StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    out = Tty()
+    with patch("sys.stdout", out), \
+            patch("shutil.get_terminal_size", return_value=os.terminal_size((80, 24))), \
+            patch("time.sleep", side_effect=KeyboardInterrupt):
+        assert watch(root, interval=1) == 0
+
+    frame = out.getvalue().split("\x1b[H\x1b[J", 1)[1]
+    assert frame.count("\n") < 24, frame
+    assert "20260915-120000-run5" in frame, frame
+    assert "more line(s); use --once" in frame, frame
